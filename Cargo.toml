@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/i18n",
+    "crates/libass-sys",
+    "crates/ffms2-sys",
+    "crates/render",
+    "crates/media",
+]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-3-Clause"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+dark-light = "3"
+eframe = "0.37.0"
+egui = "0.37.0"
+egui-wgpu = "0.37.0"
+egui_extras = "0.37.0"
+fluent = "0.17"
+rfd = "0.18"
+thiserror = "2"
+unic-langid = "0.9"
+wgpu = "30"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Justification: workspace crates mirror module/type naming (e.g. render::AssSubRenderer, i18n::I18n).
+module_name_repetitions = "allow"
+# Justification: video frame dimensions, timestamps, and egui coordinates routinely convert integers to f32/f64.
+cast_precision_loss = "allow"
+# Justification: Phase 0 spike and rendering loops return descriptive errors without exhaustive # Errors boilerplate on every internal helper.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
