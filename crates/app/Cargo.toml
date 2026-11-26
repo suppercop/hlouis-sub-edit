@@ -1,0 +1,23 @@
+[package]
+name = "hlouis-sub-edit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dark-light.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui_extras.workspace = true
+fluent.workspace = true
+i18n = { path = "../i18n" }
+media = { path = "../media" }
+render = { path = "../render" }
+rfd.workspace = true
+wgpu.workspace = true
+windows-sys.workspace = true
+
+[lints]
+workspace = true
