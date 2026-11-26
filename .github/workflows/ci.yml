@@ -1,0 +1,94 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main, "phase-*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Cache native dependencies (.native)
+        id: cache-native
+        uses: actions/cache@v4
+        with:
+          path: |
+            .native/include
+            .native/lib
+            .native/bin
+            .native/licenses
+            .native/downloads
+          key: native-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'scripts/fetch-native.ps1') }}
+
+      - name: Cache vcpkg binary archives
+        if: steps.cache-native.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LOCALAPPDATA }}/vcpkg/archives
+          key: vcpkg-archives-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-archives-${{ runner.os }}-
+
+      - name: Fetch and build native dependencies
+        if: steps.cache-native.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          ./scripts/fetch-native.ps1
+
+      - name: Add native DLLs to PATH for tests
+        shell: pwsh
+        run: |
+          $binDir = Join-Path $PWD ".native\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $binDir
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy with -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release --package hlouis-sub-edit
+
+      - name: Stage release bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/licenses | Out-Null
+          Copy-Item -Force target/release/hlouis-sub-edit.exe dist/
+          Copy-Item -Force .native/bin/*.dll dist/
+          Copy-Item -Force .native/licenses/* dist/licenses/
+          Copy-Item -Force LICENSE dist/
+          Copy-Item -Force docs/THIRD_PARTY.md dist/
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hlouis-sub-edit-windows-x64
+          path: dist/
