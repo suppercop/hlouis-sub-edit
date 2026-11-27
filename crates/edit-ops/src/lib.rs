@@ -187,7 +187,7 @@ pub fn duplicate_selected(
     Ok(EditCommand::Batch(cmds))
 }
 
-/// Deletes all selected events atomically (descending index order so indices stay valid).
+/// Deletes all selected events atomically in O(N) time without O(N²) element shifts.
 ///
 /// # Errors
 /// Returns [`EditOpsError::MissingEventsSection`] if `[Events]` is absent.
@@ -195,16 +195,69 @@ pub fn delete_selected(
     script: &ScriptFile,
     selected: &[usize],
 ) -> Result<EditCommand, EditOpsError> {
-    let evs = collect_events(script)?;
-    let idxs = normalize_selection(selected, evs.len());
-    let mut cmds = Vec::with_capacity(idxs.len());
-    for &idx in idxs.iter().rev() {
-        cmds.push(EditCommand::DeleteEvent {
-            index: idx,
-            event: evs[idx].clone(),
-        });
+    let sec = script
+        .events_section()
+        .ok_or(EditOpsError::MissingEventsSection)?;
+    if selected.is_empty() {
+        return Ok(EditCommand::Batch(Vec::new()));
     }
-    Ok(EditCommand::Batch(cmds))
+
+    let entries = &sec.entries;
+    let fast_all_events = entries
+        .iter()
+        .all(|e| matches!(e, ass_core::EventEntry::Event(_)));
+
+    if fast_all_events {
+        let count = entries.len();
+        if is_strictly_ascending_in_bounds(selected, count) {
+            let mut items = Vec::with_capacity(selected.len());
+            for &idx in selected {
+                if let ass_core::EventEntry::Event(ref ev) = entries[idx] {
+                    items.push((idx, ev.clone()));
+                }
+            }
+            return Ok(EditCommand::DeleteEvents(items));
+        }
+        let idxs = normalize_selection(selected, count);
+        if idxs.is_empty() {
+            return Ok(EditCommand::Batch(Vec::new()));
+        }
+        let mut items = Vec::with_capacity(idxs.len());
+        for idx in idxs {
+            if let ass_core::EventEntry::Event(ref ev) = entries[idx] {
+                items.push((idx, ev.clone()));
+            }
+        }
+        return Ok(EditCommand::DeleteEvents(items));
+    }
+
+    let evs: Vec<&AssEvent> = sec.events().collect();
+    let idxs = normalize_selection(selected, evs.len());
+    if idxs.is_empty() {
+        return Ok(EditCommand::Batch(Vec::new()));
+    }
+    let items: Vec<(usize, AssEvent)> = idxs
+        .into_iter()
+        .map(|idx| (idx, evs[idx].clone()))
+        .collect();
+    Ok(EditCommand::DeleteEvents(items))
+}
+
+#[inline]
+fn is_strictly_ascending_in_bounds(selected: &[usize], count: usize) -> bool {
+    let mut prev: Option<usize> = None;
+    for &idx in selected {
+        if idx >= count {
+            return false;
+        }
+        if let Some(p) = prev {
+            if idx <= p {
+                return false;
+            }
+        }
+        prev = Some(idx);
+    }
+    true
 }
 
 /// Swaps two events by index.
@@ -411,7 +464,7 @@ fn set_kind_selected(
 /// Stable-sorts either the selected rows (in place within their slots) or the entire `[Events]`
 /// section when `selection` is `None`.
 ///
-/// Never clones unchanged rows; emits `ModifyEvent` only for positions whose event moved.
+/// Uses [`EditCommand::PermuteEvents`] so zero [`AssEvent`] rows are cloned (including the undo record).
 ///
 /// # Errors
 /// Returns [`EditOpsError::MissingEventsSection`] if `[Events]` is absent.
@@ -422,32 +475,35 @@ pub fn stable_sort(
     selection: Option<&[usize]>,
 ) -> Result<EditCommand, EditOpsError> {
     let evs = collect_events(script)?;
-    let slots: Vec<usize> = match selection {
-        Some(sel) => normalize_selection(sel, evs.len()),
-        None => (0..evs.len()).collect(),
-    };
-    if slots.len() <= 1 {
+    let count = evs.len();
+    if count <= 1 {
         return Ok(EditCommand::Batch(Vec::new()));
     }
 
-    let sorted = compute_sorted_order(&evs, &slots, key, descending);
-
-    let moved = slots
-        .iter()
-        .zip(sorted.iter())
-        .filter(|(&d, &s)| d != s)
-        .count();
-    let mut cmds = Vec::with_capacity(moved);
-    for (&dst_idx, &src_idx) in slots.iter().zip(sorted.iter()) {
-        if dst_idx != src_idx {
-            cmds.push(EditCommand::ModifyEvent {
-                index: dst_idx,
-                before: Box::new(evs[dst_idx].clone()),
-                after: Box::new(evs[src_idx].clone()),
-            });
+    match selection {
+        None => {
+            let order = compute_sorted_all(&evs, key, descending);
+            if order.iter().enumerate().all(|(dst, &src)| dst == src) {
+                return Ok(EditCommand::Batch(Vec::new()));
+            }
+            Ok(EditCommand::PermuteEvents(order))
+        }
+        Some(sel) => {
+            let slots = normalize_selection(sel, count);
+            if slots.len() <= 1 {
+                return Ok(EditCommand::Batch(Vec::new()));
+            }
+            let sorted = compute_sorted_order(&evs, &slots, key, descending);
+            if slots.iter().zip(sorted.iter()).all(|(&d, &s)| d == s) {
+                return Ok(EditCommand::Batch(Vec::new()));
+            }
+            let mut full_order: Vec<usize> = (0..count).collect();
+            for (&dst_idx, &src_idx) in slots.iter().zip(sorted.iter()) {
+                full_order[dst_idx] = src_idx;
+            }
+            Ok(EditCommand::PermuteEvents(full_order))
         }
     }
-    Ok(EditCommand::Batch(cmds))
 }
 
 /// Zero-clone in-place stable sort directly permuting `EventsSection::entries`.
@@ -528,6 +584,53 @@ pub fn stable_sort_in_place(
     }
 
     Ok(sorted)
+}
+
+fn compute_sorted_all(evs: &[&AssEvent], key: SortKey, descending: bool) -> Vec<usize> {
+    match key {
+        SortKey::Start | SortKey::End | SortKey::Layer => {
+            let mut keyed: Vec<(i64, usize)> = evs
+                .iter()
+                .enumerate()
+                .map(|(idx, ev)| {
+                    let k = match key {
+                        SortKey::Start => i64::from(ev.start().as_cs()),
+                        SortKey::End => i64::from(ev.end().as_cs()),
+                        SortKey::Layer => i64::from(ev.layer()),
+                        _ => 0,
+                    };
+                    (k, idx)
+                })
+                .collect();
+            if descending {
+                keyed.sort_by_key(|a| std::cmp::Reverse(a.0));
+            } else {
+                keyed.sort_by_key(|a| a.0);
+            }
+            keyed.into_iter().map(|(_, idx)| idx).collect()
+        }
+        SortKey::Style | SortKey::Actor | SortKey::Effect => {
+            let mut keyed: Vec<(&str, usize)> = evs
+                .iter()
+                .enumerate()
+                .map(|(idx, ev)| {
+                    let k = match key {
+                        SortKey::Style => ev.style(),
+                        SortKey::Actor => ev.name(),
+                        SortKey::Effect => ev.effect(),
+                        _ => "",
+                    };
+                    (k, idx)
+                })
+                .collect();
+            if descending {
+                keyed.sort_by(|a, b| b.0.cmp(a.0));
+            } else {
+                keyed.sort_by(|a, b| a.0.cmp(b.0));
+            }
+            keyed.into_iter().map(|(_, idx)| idx).collect()
+        }
+    }
 }
 
 fn compute_sorted_order(
@@ -889,5 +992,28 @@ Dialogue: 0,0:00:10.00,0:00:12.00,Sign,Cara,0,0,0,,Third line
         );
         // Strips ',' '!' '.' -> 18 chars
         assert_eq!(m_no_punct.char_count, 18);
+    }
+
+    #[test]
+    fn partial_selection_sort_and_undo_with_history() {
+        let mut script = sample_script();
+        let mut history = ass_core::UndoHistory::default();
+
+        // Sort only rows [0, 2] by End descending; row 1 stays untouched.
+        let cmd = stable_sort(&script, SortKey::End, true, Some(&[0, 2])).expect("partial sort");
+        assert!(matches!(cmd, EditCommand::PermuteEvents(_)));
+        history.execute(&mut script, cmd).expect("exec");
+
+        let texts: Vec<&str> = script.events().map(AssEvent::text).collect();
+        assert_eq!(texts, vec!["Third line", "First line", "Second line"]);
+
+        history.undo(&mut script).expect("undo");
+        let reverted: Vec<&str> = script.events().map(AssEvent::text).collect();
+        assert_eq!(reverted, vec!["Second line", "First line", "Third line"]);
+
+        // Redo restores sorted order.
+        history.redo(&mut script).expect("redo");
+        let redone: Vec<&str> = script.events().map(AssEvent::text).collect();
+        assert_eq!(redone, vec!["Third line", "First line", "Second line"]);
     }
 }

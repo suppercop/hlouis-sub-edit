@@ -15,6 +15,10 @@ pub enum EditCommand {
     InsertEvent { index: usize, event: AssEvent },
     /// Delete an event at logical event index `index`.
     DeleteEvent { index: usize, event: AssEvent },
+    /// Delete multiple events at sorted strictly-ascending logical indices `(index, event)`.
+    DeleteEvents(Vec<(usize, AssEvent)>),
+    /// Reorder events according to permutation `order` (`after[dst] = before[order[dst]]`).
+    PermuteEvents(Vec<usize>),
     /// Replace an entire event at logical event index `index`.
     ModifyEvent {
         index: usize,
@@ -65,6 +69,25 @@ impl EditCommand {
                     return Err(AssError::EventIndexOutOfRange(*index));
                 }
                 Ok(())
+            }
+            Self::DeleteEvents(items) => {
+                if items.is_empty() {
+                    return Ok(());
+                }
+                let indices: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
+                let sec = script
+                    .events_section_mut()
+                    .ok_or(AssError::EventIndexOutOfRange(indices[0]))?;
+                sec.remove_events_by_sorted_indices(&indices)
+            }
+            Self::PermuteEvents(order) => {
+                if order.is_empty() {
+                    return Ok(());
+                }
+                let sec = script
+                    .events_section_mut()
+                    .ok_or(AssError::InvalidPermutation(order.len()))?;
+                sec.permute_events(order)
             }
             Self::ModifyEvent { index, after, .. } => {
                 let ev = script
@@ -136,6 +159,24 @@ impl EditCommand {
                     .insert_event(*index, event.clone());
                 Ok(())
             }
+            Self::DeleteEvents(items) => {
+                if items.is_empty() {
+                    return Ok(());
+                }
+                script
+                    .ensure_events_section_mut()
+                    .insert_events_sorted(items)
+            }
+            Self::PermuteEvents(order) => {
+                if order.is_empty() {
+                    return Ok(());
+                }
+                let inv = invert_permutation(order)?;
+                let sec = script
+                    .events_section_mut()
+                    .ok_or(AssError::InvalidPermutation(order.len()))?;
+                sec.permute_events(&inv)
+            }
             Self::ModifyEvent { index, before, .. } => {
                 let ev = script
                     .events_section_mut()
@@ -196,6 +237,14 @@ impl EditCommand {
             Self::InsertEvent { event, .. } | Self::DeleteEvent { event, .. } => {
                 event_heap_bytes(event)
             }
+            Self::DeleteEvents(items) => {
+                items.capacity() * std::mem::size_of::<(usize, AssEvent)>()
+                    + items
+                        .iter()
+                        .map(|(_, ev)| event_heap_bytes(ev))
+                        .sum::<usize>()
+            }
+            Self::PermuteEvents(order) => order.capacity() * std::mem::size_of::<usize>(),
             Self::ModifyEvent { before, after, .. } => {
                 event_heap_bytes(before) + event_heap_bytes(after)
             }
@@ -226,6 +275,18 @@ fn apply_script_info_value(script: &mut ScriptFile, key: &str, value: Option<&st
             }
         }
     }
+}
+
+fn invert_permutation(order: &[usize]) -> Result<Vec<usize>, AssError> {
+    let n = order.len();
+    let mut inv = vec![usize::MAX; n];
+    for (dst, &src) in order.iter().enumerate() {
+        if src >= n || inv[src] != usize::MAX {
+            return Err(AssError::InvalidPermutation(n));
+        }
+        inv[src] = dst;
+    }
+    Ok(inv)
 }
 
 fn event_heap_bytes(ev: &AssEvent) -> usize {
@@ -605,5 +666,67 @@ mod tests {
             script.script_info().and_then(|s| s.get("YCbCr Matrix")),
             Some("TV.709")
         );
+    }
+
+    #[test]
+    fn permute_and_batch_delete_preserve_comments_and_round_trip_undo_redo() {
+        let raw = "\
+[Script Info]
+ScriptType: v4.00+
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+; leading comment
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Zero
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,One
+; middle comment
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,Two
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,Three
+";
+        let mut script = crate::parse_ass(raw).value;
+        let mut history = UndoHistory::default();
+
+        // Permute [Zero, One, Two, Three] -> [Two, Three, Zero, One].
+        history
+            .execute(&mut script, EditCommand::PermuteEvents(vec![2, 3, 0, 1]))
+            .expect("permute");
+        let texts: Vec<&str> = script.events().map(AssEvent::text).collect();
+        assert_eq!(texts, vec!["Two", "Three", "Zero", "One"]);
+        // Non-event entries stay in place.
+        assert!(matches!(
+            script.events_section().unwrap().entries[0],
+            EventEntry::Comment(_)
+        ));
+        assert!(matches!(
+            script.events_section().unwrap().entries[3],
+            EventEntry::Comment(_)
+        ));
+
+        history.undo(&mut script).expect("undo permute");
+        let reverted: Vec<&str> = script.events().map(AssEvent::text).collect();
+        assert_eq!(reverted, vec!["Zero", "One", "Two", "Three"]);
+
+        // Batch delete rows 0 and 2 ([Zero, Two]) -> leaves [One, Three], then undo restores all.
+        let ev0 = script.events().next().unwrap().clone();
+        let ev2 = script.events().nth(2).unwrap().clone();
+        history
+            .execute(
+                &mut script,
+                EditCommand::DeleteEvents(vec![(0, ev0), (2, ev2)]),
+            )
+            .expect("batch delete");
+        let after_del: Vec<&str> = script.events().map(AssEvent::text).collect();
+        assert_eq!(after_del, vec!["One", "Three"]);
+
+        history.undo(&mut script).expect("undo delete");
+        let restored: Vec<&str> = script.events().map(AssEvent::text).collect();
+        assert_eq!(restored, vec!["Zero", "One", "Two", "Three"]);
+        assert_eq!(crate::serialize_ass(&script), raw);
+
+        // Invalid permutation rejected cleanly.
+        assert!(matches!(
+            EditCommand::PermuteEvents(vec![0, 0, 1, 2]).apply(&mut script),
+            Err(AssError::InvalidPermutation(4))
+        ));
     }
 }

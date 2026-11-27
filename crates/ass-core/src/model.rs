@@ -909,6 +909,189 @@ impl EventsSection {
             _ => None,
         }
     }
+
+    /// Reorders parsed `AssEvent` entries in-place according to `order`, where `after[dst] = before[order[dst]]`.
+    pub fn permute_events(&mut self, order: &[usize]) -> Result<(), crate::AssError> {
+        let n = order.len();
+        let all_events = self.entries.len() == n
+            && self
+                .entries
+                .iter()
+                .all(|e| matches!(e, EventEntry::Event(_)));
+
+        let positions: Vec<usize> = if all_events {
+            Vec::new()
+        } else {
+            let pos: Vec<usize> = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| matches!(e, EventEntry::Event(_)).then_some(i))
+                .collect();
+            if pos.len() != n {
+                return Err(crate::AssError::InvalidPermutation(n));
+            }
+            pos
+        };
+
+        let mut unvisited = vec![false; n];
+        for &src in order {
+            if src >= n || unvisited[src] {
+                return Err(crate::AssError::InvalidPermutation(n));
+            }
+            unvisited[src] = true;
+        }
+
+        // In-place cycle decomposition reuses `unvisited` (all entries currently true).
+        for start in 0..n {
+            if !unvisited[start] {
+                continue;
+            }
+            unvisited[start] = false;
+            if order[start] == start {
+                continue;
+            }
+            let start_entry_idx = if all_events { start } else { positions[start] };
+            let saved = std::mem::replace(&mut self.entries[start_entry_idx], EventEntry::Blank);
+            let mut cur = start;
+            loop {
+                let src = order[cur];
+                let cur_entry_idx = if all_events { cur } else { positions[cur] };
+                if src == start {
+                    self.entries[cur_entry_idx] = saved;
+                    break;
+                }
+                let src_entry_idx = if all_events { src } else { positions[src] };
+                let moved = std::mem::replace(&mut self.entries[src_entry_idx], EventEntry::Blank);
+                self.entries[cur_entry_idx] = moved;
+                unvisited[src] = false;
+                cur = src;
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes all events at sorted strictly-ascending logical indices in O(N) time.
+    pub fn remove_events_by_sorted_indices(
+        &mut self,
+        sorted_indices: &[usize],
+    ) -> Result<(), crate::AssError> {
+        if sorted_indices.is_empty() {
+            return Ok(());
+        }
+        let mut prev = None;
+        for &idx in sorted_indices {
+            if let Some(p) = prev {
+                if idx <= p {
+                    return Err(crate::AssError::EventIndexOutOfRange(idx));
+                }
+            }
+            prev = Some(idx);
+        }
+
+        let fast_all_events = self
+            .entries
+            .iter()
+            .all(|e| matches!(e, EventEntry::Event(_)));
+        let ev_count = if fast_all_events {
+            self.entries.len()
+        } else {
+            self.event_count()
+        };
+        if let Some(&last) = sorted_indices.last() {
+            if last >= ev_count {
+                return Err(crate::AssError::EventIndexOutOfRange(last));
+            }
+        }
+
+        let mut k = 0usize;
+        let mut w = 0usize;
+        let mut ev_idx = 0usize;
+        for r in 0..self.entries.len() {
+            let is_event = fast_all_events || matches!(self.entries[r], EventEntry::Event(_));
+            if is_event {
+                let drop_this = k < sorted_indices.len() && sorted_indices[k] == ev_idx;
+                ev_idx += 1;
+                if drop_this {
+                    k += 1;
+                    continue;
+                }
+            }
+            if w != r {
+                self.entries.swap(w, r);
+            }
+            w += 1;
+        }
+        self.entries.truncate(w);
+        Ok(())
+    }
+
+    /// Inserts `(logical_index, event)` pairs (sorted strictly ascending by `logical_index`) in O(N).
+    pub fn insert_events_sorted(
+        &mut self,
+        items: &[(usize, AssEvent)],
+    ) -> Result<(), crate::AssError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let fast_all_events = self
+            .entries
+            .iter()
+            .all(|e| matches!(e, EventEntry::Event(_)));
+        let total_after = if fast_all_events {
+            self.entries.len() + items.len()
+        } else {
+            self.event_count() + items.len()
+        };
+        let mut prev = None;
+        for (idx, _) in items {
+            if *idx >= total_after {
+                return Err(crate::AssError::EventIndexOutOfRange(*idx));
+            }
+            if let Some(p) = prev {
+                if *idx <= p {
+                    return Err(crate::AssError::EventIndexOutOfRange(*idx));
+                }
+            }
+            prev = Some(*idx);
+        }
+
+        let old = std::mem::take(&mut self.entries);
+        let trailing_blanks_start = old
+            .iter()
+            .rposition(|e| !matches!(e, EventEntry::Blank))
+            .map_or(0, |i| i + 1);
+        let mut merged = Vec::with_capacity(old.len() + items.len());
+        let mut k = 0usize;
+        let mut out_ev_idx = 0usize;
+
+        for (pos, entry) in old.into_iter().enumerate() {
+            if pos >= trailing_blanks_start {
+                while k < items.len() {
+                    merged.push(EventEntry::Event(items[k].1.clone()));
+                    k += 1;
+                }
+                merged.push(entry);
+                continue;
+            }
+            let is_event = fast_all_events || matches!(entry, EventEntry::Event(_));
+            if is_event {
+                while k < items.len() && items[k].0 == out_ev_idx {
+                    merged.push(EventEntry::Event(items[k].1.clone()));
+                    out_ev_idx += 1;
+                    k += 1;
+                }
+                out_ev_idx += 1;
+            }
+            merged.push(entry);
+        }
+        while k < items.len() {
+            merged.push(EventEntry::Event(items[k].1.clone()));
+            k += 1;
+        }
+        self.entries = merged;
+        Ok(())
+    }
 }
 
 /// Single line inside `[Events]`.

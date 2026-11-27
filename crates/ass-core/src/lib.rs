@@ -39,6 +39,8 @@ pub enum AssError {
     EventIndexOutOfRange(usize),
     #[error("style index {0} is out of range")]
     StyleIndexOutOfRange(usize),
+    #[error("invalid event permutation of length {0}")]
+    InvalidPermutation(usize),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
