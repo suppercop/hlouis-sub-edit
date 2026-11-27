@@ -117,6 +117,8 @@ pub struct OverlapIndex {
     prefix_max_end: Vec<u32>,
     /// Overlap flag per logical row (`0` = no overlap, `1` = overlaps another non-comment row).
     overlaps: Vec<u8>,
+    /// Reusable scratch buffer for incremental neighbour re-evaluation (0 allocs in steady state).
+    scratch_affected: Vec<usize>,
 }
 
 impl OverlapIndex {
@@ -161,25 +163,22 @@ impl OverlapIndex {
         }
     }
 
-    /// Incrementally updates overlap status for a single edited row in O(log N + `K_local`) without
-    /// rebuilding the full index.
-    pub fn update_row(&mut self, row: usize, new_timing: RowTiming) {
-        if row >= self.rows.len() {
-            return;
+    #[inline]
+    fn is_active_timing(t: RowTiming) -> bool {
+        !t.is_comment && t.end_cs > t.start_cs
+    }
+
+    /// Returns `true` if `row` overlaps at least one other active row in the current index.
+    fn has_any_overlap(&self, row: usize) -> bool {
+        let t = self.rows[row];
+        if !Self::is_active_timing(t) {
+            return false;
         }
-        self.rows[row] = new_timing;
-        if new_timing.is_comment || new_timing.end_cs <= new_timing.start_cs {
-            self.overlaps[row] = 0;
-            return;
-        }
-        // Check if any row in `sorted_starts` with `start < new_timing.end_cs` has `end > new_timing.start_cs`.
-        let key_hi = u64::from(new_timing.end_cs) << 32;
-        let hi_pos = self.sorted_starts.partition_point(|&p| p < key_hi);
-        let mut found_overlap = false;
-        let mut k = hi_pos;
+        let key_hi = u64::from(t.end_cs) << 32;
+        let mut k = self.sorted_starts.partition_point(|&p| p < key_hi);
         while k > 0 {
             k -= 1;
-            if self.prefix_max_end[k] <= new_timing.start_cs {
+            if self.prefix_max_end[k] <= t.start_cs {
                 break;
             }
             #[allow(clippy::cast_possible_truncation)]
@@ -188,16 +187,137 @@ impl OverlapIndex {
                 continue;
             }
             let other = self.rows[other_idx];
-            if !other.is_comment
-                && other.end_cs > new_timing.start_cs
-                && other.start_cs < new_timing.end_cs
+            if Self::is_active_timing(other)
+                && other.end_cs > t.start_cs
+                && other.start_cs < t.end_cs
             {
-                found_overlap = true;
-                self.overlaps[other_idx] = 1;
-                break;
+                return true;
             }
         }
-        self.overlaps[row] = u8::from(found_overlap);
+        false
+    }
+
+    /// Incrementally updates overlap status for a single edited row, maintaining exact overlap
+    /// flags for `row` AND every neighbour that gained or lost an overlap (bit-identical to
+    /// [`OverlapIndex::rebuild`]). Zero heap allocations in steady state.
+    #[allow(clippy::too_many_lines)]
+    pub fn update_row(&mut self, row: usize, new_timing: RowTiming) {
+        if row >= self.rows.len() {
+            return;
+        }
+        let old_timing = self.rows[row];
+        let old_active = Self::is_active_timing(old_timing);
+        let new_active = Self::is_active_timing(new_timing);
+
+        // 1. Collect previous neighbours of `row` before mutating `sorted_starts`.
+        self.scratch_affected.clear();
+        if old_active {
+            let key_hi = u64::from(old_timing.end_cs) << 32;
+            let mut k = self.sorted_starts.partition_point(|&p| p < key_hi);
+            while k > 0 {
+                k -= 1;
+                if self.prefix_max_end[k] <= old_timing.start_cs {
+                    break;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let other_idx = (self.sorted_starts[k] & 0xFFFF_FFFF) as usize;
+                if other_idx == row {
+                    continue;
+                }
+                let other = self.rows[other_idx];
+                if Self::is_active_timing(other)
+                    && other.end_cs > old_timing.start_cs
+                    && other.start_cs < old_timing.end_cs
+                {
+                    self.scratch_affected.push(other_idx);
+                }
+            }
+        }
+
+        // 2. Remove old packed entry (if active), update timing, and insert new entry (if active).
+        #[allow(clippy::cast_possible_truncation)]
+        let old_pos = if old_active {
+            let old_packed = (u64::from(old_timing.start_cs) << 32) | (row as u64);
+            self.sorted_starts.binary_search(&old_packed).ok()
+        } else {
+            None
+        };
+        if let Some(pos) = old_pos {
+            self.sorted_starts.remove(pos);
+            self.prefix_max_end.remove(pos);
+        }
+
+        self.rows[row] = new_timing;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let new_pos = if new_active {
+            let new_packed = (u64::from(new_timing.start_cs) << 32) | (row as u64);
+            let pos = self.sorted_starts.partition_point(|&p| p < new_packed);
+            self.sorted_starts.insert(pos, new_packed);
+            self.prefix_max_end.insert(pos, 0);
+            Some(pos)
+        } else {
+            None
+        };
+
+        // 3. Repair `prefix_max_end` from the earliest touched position until values converge.
+        let len = self.sorted_starts.len();
+        if len > 0 {
+            let start_repair = old_pos.unwrap_or(len).min(new_pos.unwrap_or(len));
+            let max_touched = old_pos.unwrap_or(0).max(new_pos.unwrap_or(0));
+            if start_repair < len {
+                let mut running = if start_repair > 0 {
+                    self.prefix_max_end[start_repair - 1]
+                } else {
+                    0
+                };
+                for i in start_repair..len {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let idx = (self.sorted_starts[i] & 0xFFFF_FFFF) as usize;
+                    running = running.max(self.rows[idx].end_cs);
+                    let prev_val = self.prefix_max_end[i];
+                    self.prefix_max_end[i] = running;
+                    if i > max_touched && running == prev_val {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 4. Mark `row` and all its new neighbours.
+        if new_active {
+            let key_hi = u64::from(new_timing.end_cs) << 32;
+            let mut k = self.sorted_starts.partition_point(|&p| p < key_hi);
+            let mut found_overlap = false;
+            while k > 0 {
+                k -= 1;
+                if self.prefix_max_end[k] <= new_timing.start_cs {
+                    break;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let other_idx = (self.sorted_starts[k] & 0xFFFF_FFFF) as usize;
+                if other_idx == row {
+                    continue;
+                }
+                let other = self.rows[other_idx];
+                if Self::is_active_timing(other)
+                    && other.end_cs > new_timing.start_cs
+                    && other.start_cs < new_timing.end_cs
+                {
+                    found_overlap = true;
+                    self.overlaps[other_idx] = 1;
+                }
+            }
+            self.overlaps[row] = u8::from(found_overlap);
+        } else {
+            self.overlaps[row] = 0;
+        }
+
+        // 5. Re-evaluate every previous neighbour so cleared overlaps are reset accurately.
+        for i in 0..self.scratch_affected.len() {
+            let cand = self.scratch_affected[i];
+            self.overlaps[cand] = u8::from(self.has_any_overlap(cand));
+        }
     }
 
     /// Returns `true` if `row` overlaps another non-comment row.
@@ -628,5 +748,60 @@ mod tests {
         grid.key_move(KeyNav::End, false, 10);
         assert_eq!(grid.active_row(), Some(3));
         assert_eq!(grid.find_prev(|i| i == 1), Some(1));
+    }
+
+    #[test]
+    fn incremental_update_row_matches_full_rebuild_randomized() {
+        let mut state: u64 = 0x5EED_CAFE_1234_5678;
+        let mut next_u32 = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_possible_truncation)]
+            (state as u32)
+        };
+
+        let n = 64usize;
+        let mut rows: Vec<RowTiming> = (0..n)
+            .map(|_| {
+                let start = next_u32() % 400;
+                let dur = next_u32() % 60;
+                RowTiming {
+                    start_cs: start,
+                    end_cs: start + dur,
+                    is_comment: (next_u32() % 5) == 0,
+                }
+            })
+            .collect();
+
+        let mut inc = OverlapIndex::default();
+        inc.rebuild(&rows);
+
+        for step in 0..400usize {
+            let row = (next_u32() as usize) % n;
+            let start = next_u32() % 400;
+            let dur = if (next_u32() % 8) == 0 {
+                0
+            } else {
+                next_u32() % 80
+            };
+            let timing = RowTiming {
+                start_cs: start,
+                end_cs: start + dur,
+                is_comment: (next_u32() % 4) == 0,
+            };
+            rows[row] = timing;
+            inc.update_row(row, timing);
+
+            let mut fresh = OverlapIndex::default();
+            fresh.rebuild(&rows);
+            for r in 0..n {
+                assert_eq!(
+                    inc.is_overlapping(r),
+                    fresh.is_overlapping(r),
+                    "mismatch at step {step}, row {r} after editing row {row}"
+                );
+            }
+        }
     }
 }
