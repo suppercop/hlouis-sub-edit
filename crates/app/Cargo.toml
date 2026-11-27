@@ -19,5 +19,20 @@ rfd.workspace = true
 wgpu.workspace = true
 windows-sys.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[lib]
+bench = false
+
+[[bin]]
+name = "hlouis-sub-edit"
+path = "src/main.rs"
+bench = false
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
 [lints]
 workspace = true

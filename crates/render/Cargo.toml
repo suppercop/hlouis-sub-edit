@@ -8,5 +8,15 @@ license.workspace = true
 libass-sys = { path = "../libass-sys" }
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[lib]
+bench = false
+
+[[bench]]
+name = "render_bench"
+harness = false
+
 [lints]
 workspace = true

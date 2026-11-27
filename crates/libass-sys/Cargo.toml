@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 links = "ass"
 
+[lib]
+bench = false
+
 [lints]
 workspace = true

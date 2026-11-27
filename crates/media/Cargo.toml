@@ -8,5 +8,15 @@ license.workspace = true
 ffms2-sys = { path = "../ffms2-sys" }
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[lib]
+bench = false
+
+[[bench]]
+name = "media_bench"
+harness = false
+
 [lints]
 workspace = true
