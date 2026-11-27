@@ -13,13 +13,16 @@ audio-peaks = { path = "../audio-peaks" }
 audio-view = { path = "../audio-view" }
 commands = { path = "../commands" }
 document = { path = "../document" }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 egui = { workspace = true, features = ["default_fonts"] }
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
 hlouis-tools = { path = "../hlouis-tools" }
 i18n-catalog = { path = "../i18n-catalog" }
 keyframes = { path = "../keyframes" }
 layout = { path = "../layout" }
 perf-metrics = { path = "../perf-metrics" }
 playback = { path = "../playback" }
+png = "0.17"
 settings = { path = "../settings" }
 template-doctor = { path = "../template-doctor" }
 theme = { path = "../theme" }
@@ -32,7 +35,6 @@ ui-video = { path = "../ui-video" }
 
 [dev-dependencies]
 criterion = "0.5"
-egui_kittest = "0.37.0"
 
 [[bin]]
 name = "hlouis-ui-demo"

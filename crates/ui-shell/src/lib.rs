@@ -407,6 +407,53 @@ impl AppShell {
                         ui.close();
                     }
                 });
+                ui.separator();
+                let cur_spec = self.theme.spec();
+                if ui
+                    .selectable_label(matches!(cur_spec, ThemeSpec::Light), "Light")
+                    .clicked()
+                {
+                    self.set_theme(ThemeSpec::Light);
+                }
+                if ui
+                    .selectable_label(matches!(cur_spec, ThemeSpec::Dark), "Dark")
+                    .clicked()
+                {
+                    self.set_theme(ThemeSpec::Dark);
+                }
+                let is_ec = matches!(cur_spec, ThemeSpec::EyeComfort { .. });
+                if ui.selectable_label(is_ec, "Eye Comfort").clicked() {
+                    self.set_theme(ThemeSpec::EyeComfort {
+                        base: BaseTheme::Dark,
+                        strength: self.settings.appearance.eye_comfort_strength,
+                    });
+                }
+                if is_ec {
+                    let mut strength = self.settings.appearance.eye_comfort_strength;
+                    if ui
+                        .add(egui::Slider::new(&mut strength, 0..=100).suffix("%"))
+                        .changed()
+                    {
+                        self.settings.appearance.eye_comfort_strength = strength;
+                        self.set_theme(ThemeSpec::EyeComfort {
+                            base: BaseTheme::Dark,
+                            strength,
+                        });
+                    }
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(self.catalog.locale() == Locale::En, "EN")
+                    .clicked()
+                {
+                    self.set_locale(Locale::En);
+                }
+                if ui
+                    .selectable_label(self.catalog.locale() == Locale::Vi, "VI")
+                    .clicked()
+                {
+                    self.set_locale(Locale::Vi);
+                }
             });
         });
 
