@@ -75,6 +75,214 @@ struct ResampleState {
     ar: f64,
     shift_x: f64,
     shift_y: f64,
+    color_conv: Option<YcbcrConverter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YcbcrMatrix {
+    Bt601,
+    Bt709,
+    Fcc,
+    Smpte240m,
+}
+
+impl YcbcrMatrix {
+    const fn coefficients(self) -> [f64; 3] {
+        match self {
+            Self::Bt601 => [0.299, 0.587, 0.114],
+            Self::Bt709 => [0.2126, 0.7152, 0.0722],
+            Self::Fcc => [0.3, 0.59, 0.11],
+            Self::Smpte240m => [0.212, 0.701, 0.087],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YcbcrRange {
+    Tv,
+    Pc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct YcbcrColorspace {
+    matrix: YcbcrMatrix,
+    range: YcbcrRange,
+}
+
+/// Linear + offset RGB->YCbCr->RGB converter matching Aegisub's `agi::ycbcr_converter`.
+#[derive(Debug, Clone, Copy)]
+struct YcbcrConverter {
+    to_ycbcr: [f64; 9],
+    from_ycbcr: [f64; 9],
+    shift_to: [f64; 3],
+    shift_from: [f64; 3],
+}
+
+impl YcbcrConverter {
+    fn new(src: YcbcrColorspace, dst: YcbcrColorspace) -> Self {
+        let [src_red, src_green, src_blue] = src.matrix.coefficients();
+        let mut to_ycbcr = [
+            src_red,
+            src_green,
+            src_blue,
+            -src_red / (1.0 - src_blue),
+            -src_green / (1.0 - src_blue),
+            1.0,
+            1.0,
+            -src_green / (1.0 - src_red),
+            -src_blue / (1.0 - src_red),
+        ];
+        let (row_scale, shift_to) = match src.range {
+            YcbcrRange::Pc => ([1.0, 0.5, 0.5], [0.0, 128.0, 128.0]),
+            YcbcrRange::Tv => (
+                [219.0 / 255.0, 112.0 / 255.0, 112.0 / 255.0],
+                [16.0, 128.0, 128.0],
+            ),
+        };
+        for row in 0..3 {
+            for col in 0..3 {
+                to_ycbcr[row * 3 + col] *= row_scale[row];
+            }
+        }
+
+        let [dst_red, dst_green, dst_blue] = dst.matrix.coefficients();
+        let mut from_ycbcr = [
+            1.0,
+            0.0,
+            1.0 - dst_red,
+            1.0,
+            -(1.0 - dst_blue) * dst_blue / dst_green,
+            -(1.0 - dst_red) * dst_red / dst_green,
+            1.0,
+            1.0 - dst_blue,
+            0.0,
+        ];
+        let (col_scale, shift_from) = match dst.range {
+            YcbcrRange::Pc => ([1.0, 2.0, 2.0], [0.0, -128.0, -128.0]),
+            YcbcrRange::Tv => (
+                [255.0 / 219.0, 255.0 / 112.0, 255.0 / 112.0],
+                [-16.0, -128.0, -128.0],
+            ),
+        };
+        for row in 0..3 {
+            for col in 0..3 {
+                from_ycbcr[row * 3 + col] *= col_scale[col];
+            }
+        }
+
+        Self {
+            to_ycbcr,
+            from_ycbcr,
+            shift_to,
+            shift_from,
+        }
+    }
+
+    fn rgb_to_rgb(self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        let input = [f64::from(r), f64::from(g), f64::from(b)];
+        let ycbcr = [
+            self.to_ycbcr[0] * input[0]
+                + self.to_ycbcr[1] * input[1]
+                + self.to_ycbcr[2] * input[2]
+                + self.shift_to[0]
+                + self.shift_from[0],
+            self.to_ycbcr[3] * input[0]
+                + self.to_ycbcr[4] * input[1]
+                + self.to_ycbcr[5] * input[2]
+                + self.shift_to[1]
+                + self.shift_from[1],
+            self.to_ycbcr[6] * input[0]
+                + self.to_ycbcr[7] * input[1]
+                + self.to_ycbcr[8] * input[2]
+                + self.shift_to[2]
+                + self.shift_from[2],
+        ];
+        let rgb = [
+            self.from_ycbcr[0] * ycbcr[0]
+                + self.from_ycbcr[1] * ycbcr[1]
+                + self.from_ycbcr[2] * ycbcr[2],
+            self.from_ycbcr[3] * ycbcr[0]
+                + self.from_ycbcr[4] * ycbcr[1]
+                + self.from_ycbcr[5] * ycbcr[2],
+            self.from_ycbcr[6] * ycbcr[0]
+                + self.from_ycbcr[7] * ycbcr[1]
+                + self.from_ycbcr[8] * ycbcr[2],
+        ];
+        (clamp_u8(rgb[0]), clamp_u8(rgb[1]), clamp_u8(rgb[2]))
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn clamp_u8(v: f64) -> u8 {
+    // Matches Aegisub `clamp(v + 0.5)` into [0, 255].
+    let shifted = (v + 0.5).clamp(0.0, 255.0);
+    shifted as u8
+}
+
+fn parse_ycbcr_colorspace(s: &str) -> Option<YcbcrColorspace> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("TV.601") {
+        Some(YcbcrColorspace {
+            matrix: YcbcrMatrix::Bt601,
+            range: YcbcrRange::Tv,
+        })
+    } else if trimmed.eq_ignore_ascii_case("PC.601") {
+        Some(YcbcrColorspace {
+            matrix: YcbcrMatrix::Bt601,
+            range: YcbcrRange::Pc,
+        })
+    } else if trimmed.eq_ignore_ascii_case("TV.709") {
+        Some(YcbcrColorspace {
+            matrix: YcbcrMatrix::Bt709,
+            range: YcbcrRange::Tv,
+        })
+    } else if trimmed.eq_ignore_ascii_case("PC.709") {
+        Some(YcbcrColorspace {
+            matrix: YcbcrMatrix::Bt709,
+            range: YcbcrRange::Pc,
+        })
+    } else if trimmed.eq_ignore_ascii_case("TV.FCC") {
+        Some(YcbcrColorspace {
+            matrix: YcbcrMatrix::Fcc,
+            range: YcbcrRange::Tv,
+        })
+    } else if trimmed.eq_ignore_ascii_case("PC.FCC") {
+        Some(YcbcrColorspace {
+            matrix: YcbcrMatrix::Fcc,
+            range: YcbcrRange::Pc,
+        })
+    } else if trimmed.eq_ignore_ascii_case("TV.240M") {
+        Some(YcbcrColorspace {
+            matrix: YcbcrMatrix::Smpte240m,
+            range: YcbcrRange::Tv,
+        })
+    } else if trimmed.eq_ignore_ascii_case("PC.240M") {
+        Some(YcbcrColorspace {
+            matrix: YcbcrMatrix::Smpte240m,
+            range: YcbcrRange::Pc,
+        })
+    } else {
+        None
+    }
+}
+
+fn resolve_color_converter(script: &ScriptFile, opts: &ResampleOptions) -> Option<YcbcrConverter> {
+    let dst = parse_ycbcr_colorspace(opts.ycbcr_matrix.as_deref()?)?;
+    let existing = script.script_info().and_then(|s| s.get("YCbCr Matrix"));
+    let src = match existing.map(str::trim) {
+        None | Some("") => YcbcrColorspace {
+            // Matches Aegisub's Header::to_effective() default on missing header.
+            matrix: YcbcrMatrix::Bt601,
+            range: YcbcrRange::Tv,
+        },
+        Some(s) if s.eq_ignore_ascii_case("None") => return None,
+        Some(s) => parse_ycbcr_colorspace(s)?,
+    };
+    if src == dst {
+        None
+    } else {
+        Some(YcbcrConverter::new(src, dst))
+    }
 }
 
 /// Resamples `script` to the target resolution in `opts`.
@@ -91,7 +299,8 @@ pub fn resample_resolution(
     }
 
     let (src_x, src_y) = resolve_source_res(script, opts.source_override);
-    let state = compute_state(src_x, src_y, opts);
+    let mut state = compute_state(src_x, src_y, opts);
+    state.color_conv = resolve_color_converter(script, opts);
 
     let mut cmds = Vec::new();
     let width_str = opts.dest_x.to_string();
@@ -230,6 +439,7 @@ fn compute_state(src_x: u32, src_y: u32, opts: &ResampleOptions) -> ResampleStat
         ar,
         shift_x: f64::from(opts.margin_left) * rx + border_x,
         shift_y: f64::from(opts.margin_top) * ry + border_y,
+        color_conv: None,
     }
 }
 
@@ -245,6 +455,20 @@ fn resample_style(st: &AssStyle, s: ResampleState) -> AssStyle {
     out.set_margin_l(scale_margin(st.margin_l(), s.rx, s.shift_x));
     out.set_margin_r(scale_margin(st.margin_r(), s.rx, s.shift_x));
     out.set_margin_v(scale_margin(st.margin_v(), s.ry, s.shift_y));
+    if let Some(conv) = s.color_conv {
+        if let Some(c) = convert_ass_style_colour(st.primary_colour(), conv) {
+            out.set_primary_colour(c);
+        }
+        if let Some(c) = convert_ass_style_colour(st.secondary_colour(), conv) {
+            out.set_secondary_colour(c);
+        }
+        if let Some(c) = convert_ass_style_colour(st.outline_colour(), conv) {
+            out.set_outline_colour(c);
+        }
+        if let Some(c) = convert_ass_style_colour(st.back_colour(), conv) {
+            out.set_back_colour(c);
+        }
+    }
     out
 }
 
@@ -396,16 +620,73 @@ fn write_resampled_tag(out: &mut String, tag: &OverrideTag, s: ResampleState, ch
                 out.push_str(&tag.raw_args);
             }
         }
-        TagArgs::Raw(raw) => {
-            if let Some(scaled) = scale_scalar_tag(&tag.name, raw, s) {
-                *changed = true;
-                out.push_str(&scaled);
-            } else {
-                out.push_str(raw);
-            }
-        }
+        TagArgs::Raw(raw) => write_resampled_raw_tag(out, &tag.name, raw, s, changed),
         _ => out.push_str(&tag.raw_args),
     }
+}
+
+fn write_resampled_raw_tag(
+    out: &mut String,
+    name: &str,
+    raw: &str,
+    s: ResampleState,
+    changed: &mut bool,
+) {
+    if let Some(conv) = s.color_conv {
+        if matches!(name, "c" | "1c" | "2c" | "3c" | "4c") {
+            if let Some(converted) = convert_ass_override_colour(raw, conv) {
+                if converted != raw {
+                    *changed = true;
+                }
+                out.push_str(&converted);
+                return;
+            }
+        }
+    }
+    if let Some(scaled) = scale_scalar_tag(name, raw, s) {
+        *changed = true;
+        out.push_str(&scaled);
+    } else {
+        out.push_str(raw);
+    }
+}
+
+fn parse_ass_hex_abgr(raw: &str) -> Option<(u8, u8, u8, u8)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let body = trimmed
+        .strip_prefix('&')
+        .unwrap_or(trimmed)
+        .strip_prefix(['H', 'h'])
+        .unwrap_or_else(|| trimmed.strip_prefix('&').unwrap_or(trimmed))
+        .trim_end_matches('&');
+    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let val = u32::from_str_radix(body, 16).ok()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let a = ((val >> 24) & 0xFF) as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let b = ((val >> 16) & 0xFF) as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let g = ((val >> 8) & 0xFF) as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let r = (val & 0xFF) as u8;
+    Some((a, b, g, r))
+}
+
+fn convert_ass_style_colour(raw: &str, conv: YcbcrConverter) -> Option<String> {
+    let (a, b, g, r) = parse_ass_hex_abgr(raw)?;
+    let (nr, ng, nb) = conv.rgb_to_rgb(r, g, b);
+    Some(format!("&H{a:02X}{nb:02X}{ng:02X}{nr:02X}"))
+}
+
+fn convert_ass_override_colour(raw: &str, conv: YcbcrConverter) -> Option<String> {
+    let (_, b, g, r) = parse_ass_hex_abgr(raw)?;
+    let (nr, ng, nb) = conv.rgb_to_rgb(r, g, b);
+    Some(format!("&H{nb:02X}{ng:02X}{nr:02X}&"))
 }
 
 fn scale_scalar_tag(name: &str, raw: &str, s: ResampleState) -> Option<String> {
@@ -581,5 +862,102 @@ Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\fscx100\\pos(320,240)}Wide
         assert!((st.scale_x() - 133.33).abs() < 0.02);
         let ev = script.events().next().unwrap();
         assert_eq!(ev.text(), r"{\fscx133.33\pos(960,540)}Wide");
+    }
+
+    #[test]
+    fn ycbcr_matrix_change_converts_style_and_override_colours_including_transform_and_undoes() {
+        let raw = "\
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+YCbCr Matrix: TV.601
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,40,&H0000FF00,&H400000FF,&H00FFFFFF,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\c&H00FF00&\\1c&H0000FF&\\2c&HFF0000&\\3c&HFFFFFF&\\4c&H000000&\\t(0,500,\\3c&H00FF00&)\\c}Green
+";
+        let mut script = parse_ass(raw).value;
+        let mut opts = ResampleOptions::new(1280, 720);
+        opts.ycbcr_matrix = Some("TV.709".to_owned());
+
+        let mut history = UndoHistory::default();
+        let cmd = resample_resolution(&script, &opts).expect("resample matrix");
+        history.execute(&mut script, cmd).expect("exec");
+
+        assert_eq!(
+            script.script_info().unwrap().get("YCbCr Matrix"),
+            Some("TV.709")
+        );
+
+        // Pure green (0,255,0) TV.601 -> TV.709 shifts channels; alpha byte 0x40 on red preserved.
+        let expected_green_601_to_709 = YcbcrConverter::new(
+            parse_ycbcr_colorspace("TV.601").unwrap(),
+            parse_ycbcr_colorspace("TV.709").unwrap(),
+        )
+        .rgb_to_rgb(0, 255, 0);
+        assert_ne!(expected_green_601_to_709, (0, 255, 0));
+
+        let st = script.styles().next().unwrap();
+        let expected_st_primary = format!(
+            "&H00{:02X}{:02X}{:02X}",
+            expected_green_601_to_709.2, expected_green_601_to_709.1, expected_green_601_to_709.0
+        );
+        assert_eq!(st.primary_colour(), expected_st_primary);
+        assert!(st.secondary_colour().starts_with("&H40"));
+        assert_ne!(st.secondary_colour(), "&H400000FF");
+        // White and black stay neutral.
+        assert_eq!(st.outline_colour(), "&H00FFFFFF");
+        assert_eq!(st.back_colour(), "&H80000000");
+
+        let ev_text = script.events().next().unwrap().text();
+        let expected_override_green = format!(
+            "&H{:02X}{:02X}{:02X}&",
+            expected_green_601_to_709.2, expected_green_601_to_709.1, expected_green_601_to_709.0
+        );
+        assert!(ev_text.contains(&format!(r"\c{expected_override_green}")));
+        assert!(ev_text.contains(&format!(r"\t(0,500,\3c{expected_override_green})")));
+        assert!(ev_text.ends_with(r"\c}Green"));
+        assert!(!ev_text.contains(r"\1c&H0000FF&"));
+        assert!(!ev_text.contains(r"\2c&HFF0000&"));
+        // White/black overrides untouched.
+        assert!(ev_text.contains(r"\3c&HFFFFFF&"));
+        assert!(ev_text.contains(r"\4c&H000000&"));
+
+        // Round-trip back TV.709 -> TV.601 and verify undo restores exact originals.
+        history.undo(&mut script).expect("undo");
+        assert_eq!(
+            script.script_info().unwrap().get("YCbCr Matrix"),
+            Some("TV.601")
+        );
+        let st_restored = script.styles().next().unwrap();
+        assert_eq!(st_restored.primary_colour(), "&H0000FF00");
+        assert_eq!(st_restored.secondary_colour(), "&H400000FF");
+        assert!(script
+            .events()
+            .next()
+            .unwrap()
+            .text()
+            .contains(r"\t(0,500,\3c&H00FF00&)"));
+
+        // In-gamut colours (80, 160, 120) round-trip TV.601 -> TV.709 -> TV.601 within <= 2/255.
+        let conv_601_709 = YcbcrConverter::new(
+            parse_ycbcr_colorspace("TV.601").unwrap(),
+            parse_ycbcr_colorspace("TV.709").unwrap(),
+        );
+        let conv_709_601 = YcbcrConverter::new(
+            parse_ycbcr_colorspace("TV.709").unwrap(),
+            parse_ycbcr_colorspace("TV.601").unwrap(),
+        );
+        let (r1, g1, b1) = conv_601_709.rgb_to_rgb(80, 160, 120);
+        let (r2, g2, b2) = conv_709_601.rgb_to_rgb(r1, g1, b1);
+        assert!(
+            r2.abs_diff(80) <= 2 && g2.abs_diff(160) <= 2 && b2.abs_diff(120) <= 2,
+            "in-gamut round-trip=({r2},{g2},{b2})"
+        );
     }
 }
