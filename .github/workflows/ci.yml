@@ -92,7 +92,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         shell: pwsh
         run: |
-          cargo bench --workspace -- --save-baseline main
+          cargo bench --workspace --benches -- --save-baseline main
           ./scripts/compare-benches.ps1 -CurrentBaseline main -ReferenceBaseline main -OutDir dist/bench-results
 
       - name: Save main benchmark baseline cache
@@ -106,7 +106,7 @@ jobs:
         if: github.ref != 'refs/heads/main'
         shell: pwsh
         run: |
-          cargo bench --workspace -- --save-baseline pr
+          cargo bench --workspace --benches -- --save-baseline pr
           ./scripts/compare-benches.ps1 -CurrentBaseline pr -ReferenceBaseline main -MaxRegressionPct 10.0 -OutDir dist/bench-results
 
       - name: Upload benchmark results artifact
