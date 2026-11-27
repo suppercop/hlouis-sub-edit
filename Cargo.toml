@@ -50,6 +50,7 @@ members = [
     "crates/dialogs-model",
     "crates/i18n-catalog",
     "crates/hlouis-tools",
+    "crates/template-doctor",
 ]
 
 [workspace.package]
