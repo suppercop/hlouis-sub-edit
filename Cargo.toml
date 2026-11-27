@@ -54,6 +54,7 @@ members = [
     "crates/ui-theme",
     "crates/ui-grid",
     "crates/ui-editbox",
+    "crates/ui-audio",
 ]
 
 [workspace.package]
