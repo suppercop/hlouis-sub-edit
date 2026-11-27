@@ -1,0 +1,43 @@
+[package]
+name = "ui-shell"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ass-core = { path = "../ass-core" }
+audio-peaks = { path = "../audio-peaks" }
+audio-view = { path = "../audio-view" }
+commands = { path = "../commands" }
+document = { path = "../document" }
+egui = { workspace = true, features = ["default_fonts"] }
+hlouis-tools = { path = "../hlouis-tools" }
+i18n-catalog = { path = "../i18n-catalog" }
+keyframes = { path = "../keyframes" }
+layout = { path = "../layout" }
+perf-metrics = { path = "../perf-metrics" }
+playback = { path = "../playback" }
+settings = { path = "../settings" }
+template-doctor = { path = "../template-doctor" }
+theme = { path = "../theme" }
+ui-audio = { path = "../ui-audio" }
+ui-dialogs = { path = "../ui-dialogs" }
+ui-editbox = { path = "../ui-editbox" }
+ui-grid = { path = "../ui-grid" }
+ui-theme = { path = "../ui-theme" }
+ui-video = { path = "../ui-video" }
+
+[dev-dependencies]
+criterion = "0.5"
+egui_kittest = "0.37.0"
+
+[[bin]]
+name = "hlouis-ui-demo"
+path = "src/bin/hlouis-ui-demo.rs"
+
+[[bench]]
+name = "ui_shell"
+harness = false

@@ -57,6 +57,7 @@ members = [
     "crates/ui-audio",
     "crates/ui-video",
     "crates/ui-dialogs",
+    "crates/ui-shell",
 ]
 
 [workspace.package]
