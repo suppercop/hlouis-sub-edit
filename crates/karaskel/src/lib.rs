@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use ass_core::{AssEvent, AssStyle, EventKind, ScriptFile};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// Font measurement output matching Aegisub `aegisub.text_extents`.
@@ -79,7 +80,9 @@ pub struct KaraskelSyllable {
     pub left: f64,
     pub center: f64,
     pub right: f64,
-    pub highlights: Vec<Highlight>,
+    /// Highlight slices; one inline slot covers the common single-`\k` case without a heap
+    /// allocation.
+    pub highlights: SmallVec<[Highlight; 1]>,
     pub furigana: Vec<FuriganaEntry>,
 }
 
@@ -438,7 +441,7 @@ fn parse_karaskel_syllables(text: &str, generate_furigana: bool) -> Vec<Karaskel
     let mut cur_fx = String::new();
     let mut cur_tag: &'static str = "";
     let mut cur_dur_ms = 0i64;
-    let mut cur_highlights: Vec<Highlight> = Vec::new();
+    let mut cur_highlights: SmallVec<[Highlight; 1]> = SmallVec::new();
     let mut cur_text = String::new();
     let mut have_started = false;
 
@@ -447,11 +450,13 @@ fn parse_karaskel_syllables(text: &str, generate_furigana: bool) -> Vec<Karaskel
                      cur_dur_ms: &mut i64,
                      cur_tag: &'static str,
                      cur_fx: &str,
-                     cur_highlights: &mut Vec<Highlight>,
+                     cur_highlights: &mut SmallVec<[Highlight; 1]>,
                      cur_text: &mut String| {
         let start_time = *cur_ms;
         let end_time = start_time + *cur_dur_ms;
         let mut furi = Vec::new();
+        // Copy into an exactly-sized String and keep `cur_text`'s buffer for the next syllable
+        // (no regrow chain, no per-syllable `mem::take` that discards the capacity).
         let display_text = if generate_furigana {
             if let Some((base, reading)) = cur_text.split_once('|') {
                 if !reading.is_empty() {
@@ -469,10 +474,10 @@ fn parse_karaskel_syllables(text: &str, generate_furigana: bool) -> Vec<Karaskel
                 }
                 base.to_owned()
             } else {
-                std::mem::take(cur_text)
+                cur_text.as_str().to_owned()
             }
         } else {
-            std::mem::take(cur_text)
+            cur_text.as_str().to_owned()
         };
         if cur_highlights.is_empty() && *cur_dur_ms > 0 {
             cur_highlights.push(Highlight {
@@ -495,9 +500,11 @@ fn parse_karaskel_syllables(text: &str, generate_furigana: bool) -> Vec<Karaskel
             left: 0.0,
             center: 0.0,
             right: 0.0,
-            highlights: std::mem::take(cur_highlights),
+            // Inline copy (no heap for a single highlight); the scratch buffer is reused.
+            highlights: cur_highlights.clone(),
             furigana: furi,
         });
+        cur_highlights.clear();
         *cur_ms = end_time;
         *cur_dur_ms = 0;
         cur_text.clear();

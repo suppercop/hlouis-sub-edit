@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ass-core = { path = "../ass-core" }
+smallvec = "1"
 
 [dev-dependencies]
 criterion = "0.5"
