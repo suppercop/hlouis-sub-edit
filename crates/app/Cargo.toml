@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ass-core = { path = "../ass-core" }
 dark-light.workspace = true
 eframe.workspace = true
 egui.workspace = true

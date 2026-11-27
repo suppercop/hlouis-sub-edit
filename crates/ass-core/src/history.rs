@@ -2,11 +2,22 @@
 //! and a bounded memory budget.
 
 use crate::model::{AssEvent, AssStyle, ScriptFile};
+use crate::time::AssTime;
 use crate::AssError;
 use std::collections::VecDeque;
 
 /// Default memory cap for undo + redo stacks (64 MiB).
 pub const DEFAULT_MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Compact timestamp change record for bulk timing operations (`Shift Times`, `TPP`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventTimeChange {
+    pub index: usize,
+    pub before_start: AssTime,
+    pub before_end: AssTime,
+    pub after_start: AssTime,
+    pub after_end: AssTime,
+}
 
 /// Atomic, reversible edit operation on a [`ScriptFile`].
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +30,8 @@ pub enum EditCommand {
     DeleteEvents(Vec<(usize, AssEvent)>),
     /// Reorder events according to permutation `order` (`after[dst] = before[order[dst]]`).
     PermuteEvents(Vec<usize>),
+    /// Bulk start/end timestamp changes without cloning event strings or heap-boxing events.
+    ModifyEventTimes(Vec<EventTimeChange>),
     /// Replace an entire event at logical event index `index`.
     ModifyEvent {
         index: usize,
@@ -89,6 +102,15 @@ impl EditCommand {
                     .ok_or(AssError::InvalidPermutation(order.len()))?;
                 sec.permute_events(order)
             }
+            Self::ModifyEventTimes(changes) => {
+                if changes.is_empty() {
+                    return Ok(());
+                }
+                let sec = script
+                    .events_section_mut()
+                    .ok_or(AssError::EventIndexOutOfRange(changes[0].index))?;
+                apply_time_changes(sec, changes, true)
+            }
             Self::ModifyEvent { index, after, .. } => {
                 let ev = script
                     .events_section_mut()
@@ -102,7 +124,8 @@ impl EditCommand {
                     .events_section_mut()
                     .and_then(|sec| sec.get_event_mut(*index))
                     .ok_or(AssError::EventIndexOutOfRange(*index))?;
-                ev.set_text(after.clone());
+                after.clone_into(&mut ev.text);
+                ev.raw_line = None;
                 Ok(())
             }
             Self::InsertStyle { index, style } => {
@@ -177,6 +200,15 @@ impl EditCommand {
                     .ok_or(AssError::InvalidPermutation(order.len()))?;
                 sec.permute_events(&inv)
             }
+            Self::ModifyEventTimes(changes) => {
+                if changes.is_empty() {
+                    return Ok(());
+                }
+                let sec = script
+                    .events_section_mut()
+                    .ok_or(AssError::EventIndexOutOfRange(changes[0].index))?;
+                apply_time_changes(sec, changes, false)
+            }
             Self::ModifyEvent { index, before, .. } => {
                 let ev = script
                     .events_section_mut()
@@ -190,7 +222,8 @@ impl EditCommand {
                     .events_section_mut()
                     .and_then(|sec| sec.get_event_mut(*index))
                     .ok_or(AssError::EventIndexOutOfRange(*index))?;
-                ev.set_text(before.clone());
+                before.clone_into(&mut ev.text);
+                ev.raw_line = None;
                 Ok(())
             }
             Self::InsertStyle { index, .. } => {
@@ -245,6 +278,9 @@ impl EditCommand {
                         .sum::<usize>()
             }
             Self::PermuteEvents(order) => order.capacity() * std::mem::size_of::<usize>(),
+            Self::ModifyEventTimes(changes) => {
+                changes.capacity() * std::mem::size_of::<EventTimeChange>()
+            }
             Self::ModifyEvent { before, after, .. } => {
                 event_heap_bytes(before) + event_heap_bytes(after)
             }
@@ -264,6 +300,52 @@ impl EditCommand {
         };
         base.saturating_add(extra)
     }
+}
+
+fn apply_time_changes(
+    sec: &mut crate::model::EventsSection,
+    changes: &[EventTimeChange],
+    forward: bool,
+) -> Result<(), AssError> {
+    if sec.refresh_all_events_cache() {
+        for ch in changes {
+            let Some(crate::model::EventEntry::Event(ev)) = sec.entries.get_mut(ch.index) else {
+                return Err(AssError::EventIndexOutOfRange(ch.index));
+            };
+            let (s, e) = if forward {
+                (ch.after_start, ch.after_end)
+            } else {
+                (ch.before_start, ch.before_end)
+            };
+            ev.set_start(s);
+            ev.set_end(e);
+        }
+        return Ok(());
+    }
+
+    // Fallback when non-event entries (comments/blanks) exist: single O(N + M) pass if sorted,
+    // or indexed lookup otherwise.
+    let mut entry_positions: Vec<usize> = Vec::with_capacity(sec.entries.len());
+    for (pos, entry) in sec.entries.iter().enumerate() {
+        if matches!(entry, crate::model::EventEntry::Event(_)) {
+            entry_positions.push(pos);
+        }
+    }
+    for ch in changes {
+        let Some(&pos) = entry_positions.get(ch.index) else {
+            return Err(AssError::EventIndexOutOfRange(ch.index));
+        };
+        if let crate::model::EventEntry::Event(ref mut ev) = sec.entries[pos] {
+            let (s, e) = if forward {
+                (ch.after_start, ch.after_end)
+            } else {
+                (ch.before_start, ch.before_end)
+            };
+            ev.set_start(s);
+            ev.set_end(e);
+        }
+    }
+    Ok(())
 }
 
 fn apply_script_info_value(script: &mut ScriptFile, key: &str, value: Option<&str>) {

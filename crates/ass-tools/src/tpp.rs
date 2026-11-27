@@ -13,7 +13,7 @@
 //!    kf + start_after_ms]` and `end` within `[kf - end_before_ms, kf + end_after_ms]` using
 //!    Aegisub's four independent thresholds.
 
-use ass_core::{AssTime, EditCommand, EventKind, ScriptFile};
+use ass_core::{AssTime, EditCommand, EventKind, EventTimeChange, ScriptFile};
 
 /// Configuration for adjacent-line linking.
 #[derive(Debug, Clone, Copy)]
@@ -149,26 +149,25 @@ pub fn timing_post_process(script: &ScriptFile, opts: TppOptions<'_>) -> EditCom
         }
     }
 
-    // Emit ModifyEvent commands only for lines whose timestamps actually changed.
-    let mut cmds = Vec::new();
+    // Emit compact timestamp changes only for lines whose timestamps actually changed.
+    let mut changes = Vec::with_capacity(items.len());
     for (idx, new_start_cs, new_end_cs) in items {
         if let Some(&ev) = all_events.get(idx) {
             let new_start = AssTime::from_cs(new_start_cs);
             let new_end = AssTime::from_cs(new_end_cs);
             if new_start != ev.start() || new_end != ev.end() {
-                let mut after = ev.clone();
-                after.set_start(new_start);
-                after.set_end(new_end);
-                cmds.push(EditCommand::ModifyEvent {
+                changes.push(EventTimeChange {
                     index: idx,
-                    before: Box::new(ev.clone()),
-                    after: Box::new(after),
+                    before_start: ev.start(),
+                    before_end: ev.end(),
+                    after_start: new_start,
+                    after_end: new_end,
                 });
             }
         }
     }
 
-    EditCommand::Batch(cmds)
+    EditCommand::ModifyEventTimes(changes)
 }
 
 #[inline]

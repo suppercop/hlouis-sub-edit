@@ -44,10 +44,10 @@ impl TokenKind {
     }
 }
 
-/// Tokenizes an ASS dialogue line into contiguous spans covering `0..text.len()`.
-#[must_use]
-pub fn tokenize_ass_line(text: &str) -> Vec<HighlightSpan> {
-    let mut spans = Vec::new();
+/// Tokenizes an ASS dialogue line into an existing scratch `Vec<HighlightSpan>` without
+/// allocating when capacity suffices.
+pub fn tokenize_ass_line_into(text: &str, spans: &mut Vec<HighlightSpan>) {
+    spans.clear();
     let bytes = text.as_bytes();
     let len = bytes.len();
     let mut i = 0usize;
@@ -55,39 +55,47 @@ pub fn tokenize_ass_line(text: &str) -> Vec<HighlightSpan> {
 
     while i < len {
         if bytes[i] == b'{' {
-            push_span(&mut spans, i, i + 1, TokenKind::Brace);
+            push_span(spans, i, i + 1, TokenKind::Brace);
             i += 1;
-            i = scan_override_block(text, i, &mut spans, &mut drawing_level);
+            i = scan_override_block(text, i, spans, &mut drawing_level);
             if i < len && bytes[i] == b'}' {
-                push_span(&mut spans, i, i + 1, TokenKind::Brace);
+                push_span(spans, i, i + 1, TokenKind::Brace);
                 i += 1;
             }
         } else {
             let next_brace = find_byte(bytes, i, b'{').unwrap_or(len);
             if drawing_level > 0 {
-                scan_drawing_segment(text, i, next_brace, &mut spans);
+                scan_drawing_segment(text, i, next_brace, spans);
             } else {
-                scan_dialogue_segment(text, i, next_brace, &mut spans);
+                scan_dialogue_segment(text, i, next_brace, spans);
             }
             i = next_brace;
         }
     }
+}
 
+/// Tokenizes an ASS dialogue line into contiguous spans covering `0..text.len()`.
+#[must_use]
+pub fn tokenize_ass_line(text: &str) -> Vec<HighlightSpan> {
+    let mut spans = Vec::with_capacity(16);
+    tokenize_ass_line_into(text, &mut spans);
     spans
 }
 
-/// Builds an `egui::text::LayoutJob` with syntax colors from `palette`.
+/// Builds an `egui::text::LayoutJob` with syntax colors from `palette`, reusing `scratch` spans.
 #[must_use]
-pub fn build_layout_job(
+pub fn build_layout_job_with_scratch(
     text: &str,
     font_id: &FontId,
     wrap_width: f32,
     palette: &ThemePalette,
+    scratch: &mut Vec<HighlightSpan>,
 ) -> LayoutJob {
+    tokenize_ass_line_into(text, scratch);
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
 
-    for span in tokenize_ass_line(text) {
+    for span in scratch.iter() {
         if let Some(slice) = text.get(span.start..span.end) {
             let format = TextFormat {
                 font_id: font_id.clone(),
@@ -111,6 +119,18 @@ pub fn build_layout_job(
     }
 
     job
+}
+
+/// Builds an `egui::text::LayoutJob` with syntax colors from `palette`.
+#[must_use]
+pub fn build_layout_job(
+    text: &str,
+    font_id: &FontId,
+    wrap_width: f32,
+    palette: &ThemePalette,
+) -> LayoutJob {
+    let mut scratch = Vec::with_capacity(16);
+    build_layout_job_with_scratch(text, font_id, wrap_width, palette, &mut scratch)
 }
 
 fn push_span(spans: &mut Vec<HighlightSpan>, start: usize, end: usize, kind: TokenKind) {

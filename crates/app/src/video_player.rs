@@ -7,6 +7,7 @@ use media::{
     PreindexHandle, PreindexProgress, UpgradeStatus, VideoInfo, VideoProvider,
 };
 use render::AssSubRenderer;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -234,6 +235,15 @@ const EXACT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PREINDEX_IDLE_COOLDOWN: Duration = Duration::from_millis(500);
 const MAX_POOLED_BUFFERS_PLAYING: usize = 4;
 const MAX_POOLED_BUFFERS_PAUSED: usize = 1;
+const MAX_CLEAN_PAUSED_FRAMES: usize = 4;
+
+struct CleanPausedFrame {
+    frame_index: usize,
+    pts_ms: i64,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
 
 #[allow(clippy::struct_excessive_bools)]
 struct WorkerState {
@@ -247,6 +257,7 @@ struct WorkerState {
     loop_playback: bool,
     generation: u64,
     buffer_pool: Vec<Vec<u8>>,
+    clean_paused_cache: VecDeque<CleanPausedFrame>,
     idle_preindex_siblings: bool,
     index_cache_max_mb: u64,
     preindex: Option<PreindexHandle>,
@@ -282,6 +293,10 @@ impl WorkerState {
             self.buffer_pool.truncate(cap);
             self.buffer_pool.shrink_to_fit();
         }
+    }
+
+    fn clear_clean_paused(&mut self) {
+        self.clean_paused_cache.clear();
     }
 
     fn pause_preindex_for_activity(&mut self) {
@@ -321,37 +336,73 @@ impl WorkerState {
     fn render_frame(
         &mut self,
         frame_index: usize,
+        cache_clean: bool,
         evt_tx: &mpsc::Sender<PlayerEvent>,
     ) -> Result<ReadyFrame, String> {
         self.pause_preindex_for_activity();
         let mut rgba = self.buffer_pool.pop().unwrap_or_default();
-        let video = self
-            .video
-            .as_mut()
-            .ok_or_else(|| "no video loaded".to_owned())?;
-        let info = video.info().clone();
-        if frame_index >= info.num_frames {
-            self.buffer_pool.push(rgba);
-            return Err("frame out of range".to_owned());
-        }
-
-        let t_decode = Instant::now();
-        let decode_res = video.decode_frame_into(frame_index, &mut rgba);
-        if let Some(notice) = video.take_fallback_notice() {
-            let _ = evt_tx.send(PlayerEvent::ProviderNotice(notice));
-        }
-        let pts_ms = match decode_res {
-            Ok(pts) => pts,
-            Err(err) => {
-                self.buffer_pool.push(rgba);
-                return Err(err.to_string());
-            }
+        let cached = if cache_clean {
+            self.clean_paused_cache
+                .iter()
+                .position(|c| c.frame_index == frame_index)
+                .and_then(|pos| self.clean_paused_cache.remove(pos))
+        } else {
+            None
         };
-        let decode_ms = t_decode.elapsed().as_secs_f32() * 1000.0;
+        let (pts_ms, width, height, decode_ms) = if let Some(clean) = cached {
+            rgba.clear();
+            rgba.extend_from_slice(&clean.rgba);
+            let out = (clean.pts_ms, clean.width, clean.height, 0.0);
+            self.clean_paused_cache.push_back(clean);
+            out
+        } else {
+            let video = self
+                .video
+                .as_mut()
+                .ok_or_else(|| "no video loaded".to_owned())?;
+            let info = video.info().clone();
+            if frame_index >= info.num_frames {
+                self.buffer_pool.push(rgba);
+                return Err("frame out of range".to_owned());
+            }
+
+            let t_decode = Instant::now();
+            let decode_res = video.decode_frame_into(frame_index, &mut rgba);
+            if let Some(notice) = video.take_fallback_notice() {
+                let _ = evt_tx.send(PlayerEvent::ProviderNotice(notice));
+            }
+            let pts_ms = match decode_res {
+                Ok(pts) => pts,
+                Err(err) => {
+                    self.buffer_pool.push(rgba);
+                    return Err(err.to_string());
+                }
+            };
+            let decode_ms = t_decode.elapsed().as_secs_f32() * 1000.0;
+            if cache_clean {
+                let buf = if self.clean_paused_cache.len() >= MAX_CLEAN_PAUSED_FRAMES {
+                    if let Some(mut evicted) = self.clean_paused_cache.pop_front() {
+                        evicted.rgba.clear();
+                        evicted.rgba.extend_from_slice(&rgba);
+                        evicted.rgba
+                    } else {
+                        rgba.clone()
+                    }
+                } else {
+                    rgba.clone()
+                };
+                self.clean_paused_cache.push_back(CleanPausedFrame {
+                    frame_index,
+                    pts_ms,
+                    width: info.width,
+                    height: info.height,
+                    rgba: buf,
+                });
+            }
+            (pts_ms, info.width, info.height, decode_ms)
+        };
 
         let t_render = Instant::now();
-        let width = info.width;
-        let height = info.height;
         let render_res = {
             let renderer = self.ensure_renderer(width, height)?;
             renderer.render_and_blend_rgba(pts_ms, &mut rgba, width, height)
@@ -405,6 +456,12 @@ fn coalesce_commands(cmds: Vec<PlayerCmd>) -> Vec<PlayerCmd> {
                 }
                 _ => out.push(PlayerCmd::StepFrame(delta)),
             },
+            PlayerCmd::LoadAssMemory(text) => {
+                while matches!(out.last(), Some(PlayerCmd::LoadAssMemory(_))) {
+                    out.pop();
+                }
+                out.push(PlayerCmd::LoadAssMemory(text));
+            }
             other => out.push(other),
         }
     }
@@ -434,6 +491,7 @@ fn worker_loop(
         loop_playback: false,
         generation: 1,
         buffer_pool: Vec::new(),
+        clean_paused_cache: VecDeque::with_capacity(MAX_CLEAN_PAUSED_FRAMES),
         idle_preindex_siblings,
         index_cache_max_mb,
         preindex: None,
@@ -556,7 +614,7 @@ fn step_playback(
         return;
     };
 
-    match state.render_frame(next_frame, evt_tx) {
+    match state.render_frame(next_frame, false, evt_tx) {
         Ok(frame) => {
             state.current_frame = next_frame;
             queued_frames.fetch_add(1, Ordering::Relaxed);
@@ -583,6 +641,7 @@ fn handle_open_video(
     ctx: &egui::Context,
 ) {
     state.playing = false;
+    state.clear_clean_paused();
     state.stop_preindex(evt_tx);
     state.current_video_path = None;
     // Closing the previous file cancels its background index (HybridVideo::drop).
@@ -681,6 +740,7 @@ fn poll_exact_index(
         UpgradeStatus::Switched => {
             let info = video.info().clone();
             let still_indexing = video.is_indexing();
+            state.clear_clean_paused();
             state.current_frame = state.current_frame.min(info.num_frames.saturating_sub(1));
             let _ = evt_tx.send(PlayerEvent::ExactReady { info });
             if !state.playing {
@@ -805,6 +865,7 @@ fn handle_command(
         PlayerCmd::SetPlaying(play) => {
             state.playing = play && state.video.is_some();
             if state.playing {
+                state.clear_clean_paused();
                 state.pause_preindex_for_activity();
             } else {
                 state.trim_pool();
@@ -917,7 +978,7 @@ fn emit_seek_frame(
     queued_frames: &AtomicUsize,
     ctx: &egui::Context,
 ) {
-    match state.render_frame(target, evt_tx) {
+    match state.render_frame(target, true, evt_tx) {
         Ok(frame) => {
             state.current_frame = target;
             queued_frames.fetch_add(1, Ordering::Relaxed);

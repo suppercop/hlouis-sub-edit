@@ -2108,6 +2108,7 @@ name = "hlouis-sub-edit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ass-core",
  "criterion",
  "dark-light",
  "eframe",

@@ -7,7 +7,7 @@
 //! - Times: Start only, End only, or Both Start and End.
 
 use crate::ToolsError;
-use ass_core::{AssTime, EditCommand, ScriptFile};
+use ass_core::{AssTime, EditCommand, EventTimeChange, ScriptFile};
 use std::collections::BTreeSet;
 
 /// Amount to shift timestamps by.
@@ -66,7 +66,11 @@ pub fn shift_times(script: &ScriptFile, opts: ShiftOptions<'_>) -> Result<EditCo
         return Ok(EditCommand::Batch(Vec::new()));
     };
 
-    let mut cmds = Vec::new();
+    let mut changes = Vec::with_capacity(match opts.affect {
+        ShiftAffect::All => events_sec.entries.len(),
+        ShiftAffect::Selected(sel) => sel.len(),
+        ShiftAffect::SelectionOnward(first) => events_sec.entries.len().saturating_sub(first),
+    });
     for (idx, ev) in events_sec.events().enumerate() {
         let affected = match opts.affect {
             ShiftAffect::All => true,
@@ -98,18 +102,17 @@ pub fn shift_times(script: &ScriptFile, opts: ShiftOptions<'_>) -> Result<EditCo
         };
 
         if final_start != ev.start() || final_end != ev.end() {
-            let mut after = ev.clone();
-            after.set_start(final_start);
-            after.set_end(final_end);
-            cmds.push(EditCommand::ModifyEvent {
+            changes.push(EventTimeChange {
                 index: idx,
-                before: Box::new(ev.clone()),
-                after: Box::new(after),
+                before_start: ev.start(),
+                before_end: ev.end(),
+                after_start: final_start,
+                after_end: final_end,
             });
         }
     }
 
-    Ok(EditCommand::Batch(cmds))
+    Ok(EditCommand::ModifyEventTimes(changes))
 }
 
 fn shift_single_time(time: AssTime, amount: ShiftAmount<'_>, dir: ShiftDirection) -> AssTime {

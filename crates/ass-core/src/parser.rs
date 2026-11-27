@@ -3,8 +3,7 @@
 use crate::charset::{decode_bytes, DetectedEncoding};
 use crate::model::{
     AssEvent, AssStyle, EventEntry, EventKind, EventsSection, KeyValueEntry, KeyValueSection,
-    LineEnding, RawSection, ScriptFile, Section, StyleEntry, StylesSection, DEFAULT_EVENT_FORMAT,
-    DEFAULT_STYLE_FORMAT,
+    LineEnding, RawSection, ScriptFile, Section, StyleEntry, StylesSection, DEFAULT_STYLE_FORMAT,
 };
 use crate::time::AssTime;
 use crate::{ParseOutcome, ParseWarning};
@@ -42,6 +41,8 @@ pub fn parse_ass(input: &str) -> ParseOutcome<ScriptFile> {
     let mut sections: Vec<Section> = Vec::new();
     let mut current: Option<Section> = None;
     let mut mixed_endings: Option<Vec<LineEnding>> = None;
+    let mut ev_default_fmt = true;
+    let mut ev_all_only = true;
 
     for (zero_idx, (raw_line, term)) in split_lines_with_endings(body).enumerate() {
         if let Some(le) = term {
@@ -54,26 +55,56 @@ pub fn parse_ass(input: &str) -> ParseOutcome<ScriptFile> {
             }
         }
         let line_no = zero_idx + 1;
-        let trimmed = raw_line.trim();
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-            if let Some(sec) = current.take() {
-                sections.push(sec);
+        let maybe_header = raw_line
+            .as_bytes()
+            .first()
+            .is_some_and(|&b| b == b'[' || b.is_ascii_whitespace());
+        if maybe_header {
+            let trimmed = raw_line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+                if let Some(mut sec) = current.take() {
+                    if let Section::Events(ref mut ev) = sec {
+                        ev.set_all_events_cache(ev_all_only);
+                    }
+                    sections.push(sec);
+                }
+                let mut next_sec = start_section(raw_line, trimmed);
+                if let Section::Events(ref mut ev) = next_sec {
+                    // Estimate event count from input size (typically ~100-130 bytes/line) to avoid Vec regrowth.
+                    let est = (body.len() / 100).saturating_add(8);
+                    ev.entries.reserve(est);
+                    ev_default_fmt = true;
+                    ev_all_only = true;
+                }
+                current = Some(next_sec);
+                continue;
             }
-            current = Some(start_section(raw_line, trimmed));
-            continue;
         }
 
         if current.is_none() {
             current = Some(Section::Preamble(Vec::new()));
         }
 
-        if let Some(sec) = current.as_mut() {
-            push_section_line(sec, raw_line, line_no, &mut warnings);
+        match current.as_mut() {
+            Some(Section::Events(sec)) => {
+                parse_event_line(
+                    sec,
+                    raw_line,
+                    line_no,
+                    &mut warnings,
+                    &mut ev_default_fmt,
+                    &mut ev_all_only,
+                );
+            }
+            Some(sec) => push_section_line(sec, raw_line, line_no, &mut warnings),
+            None => {}
         }
     }
 
-    if let Some(sec) = current {
+    if let Some(mut sec) = current {
+        if let Section::Events(ref mut ev) = sec {
+            ev.set_all_events_cache(ev_all_only);
+        }
         sections.push(sec);
     }
 
@@ -166,15 +197,7 @@ fn start_section(raw_header: &str, trimmed: &str) -> Section {
             entries: Vec::new(),
         })
     } else if trimmed.eq_ignore_ascii_case("[Events]") {
-        Section::Events(EventsSection {
-            header: raw_header.to_owned(),
-            format: DEFAULT_EVENT_FORMAT
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            raw_format_line: None,
-            entries: Vec::new(),
-        })
+        Section::Events(EventsSection::new(raw_header))
     } else if trimmed.eq_ignore_ascii_case("[Fonts]") {
         Section::Fonts(RawSection {
             header: raw_header.to_owned(),
@@ -205,7 +228,18 @@ fn push_section_line(
             kv.entries.push(parse_kv_entry(raw_line));
         }
         Section::Styles(sec) => parse_style_line(sec, raw_line, line_no, warnings),
-        Section::Events(sec) => parse_event_line(sec, raw_line, line_no, warnings),
+        Section::Events(sec) => {
+            let mut default_fmt = is_default_event_format(&sec.format);
+            let mut all_ev = true;
+            parse_event_line(
+                sec,
+                raw_line,
+                line_no,
+                warnings,
+                &mut default_fmt,
+                &mut all_ev,
+            );
+        }
         Section::Fonts(raw) | Section::Graphics(raw) | Section::Unknown(raw) => {
             raw.lines.push(raw_line.to_owned());
         }
@@ -366,17 +400,22 @@ fn parse_event_line(
     raw_line: &str,
     line_no: usize,
     warnings: &mut Vec<ParseWarning>,
+    default_fmt: &mut bool,
+    all_ev: &mut bool,
 ) {
     if raw_line.is_empty() {
+        *all_ev = false;
         sec.entries.push(EventEntry::Blank);
         return;
     }
     if raw_line.starts_with(';') {
+        *all_ev = false;
         sec.entries.push(EventEntry::Comment(raw_line.to_owned()));
         return;
     }
     if sec.raw_format_line.is_none() {
         if let Some(cols) = parse_format_columns(raw_line) {
+            *default_fmt = is_default_event_format(&cols);
             sec.format = cols;
             sec.raw_format_line = Some(raw_line.to_owned());
             return;
@@ -388,6 +427,7 @@ fn parse_event_line(
     } else if let Some(r) = raw_line.strip_prefix("Comment:") {
         (EventKind::Comment, r)
     } else {
+        *all_ev = false;
         sec.entries.push(EventEntry::Raw(raw_line.to_owned()));
         return;
     };
@@ -420,19 +460,23 @@ fn parse_event_line(
     };
 
     let mut is_canonical = has_canonical_space;
-    let mut parsed_fields = 0usize;
-
-    for (col_name, raw_val) in sec.format.iter().zip(payload.splitn(col_count, ',')) {
-        parsed_fields += 1;
-        apply_event_field(
-            &mut event,
-            col_name,
-            raw_val,
-            line_no,
-            warnings,
-            &mut is_canonical,
-        );
-    }
+    let parsed_fields = if *default_fmt {
+        parse_default_event_fields(&mut event, payload, line_no, warnings, &mut is_canonical)
+    } else {
+        let mut count = 0usize;
+        for (col_name, raw_val) in sec.format.iter().zip(payload.splitn(col_count, ',')) {
+            count += 1;
+            apply_event_field(
+                &mut event,
+                col_name,
+                raw_val,
+                line_no,
+                warnings,
+                &mut is_canonical,
+            );
+        }
+        count
+    };
 
     if parsed_fields < sec.format.len() {
         is_canonical = false;
@@ -454,6 +498,192 @@ fn parse_event_line(
     }
 
     sec.entries.push(EventEntry::Event(event));
+}
+
+#[inline]
+fn parse_default_event_fields(
+    event: &mut AssEvent,
+    payload: &str,
+    line_no: usize,
+    warnings: &mut Vec<ParseWarning>,
+    is_canonical: &mut bool,
+) -> usize {
+    // Fast path for complete 10-column lines using direct `split_once(',')` (memchr).
+    let Some((f_layer, r)) = payload.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+    let Some((f_start, r)) = r.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+    let Some((f_end, r)) = r.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+    let Some((f_style, r)) = r.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+    let Some((f_name, r)) = r.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+    let Some((left_m, r)) = r.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+    let Some((right_m, r)) = r.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+    let Some((vert_m, r)) = r.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+    let Some((f_eff, f_text)) = r.split_once(',') else {
+        return parse_default_event_fields_partial(event, payload, line_no, warnings, is_canonical);
+    };
+
+    parse_event_int(
+        f_layer,
+        &mut event.layer,
+        "Layer",
+        line_no,
+        warnings,
+        is_canonical,
+    );
+    parse_event_time(
+        f_start,
+        &mut event.start,
+        "Start",
+        line_no,
+        warnings,
+        is_canonical,
+    );
+    parse_event_time(
+        f_end,
+        &mut event.end,
+        "End",
+        line_no,
+        warnings,
+        is_canonical,
+    );
+    f_style.clone_into(&mut event.style);
+    f_name.clone_into(&mut event.name);
+    parse_event_int(
+        left_m,
+        &mut event.margin_l,
+        "MarginL",
+        line_no,
+        warnings,
+        is_canonical,
+    );
+    parse_event_int(
+        right_m,
+        &mut event.margin_r,
+        "MarginR",
+        line_no,
+        warnings,
+        is_canonical,
+    );
+    parse_event_int(
+        vert_m,
+        &mut event.margin_v,
+        "MarginV",
+        line_no,
+        warnings,
+        is_canonical,
+    );
+    f_eff.clone_into(&mut event.effect);
+    f_text.clone_into(&mut event.text);
+    10
+}
+
+fn parse_default_event_fields_partial(
+    event: &mut AssEvent,
+    payload: &str,
+    line_no: usize,
+    warnings: &mut Vec<ParseWarning>,
+    is_canonical: &mut bool,
+) -> usize {
+    let mut parsed_fields = 0usize;
+    let mut it = payload.splitn(10, ',');
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        parse_event_int(
+            raw_val,
+            &mut event.layer,
+            "Layer",
+            line_no,
+            warnings,
+            is_canonical,
+        );
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        parse_event_time(
+            raw_val,
+            &mut event.start,
+            "Start",
+            line_no,
+            warnings,
+            is_canonical,
+        );
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        parse_event_time(
+            raw_val,
+            &mut event.end,
+            "End",
+            line_no,
+            warnings,
+            is_canonical,
+        );
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        raw_val.clone_into(&mut event.style);
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        raw_val.clone_into(&mut event.name);
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        parse_event_int(
+            raw_val,
+            &mut event.margin_l,
+            "MarginL",
+            line_no,
+            warnings,
+            is_canonical,
+        );
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        parse_event_int(
+            raw_val,
+            &mut event.margin_r,
+            "MarginR",
+            line_no,
+            warnings,
+            is_canonical,
+        );
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        parse_event_int(
+            raw_val,
+            &mut event.margin_v,
+            "MarginV",
+            line_no,
+            warnings,
+            is_canonical,
+        );
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        raw_val.clone_into(&mut event.effect);
+    }
+    if let Some(raw_val) = it.next() {
+        parsed_fields += 1;
+        raw_val.clone_into(&mut event.text);
+    }
+    parsed_fields
 }
 
 fn apply_event_field(
@@ -483,34 +713,24 @@ fn apply_event_field(
             }
         }
         "Start" | "start" => {
-            if let Some(t) = AssTime::parse_ass(raw_val) {
-                event.start = t;
-                if !is_canonical_time(raw_val, t) {
-                    *is_canonical = false;
-                }
-            } else {
-                *is_canonical = false;
-                warnings.push(ParseWarning {
-                    line: line_no,
-                    message: format!(
-                        "invalid Start timestamp `{raw_val}`; defaulting to 0:00:00.00"
-                    ),
-                });
-            }
+            parse_event_time(
+                raw_val,
+                &mut event.start,
+                "Start",
+                line_no,
+                warnings,
+                is_canonical,
+            );
         }
         "End" | "end" => {
-            if let Some(t) = AssTime::parse_ass(raw_val) {
-                event.end = t;
-                if !is_canonical_time(raw_val, t) {
-                    *is_canonical = false;
-                }
-            } else {
-                *is_canonical = false;
-                warnings.push(ParseWarning {
-                    line: line_no,
-                    message: format!("invalid End timestamp `{raw_val}`; defaulting to 0:00:00.00"),
-                });
-            }
+            parse_event_time(
+                raw_val,
+                &mut event.end,
+                "End",
+                line_no,
+                warnings,
+                is_canonical,
+            );
         }
         "Style" | "style" => raw_val.clone_into(&mut event.style),
         "Name" | "name" | "Actor" | "actor" => raw_val.clone_into(&mut event.name),
@@ -552,6 +772,44 @@ fn apply_event_field(
     }
 }
 
+fn is_default_event_format(format: &[String]) -> bool {
+    format.len() == 10
+        && format[0] == "Layer"
+        && format[1] == "Start"
+        && format[2] == "End"
+        && format[3] == "Style"
+        && format[4] == "Name"
+        && format[5] == "MarginL"
+        && format[6] == "MarginR"
+        && format[7] == "MarginV"
+        && format[8] == "Effect"
+        && format[9] == "Text"
+}
+
+#[inline]
+fn parse_event_time(
+    raw_val: &str,
+    dest: &mut AssTime,
+    field: &str,
+    line_no: usize,
+    warnings: &mut Vec<ParseWarning>,
+    is_canonical: &mut bool,
+) {
+    if let Some((t, canonical)) = AssTime::parse_ass_canonical(raw_val) {
+        *dest = t;
+        if !canonical {
+            *is_canonical = false;
+        }
+    } else {
+        *is_canonical = false;
+        warnings.push(ParseWarning {
+            line: line_no,
+            message: format!("invalid {field} timestamp `{raw_val}`; defaulting to 0:00:00.00"),
+        });
+    }
+}
+
+#[inline]
 fn parse_event_int(
     raw_val: &str,
     dest: &mut i32,
@@ -560,6 +818,11 @@ fn parse_event_int(
     warnings: &mut Vec<ParseWarning>,
     is_canonical: &mut bool,
 ) {
+    let b = raw_val.as_bytes();
+    if b.len() == 1 && b[0].is_ascii_digit() {
+        *dest = i32::from(b[0] - b'0');
+        return;
+    }
     if let Ok(v) = raw_val.parse::<i32>() {
         *dest = v;
         if !is_canonical_int(raw_val, v) {
@@ -594,33 +857,6 @@ fn is_canonical_int(raw: &str, value: i32) -> bool {
         bytes
     };
     !digits.is_empty() && digits[0] != b'0' && digits.iter().all(u8::is_ascii_digit)
-}
-
-fn is_canonical_time(raw: &str, time: AssTime) -> bool {
-    // Fast allocation-free check for canonical `H:MM:SS.cc` (1-digit hour when < 10).
-    let (h, m, s, cs) = time.to_hms_cs();
-    let bytes = raw.as_bytes();
-    if h < 10 {
-        if bytes.len() != 10 {
-            return false;
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let expected = [
-            b'0' + (h as u8),
-            b':',
-            b'0' + ((m / 10) as u8),
-            b'0' + ((m % 10) as u8),
-            b':',
-            b'0' + ((s / 10) as u8),
-            b'0' + ((s % 10) as u8),
-            b'.',
-            b'0' + ((cs / 10) as u8),
-            b'0' + ((cs % 10) as u8),
-        ];
-        bytes == expected
-    } else {
-        raw == time.to_ass_string()
-    }
 }
 
 fn parse_i32_field(

@@ -14,10 +14,7 @@
 
 use crate::karaoke::parse_karaoke_syllables;
 use crate::ToolsError;
-use ass_core::{
-    parse_text_blocks, serialize_text_blocks, AssEvent, AssTime, EditCommand, EscapeKind,
-    ScriptFile, TextBlock,
-};
+use ass_core::{scan_override_block, AssEvent, AssTime, EditCommand, ScriptFile};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -189,25 +186,57 @@ fn split_at_cursor(ev: &AssEvent, byte_pos: usize) -> Vec<(AssTime, AssTime, Str
 }
 
 fn split_by_hard_newline(ev: &AssEvent) -> Vec<(AssTime, AssTime, String)> {
-    let blocks = parse_text_blocks(ev.text());
-    let mut segments: Vec<Vec<TextBlock>> = vec![Vec::new()];
-
-    for block in blocks {
-        if matches!(block, TextBlock::Escape(EscapeKind::HardNewline)) {
-            segments.push(Vec::new());
-        } else if let Some(last) = segments.last_mut() {
-            last.push(block);
-        }
-    }
-
-    if segments.len() < 2 {
+    let text = ev.text();
+    if !text.contains(r"\N") {
         return Vec::new();
     }
 
-    let texts: Vec<String> = segments
-        .iter()
-        .map(|seg| serialize_text_blocks(seg))
-        .collect();
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut texts: Vec<String> = Vec::new();
+    let mut seg = String::new();
+    let mut drawing_level = 0u32;
+    let mut i = 0usize;
+
+    while i < len {
+        if bytes[i] == b'{' {
+            let (next, _) = scan_override_block(text, i + 1, |item| {
+                if let ass_core::RawOverrideItem::Tag {
+                    name: "p",
+                    raw_args,
+                } = item
+                {
+                    if let Ok(lvl) = raw_args.trim().parse::<u32>() {
+                        drawing_level = lvl;
+                    }
+                }
+            });
+            seg.push_str(&text[i..next]);
+            i = next;
+        } else if drawing_level == 0 && i + 1 < len && bytes[i] == b'\\' && bytes[i + 1] == b'N' {
+            texts.push(std::mem::take(&mut seg));
+            i += 2;
+        } else {
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != b'{' && (drawing_level > 0 || bytes[i] != b'\\') {
+                i += 1;
+            }
+            if i < len
+                && bytes[i] == b'\\'
+                && drawing_level == 0
+                && !(i + 1 < len && bytes[i + 1] == b'N')
+            {
+                i += 1;
+            }
+            seg.push_str(&text[start..i]);
+        }
+    }
+    texts.push(seg);
+
+    if texts.len() < 2 {
+        return Vec::new();
+    }
     distribute_times_proportionally(ev.start(), ev.end(), texts)
 }
 
@@ -266,13 +295,53 @@ fn distribute_times_proportionally(
 }
 
 fn visible_chars_len(text: &str) -> usize {
-    parse_text_blocks(text)
-        .into_iter()
-        .map(|b| match b {
-            TextBlock::Plain(s) => s.chars().count(),
-            _ => 0,
-        })
-        .sum()
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut count = 0usize;
+    let mut drawing_level = 0u32;
+    let mut i = 0usize;
+
+    while i < len {
+        if bytes[i] == b'{' {
+            let (next, _) = scan_override_block(text, i + 1, |item| {
+                if let ass_core::RawOverrideItem::Tag {
+                    name: "p",
+                    raw_args,
+                } = item
+                {
+                    if let Ok(lvl) = raw_args.trim().parse::<u32>() {
+                        drawing_level = lvl;
+                    }
+                }
+            });
+            i = next;
+        } else {
+            let next_brace = bytes[i..]
+                .iter()
+                .position(|&b| b == b'{')
+                .map_or(len, |rel| i + rel);
+            if drawing_level == 0 {
+                let mut j = i;
+                while j < next_brace {
+                    if bytes[j] == b'\\'
+                        && j + 1 < next_brace
+                        && matches!(bytes[j + 1], b'N' | b'n' | b'h')
+                    {
+                        j += 2;
+                    } else if bytes[j] < 0x80 {
+                        count += 1;
+                        j += 1;
+                    } else {
+                        let ch_len = text[j..next_brace].chars().next().map_or(1, char::len_utf8);
+                        count += 1;
+                        j += ch_len;
+                    }
+                }
+            }
+            i = next_brace;
+        }
+    }
+    count
 }
 
 #[cfg(test)]

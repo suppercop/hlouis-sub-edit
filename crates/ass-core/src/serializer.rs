@@ -62,7 +62,7 @@ fn estimate_capacity(script: &ScriptFile) -> usize {
     let mut cap = 512usize;
     for sec in &script.sections {
         match sec {
-            Section::Events(ev) => cap = cap.saturating_add(ev.entries.len().saturating_mul(96)),
+            Section::Events(ev) => cap = cap.saturating_add(ev.entries.len().saturating_mul(128)),
             Section::Styles(st) => cap = cap.saturating_add(st.entries.len().saturating_mul(128)),
             Section::Fonts(r) | Section::Graphics(r) | Section::Unknown(r) => {
                 cap = cap.saturating_add(r.lines.len().saturating_mul(84));
@@ -287,10 +287,37 @@ fn is_default_event_format(format: &[String]) -> bool {
         && format[9] == "Text"
 }
 
+#[inline]
+fn write_i32_ascii(out: &mut String, val: i32) {
+    if val == 0 {
+        out.push('0');
+        return;
+    }
+    let mut abs = val.unsigned_abs();
+    let mut buf = [0u8; 12];
+    let mut pos = buf.len();
+    while abs > 0 {
+        pos -= 1;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            buf[pos] = b'0' + (abs % 10) as u8;
+        }
+        abs /= 10;
+    }
+    if val < 0 {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    if let Ok(s) = std::str::from_utf8(&buf[pos..]) {
+        out.push_str(s);
+    }
+}
+
 fn write_standard_event(out: &mut String, ev: &AssEvent) {
     out.push_str(ev.kind.as_str());
     out.push_str(": ");
-    let _ = write!(out, "{},", ev.layer);
+    write_i32_ascii(out, ev.layer);
+    out.push(',');
     ev.start.write_ass(out);
     out.push(',');
     ev.end.write_ass(out);
@@ -298,7 +325,13 @@ fn write_standard_event(out: &mut String, ev: &AssEvent) {
     out.push_str(&ev.style);
     out.push(',');
     out.push_str(&ev.name);
-    let _ = write!(out, ",{},{},{},", ev.margin_l, ev.margin_r, ev.margin_v);
+    out.push(',');
+    write_i32_ascii(out, ev.margin_l);
+    out.push(',');
+    write_i32_ascii(out, ev.margin_r);
+    out.push(',');
+    write_i32_ascii(out, ev.margin_v);
+    out.push(',');
     out.push_str(&ev.effect);
     out.push(',');
     out.push_str(&ev.text);

@@ -361,6 +361,12 @@ pub(crate) fn blend_bitmap_into_rgba(
     if src_a == 0 {
         return;
     }
+    #[allow(clippy::cast_possible_truncation)]
+    let red = src_r as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let green = src_g as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let blue = src_b as u8;
 
     let frame_stride = (frame_width as usize) * 4;
     let start_src_x = usize::try_from(left_clip - x_start).unwrap_or(0);
@@ -379,28 +385,39 @@ pub(crate) fn blend_bitmap_into_rgba(
             if cov == 0 {
                 continue;
             }
-            let alpha = (src_a * u32::from(cov) + 127) / 255;
+            let alpha = if src_a == 255 {
+                u32::from(cov)
+            } else {
+                fast_div_255(src_a * u32::from(cov))
+            };
             if alpha == 0 {
                 continue;
             }
             let px = &mut dst_row[i * 4..i * 4 + 4];
             if alpha == 255 {
-                px[0] = u8::try_from(src_r).unwrap_or(255);
-                px[1] = u8::try_from(src_g).unwrap_or(255);
-                px[2] = u8::try_from(src_b).unwrap_or(255);
+                px[0] = red;
+                px[1] = green;
+                px[2] = blue;
                 px[3] = 255;
             } else {
                 let inv = 255 - alpha;
-                px[0] = u8::try_from((src_r * alpha + u32::from(px[0]) * inv + 127) / 255)
-                    .unwrap_or(255);
-                px[1] = u8::try_from((src_g * alpha + u32::from(px[1]) * inv + 127) / 255)
-                    .unwrap_or(255);
-                px[2] = u8::try_from((src_b * alpha + u32::from(px[2]) * inv + 127) / 255)
-                    .unwrap_or(255);
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    px[0] = fast_div_255(src_r * alpha + u32::from(px[0]) * inv) as u8;
+                    px[1] = fast_div_255(src_g * alpha + u32::from(px[1]) * inv) as u8;
+                    px[2] = fast_div_255(src_b * alpha + u32::from(px[2]) * inv) as u8;
+                }
                 px[3] = 255;
             }
         }
     }
+}
+
+/// Exact rounded division by 255 (`(x + 127) / 255`) for all `0 <= x <= 65025` without hardware div.
+#[inline]
+const fn fast_div_255(x: u32) -> u32 {
+    let t = x + 128;
+    (t + (t >> 8)) >> 8
 }
 
 #[cfg(test)]
