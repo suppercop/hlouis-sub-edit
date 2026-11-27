@@ -8,6 +8,7 @@ members = [
     "crates/keyframes",
     "crates/fonts",
     "crates/autosave",
+    "crates/project",
     "crates/i18n",
     "crates/libass-sys",
     "crates/ffms2-sys",
