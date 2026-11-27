@@ -27,7 +27,8 @@ pub use parser::{parse_ass, parse_ass_bytes};
 pub use serializer::{serialize_ass, serialize_ass_bytes};
 pub use srt::{parse_srt, parse_srt_bytes, write_srt};
 pub use tags::{
-    parse_text_blocks, serialize_text_blocks, EscapeKind, KaraokeKind, OverrideItem, OverrideTag,
+    parse_karaoke_tag, parse_tag_args, parse_text_blocks, scan_override_block,
+    serialize_text_blocks, EscapeKind, KaraokeKind, OverrideItem, OverrideTag, RawOverrideItem,
     TagArgs, TextBlock,
 };
 pub use time::AssTime;

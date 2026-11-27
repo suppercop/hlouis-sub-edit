@@ -246,24 +246,65 @@ fn parse_plain_segment(segment: &str, blocks: &mut Vec<TextBlock>) {
 
 fn parse_override_block(
     text: &str,
-    mut i: usize,
+    i: usize,
     drawing_level: &mut u32,
 ) -> (Vec<OverrideItem>, usize, bool) {
+    let mut items = Vec::new();
+    let (next, closed) = scan_override_block(text, i, |raw| match raw {
+        RawOverrideItem::Comment(c) => items.push(OverrideItem::Comment(c.to_owned())),
+        RawOverrideItem::Tag { name, raw_args } => {
+            let args = parse_tag_args(name, raw_args);
+            if let TagArgs::DrawingMode(lvl) = args {
+                *drawing_level = lvl;
+            }
+            items.push(OverrideItem::Tag(OverrideTag {
+                name: name.to_owned(),
+                args,
+                raw_args: raw_args.to_owned(),
+            }));
+        }
+    });
+    (items, next, closed)
+}
+
+/// Borrowed view of one item inside an override block (no allocation, no argument parsing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawOverrideItem<'a> {
+    /// Free text between tags inside `{...}`.
+    Comment(&'a str),
+    /// A `\name` tag with its exact raw argument text.
+    Tag {
+        /// Tag name without the leading backslash.
+        name: &'a str,
+        /// Raw argument text following the name.
+        raw_args: &'a str,
+    },
+}
+
+/// Scans the override block whose contents begin at byte `start` (just after `{`), calling `f`
+/// for every item. Returns the byte offset after the block (past `}` when closed) and whether
+/// the closing brace was present. This is the zero-allocation core shared by
+/// [`parse_text_blocks`].
+pub fn scan_override_block<'a>(
+    text: &'a str,
+    start: usize,
+    mut f: impl FnMut(RawOverrideItem<'a>),
+) -> (usize, bool) {
     let bytes = text.as_bytes();
     let len = bytes.len();
-    let mut items = Vec::new();
+    let mut i = start;
 
     while i < len && bytes[i] != b'}' {
         if bytes[i] != b'\\' {
-            let start = i;
+            let cstart = i;
             while i < len && bytes[i] != b'}' && bytes[i] != b'\\' {
                 i = advance_char(text, i);
             }
-            items.push(OverrideItem::Comment(text[start..i].to_owned()));
+            f(RawOverrideItem::Comment(&text[cstart..i]));
             continue;
         }
 
-        i += 1; // consume '\'
+        i += 1; // consume the backslash
         let (tag_name, after_name) = match_tag_name(bytes, i);
         i = after_name;
 
@@ -284,26 +325,36 @@ fn parse_override_block(
             }
         }
 
-        let raw_args = &text[arg_start..i];
-        let args = parse_tag_args(tag_name, raw_args);
-        if let TagArgs::DrawingMode(lvl) = args {
-            *drawing_level = lvl;
-        }
-        items.push(OverrideItem::Tag(OverrideTag {
-            name: tag_name.to_owned(),
-            args,
-            raw_args: raw_args.to_owned(),
-        }));
+        f(RawOverrideItem::Tag {
+            name: tag_name,
+            raw_args: &text[arg_start..i],
+        });
     }
 
     let closed = i < len && bytes[i] == b'}';
     if closed {
         i += 1;
     }
-    (items, i, closed)
+    (i, closed)
 }
 
-fn parse_tag_args(name: &str, raw_args: &str) -> TagArgs {
+/// Parses a karaoke tag (`k`, `kf`, `K`, `ko`, `kt`) with a valid integer duration.
+#[must_use]
+pub fn parse_karaoke_tag(name: &str, raw_args: &str) -> Option<(KaraokeKind, i64)> {
+    let kind = match name {
+        "k" => KaraokeKind::K,
+        "kf" => KaraokeKind::Kf,
+        "K" => KaraokeKind::CapitalK,
+        "ko" => KaraokeKind::Ko,
+        "kt" => KaraokeKind::Kt,
+        _ => return None,
+    };
+    raw_args.trim().parse::<i64>().ok().map(|d| (kind, d))
+}
+
+/// Parses the structured arguments of tag `name` from its exact `raw_args` text.
+#[must_use]
+pub fn parse_tag_args(name: &str, raw_args: &str) -> TagArgs {
     match name {
         "pos" | "org" => {
             if let Some(nums) = parse_paren_f64_list(raw_args) {
@@ -504,7 +555,7 @@ fn match_tag_name(bytes: &[u8], start: usize) -> (&str, usize) {
     let rest = &bytes[start..];
     for &tag in KNOWN_TAGS {
         let tb = tag.as_bytes();
-        if rest.starts_with(tb) {
+        if rest.first() == Some(&tb[0]) && rest.starts_with(tb) {
             return (tag, start + tb.len());
         }
     }

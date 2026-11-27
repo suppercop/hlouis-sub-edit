@@ -3,9 +3,7 @@
 //! Parsing a line into [`KaraokeSyllable`]s and rebuilding it with [`rebuild_karaoke_line`]
 //! reproduces the original ASS `Text` byte-for-byte when no syllable is mutated.
 
-use ass_core::{
-    parse_text_blocks, serialize_text_blocks, KaraokeKind, OverrideItem, TagArgs, TextBlock,
-};
+use ass_core::{parse_karaoke_tag, scan_override_block, KaraokeKind, RawOverrideItem};
 use std::fmt::Write as _;
 
 /// A single karaoke syllable (or leading untimed prefix) parsed from an ASS line.
@@ -43,17 +41,28 @@ impl KaraokeSyllable {
 /// exact original `text` byte-for-byte.
 #[must_use]
 pub fn parse_karaoke_syllables(text: &str) -> Vec<KaraokeSyllable> {
-    let blocks = parse_text_blocks(text);
+    let bytes = text.as_bytes();
     let mut state = ParseAccum::default();
-    for block in blocks {
-        match block {
-            TextBlock::Override { items, closed } => state.push_override(items, closed),
-            other => {
-                let s = serialize_text_blocks(&[other]);
-                state.cur_text.push_str(&s);
-                state.cur_raw.push_str(&s);
-                state.has_started = true;
-            }
+    state.out.reserve(text.len() / 8 + 1);
+    let mut items: Vec<RawOverrideItem<'_>> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let start = i + 1;
+            items.clear();
+            let (next, closed) = scan_override_block(text, start, |item| items.push(item));
+            state.push_override(&items, closed);
+            i = next;
+        } else {
+            let end = bytes[i..]
+                .iter()
+                .position(|&b| b == b'{')
+                .map_or(bytes.len(), |rel| i + rel);
+            let segment = &text[i..end];
+            state.cur_text.push_str(segment);
+            state.cur_raw.push_str(segment);
+            state.has_started = true;
+            i = end;
         }
     }
     state.finish()
@@ -70,86 +79,105 @@ struct ParseAccum {
     has_started: bool,
 }
 
+fn push_raw_item(out: &mut String, item: RawOverrideItem<'_>) {
+    match item {
+        RawOverrideItem::Comment(c) => out.push_str(c),
+        RawOverrideItem::Tag { name, raw_args } => {
+            out.push('\\');
+            out.push_str(name);
+            out.push_str(raw_args);
+        }
+    }
+}
+
 impl ParseAccum {
     fn flush_current(&mut self) {
-        self.out.push(KaraokeSyllable {
+        // Copy into exactly-sized strings and keep the scratch buffers for the next syllable,
+        // so each syllable costs one allocation per non-empty field and no regrowth.
+        let out = KaraokeSyllable {
             kind: self.cur_kind,
             duration_cs: self.cur_dur,
-            tags: std::mem::take(&mut self.cur_tags),
-            text: std::mem::take(&mut self.cur_text),
-            raw_original: Some(std::mem::take(&mut self.cur_raw)),
-        });
+            tags: self.cur_tags.clone(),
+            text: self.cur_text.clone(),
+            raw_original: Some(self.cur_raw.clone()),
+        };
+        self.cur_tags.clear();
+        self.cur_text.clear();
+        self.cur_raw.clear();
+        self.out.push(out);
     }
 
-    fn push_override(&mut self, items: Vec<OverrideItem>, closed: bool) {
-        let has_k = items.iter().any(|item| {
-            matches!(
-                item,
-                OverrideItem::Tag(t) if matches!(t.args, TagArgs::Karaoke { .. })
-            )
-        });
-        if !has_k {
-            let s = serialize_text_blocks(&[TextBlock::Override { items, closed }]);
-            self.cur_tags.push_str(&s);
-            self.cur_raw.push_str(&s);
+    fn push_override(&mut self, items: &[RawOverrideItem<'_>], closed: bool) {
+        let karaoke_of = |item: &RawOverrideItem<'_>| match *item {
+            RawOverrideItem::Tag { name, raw_args } => parse_karaoke_tag(name, raw_args),
+            RawOverrideItem::Comment(_) => None,
+        };
+        if !items.iter().any(|it| karaoke_of(it).is_some()) {
+            self.cur_tags.push('{');
+            self.cur_raw.push('{');
+            for &item in items {
+                push_raw_item(&mut self.cur_tags, item);
+                push_raw_item(&mut self.cur_raw, item);
+            }
+            if closed {
+                self.cur_tags.push('}');
+                self.cur_raw.push('}');
+            }
             self.has_started = true;
             return;
         }
 
         let mut open_brace = false;
-        let mut pending: Vec<OverrideItem> = Vec::new();
-        for item in items {
-            if let OverrideItem::Tag(ref tag) = item {
-                if let TagArgs::Karaoke { kind, duration_cs } = tag.args {
-                    if self.has_started {
-                        if !pending.is_empty() {
-                            let s = serialize_override_items(&pending);
-                            self.cur_tags.push_str(&s);
-                            if !open_brace {
-                                self.cur_raw.push('{');
-                                open_brace = true;
-                            }
-                            self.cur_raw.push_str(&s);
-                            pending.clear();
-                        }
-                        self.flush_current();
-                    } else if !pending.is_empty() {
-                        let s = serialize_override_items(&pending);
-                        self.cur_tags.push('{');
-                        self.cur_tags.push_str(&s);
-                        self.cur_tags.push('}');
+        let mut pending_count = 0usize;
+        let mut pending = String::new();
+        for &item in items {
+            if let Some((kind, duration_cs)) = karaoke_of(&item) {
+                if self.has_started {
+                    if pending_count > 0 {
+                        self.cur_tags.push_str(&pending);
                         if !open_brace {
                             self.cur_raw.push('{');
                             open_brace = true;
                         }
-                        self.cur_raw.push_str(&s);
+                        self.cur_raw.push_str(&pending);
                         pending.clear();
+                        pending_count = 0;
                     }
+                    self.flush_current();
+                } else if pending_count > 0 {
+                    self.cur_tags.push('{');
+                    self.cur_tags.push_str(&pending);
+                    self.cur_tags.push('}');
                     if !open_brace {
                         self.cur_raw.push('{');
                         open_brace = true;
                     }
-                    self.cur_raw.push('\\');
-                    self.cur_raw.push_str(&tag.name);
-                    self.cur_raw.push_str(&tag.raw_args);
-                    self.cur_kind = Some(kind);
-                    self.cur_dur = u32::try_from(duration_cs.max(0)).unwrap_or(u32::MAX);
-                    self.has_started = true;
-                    continue;
+                    self.cur_raw.push_str(&pending);
+                    pending.clear();
+                    pending_count = 0;
                 }
+                if !open_brace {
+                    self.cur_raw.push('{');
+                    open_brace = true;
+                }
+                push_raw_item(&mut self.cur_raw, item);
+                self.cur_kind = Some(kind);
+                self.cur_dur = u32::try_from(duration_cs.max(0)).unwrap_or(u32::MAX);
+                self.has_started = true;
+                continue;
             }
-            pending.push(item);
+            push_raw_item(&mut pending, item);
+            pending_count += 1;
         }
 
-        if !pending.is_empty() {
-            let s = serialize_override_items(&pending);
+        if pending_count > 0 {
             self.cur_tags.push('{');
-            self.cur_tags.push_str(&s);
+            self.cur_tags.push_str(&pending);
             self.cur_tags.push('}');
             if !open_brace {
                 self.cur_raw.push('{');
             }
-            self.cur_raw.push_str(&s);
+            self.cur_raw.push_str(&pending);
         }
         if closed {
             self.cur_raw.push('}');
@@ -167,7 +195,15 @@ impl ParseAccum {
 /// Rebuilds an ASS `Text` string from parsed or edited [`KaraokeSyllable`]s.
 #[must_use]
 pub fn rebuild_karaoke_line(syllables: &[KaraokeSyllable]) -> String {
-    let mut out = String::new();
+    let cap: usize = syllables
+        .iter()
+        .map(|s| {
+            s.raw_original
+                .as_ref()
+                .map_or(s.tags.len() + s.text.len() + 8, String::len)
+        })
+        .sum();
+    let mut out = String::with_capacity(cap);
     for syl in syllables {
         if let Some(ref raw) = syl.raw_original {
             out.push_str(raw);
@@ -280,21 +316,6 @@ pub fn merge_syllables(
     };
     syllables.drain((start_idx + 1)..=end_idx_inclusive);
     true
-}
-
-fn serialize_override_items(items: &[OverrideItem]) -> String {
-    let mut out = String::new();
-    for item in items {
-        match item {
-            OverrideItem::Comment(c) => out.push_str(c),
-            OverrideItem::Tag(tag) => {
-                out.push('\\');
-                out.push_str(&tag.name);
-                out.push_str(&tag.raw_args);
-            }
-        }
-    }
-    out
 }
 
 const fn karaoke_kind_str(kind: KaraokeKind) -> &'static str {

@@ -18,8 +18,8 @@
 
 use crate::ToolsError;
 use ass_core::{
-    parse_text_blocks, AssStyle, EditCommand, OverrideItem, OverrideTag, ScriptFile, TagArgs,
-    TextBlock,
+    parse_tag_args, scan_override_block, AssStyle, EditCommand, OverrideItem, RawOverrideItem,
+    ScriptFile, TagArgs,
 };
 use std::fmt::Write as _;
 
@@ -498,43 +498,61 @@ fn scale_margin(val: i32, factor: f64, shift: f64) -> i32 {
 }
 
 fn resample_event_text(text: &str, state: ResampleState) -> Option<String> {
-    let blocks = parse_text_blocks(text);
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len() + 32);
     let mut changed = false;
+    let mut drawing_level = 0u32;
+    let mut i = 0usize;
 
-    for block in &blocks {
-        match block {
-            TextBlock::Override { items, closed } => {
-                out.push('{');
-                for item in items {
-                    write_resampled_item(&mut out, item, state, &mut changed);
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            out.push('{');
+            let (next, closed) = scan_override_block(text, i + 1, |item| match item {
+                RawOverrideItem::Comment(c) => out.push_str(c),
+                RawOverrideItem::Tag { name, raw_args } => {
+                    let args = parse_tag_args(name, raw_args);
+                    if let TagArgs::DrawingMode(lvl) = args {
+                        drawing_level = lvl;
+                    }
+                    write_resampled_tag(&mut out, name, raw_args, &args, state, &mut changed);
                 }
-                if *closed {
-                    out.push('}');
-                }
+            });
+            if closed {
+                out.push('}');
             }
-            TextBlock::Plain(s) => out.push_str(s),
-            TextBlock::Escape(esc) => out.push_str(esc.as_str()),
-            TextBlock::Drawing { level, commands } => {
+            i = next;
+        } else {
+            let end = bytes[i..]
+                .iter()
+                .position(|&b| b == b'{')
+                .map_or(bytes.len(), |rel| i + rel);
+            let segment = &text[i..end];
+            if drawing_level > 0 {
                 // Aegisub resolution_resampler.cpp passes shift=(0, 0) and rx/ar for \p>0 drawings:
                 // drawings are positioned by \pos or alignment/margins (not screen borders), and
-                // dividing X by ar avoids double-stretching when Stretch scales ScaleX/\fscx by ar.
+                // dividing X by ar avoids double-stretching when Stretch scales ScaleX/scx by ar.
                 let drawing_rx = state.rx / state.ar;
-                let scaled =
-                    scale_drawing_commands(commands, drawing_rx, state.ry, 0.0, 0.0, *level);
-                if scaled != *commands {
+                let before = out.len();
+                scale_drawing_commands(
+                    &mut out,
+                    segment,
+                    drawing_rx,
+                    state.ry,
+                    0.0,
+                    0.0,
+                    drawing_level,
+                );
+                if out[before..] != *segment {
                     changed = true;
                 }
-                out.push_str(&scaled);
+            } else {
+                out.push_str(segment);
             }
+            i = end;
         }
     }
 
-    if changed {
-        Some(out)
-    } else {
-        None
-    }
+    changed.then_some(out)
 }
 
 fn write_resampled_item(
@@ -545,15 +563,24 @@ fn write_resampled_item(
 ) {
     match item {
         OverrideItem::Comment(c) => out.push_str(c),
-        OverrideItem::Tag(tag) => write_resampled_tag(out, tag, state, changed),
+        OverrideItem::Tag(tag) => {
+            write_resampled_tag(out, &tag.name, &tag.raw_args, &tag.args, state, changed);
+        }
     }
 }
 
-fn write_resampled_tag(out: &mut String, tag: &OverrideTag, s: ResampleState, changed: &mut bool) {
+fn write_resampled_tag(
+    out: &mut String,
+    name: &str,
+    raw_args: &str,
+    args: &TagArgs,
+    s: ResampleState,
+    changed: &mut bool,
+) {
     out.push('\\');
-    out.push_str(&tag.name);
+    out.push_str(name);
 
-    match &tag.args {
+    match args {
         TagArgs::Point { x, y } => {
             *changed = true;
             let nx = x * s.rx + s.shift_x;
@@ -608,12 +635,13 @@ fn write_resampled_tag(out: &mut String, tag: &OverrideTag, s: ResampleState, ch
             scale, commands, ..
         } => {
             *changed = true;
-            let scaled = scale_drawing_commands(commands, s.rx, s.ry, s.shift_x, s.shift_y, *scale);
             if *scale == 1 {
-                let _ = write!(out, "({scaled})");
+                out.push('(');
             } else {
-                let _ = write!(out, "({scale},{scaled})");
+                let _ = write!(out, "({scale},");
             }
+            scale_drawing_commands(out, commands, s.rx, s.ry, s.shift_x, s.shift_y, *scale);
+            out.push(')');
         }
         TagArgs::Transform {
             t1,
@@ -638,11 +666,11 @@ fn write_resampled_tag(out: &mut String, tag: &OverrideTag, s: ResampleState, ch
                 out.push_str(&inner);
                 out.push(')');
             } else {
-                out.push_str(&tag.raw_args);
+                out.push_str(raw_args);
             }
         }
-        TagArgs::Raw(raw) => write_resampled_raw_tag(out, &tag.name, raw, s, changed),
-        _ => out.push_str(&tag.raw_args),
+        TagArgs::Raw(raw) => write_resampled_raw_tag(out, name, raw, s, changed),
+        _ => out.push_str(raw_args),
     }
 }
 
@@ -724,20 +752,21 @@ fn scale_scalar_tag(name: &str, raw: &str, s: ResampleState) -> Option<String> {
     Some(fmt_num(val * factor))
 }
 
-/// Scales `(x, y)` coordinate pairs inside an ASS vector drawing string (`m`, `n`, `l`, `b`, `s`, `p`, `c`).
+/// Scales `(x, y)` coordinate pairs inside an ASS vector drawing string (`m`, `n`, `l`, `b`, `s`, `p`, `c`),
+/// appending the result to `out`.
 fn scale_drawing_commands(
+    out: &mut String,
     cmds: &str,
     rx: f64,
     ry: f64,
     shift_x: f64,
     shift_y: f64,
     scale_level: u32,
-) -> String {
+) {
     let scale_mul = f64::from(1u32 << scale_level.saturating_sub(1).min(16));
     let sx = shift_x * scale_mul;
     let sy = shift_y * scale_mul;
 
-    let mut out = String::with_capacity(cmds.len() + 16);
     let mut is_x = true;
     for (idx, tok) in cmds.split_whitespace().enumerate() {
         if idx > 0 {
@@ -745,7 +774,7 @@ fn scale_drawing_commands(
         }
         if let Ok(v) = tok.parse::<f64>() {
             let scaled = if is_x { v * rx + sx } else { v * ry + sy };
-            out.push_str(&fmt_num(scaled));
+            write_num(out, scaled);
             is_x = !is_x;
         } else {
             // Drawing command letter resets x/y parity.
@@ -753,7 +782,6 @@ fn scale_drawing_commands(
             out.push_str(tok);
         }
     }
-    out
 }
 
 fn round_2(v: f64) -> f64 {
@@ -761,15 +789,27 @@ fn round_2(v: f64) -> f64 {
 }
 
 fn fmt_num(v: f64) -> String {
+    let mut s = String::new();
+    write_num(&mut s, v);
+    s
+}
+
+/// Appends `v` rounded to 2 decimals with trailing zeroes trimmed (integers print without a point).
+fn write_num(out: &mut String, v: f64) {
     let r = round_2(v);
     if (r - r.round()).abs() < 1e-6 && r.abs() < 1e12 {
         #[allow(clippy::cast_possible_truncation)]
         let int_v = r.round() as i64;
-        int_v.to_string()
+        let _ = write!(out, "{int_v}");
     } else {
-        // Trim trailing zeroes after decimal point.
-        let s = format!("{r:.2}");
-        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+        let start = out.len();
+        let _ = write!(out, "{r:.2}");
+        while out.len() > start && out.ends_with('0') {
+            out.pop();
+        }
+        if out.ends_with('.') {
+            out.pop();
+        }
     }
 }
 
