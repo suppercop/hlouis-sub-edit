@@ -1,0 +1,20 @@
+[package]
+name = "template-doctor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ass-core = { path = "../ass-core" }
+full_moon = "3.0.0"
+karaskel = { path = "../karaskel" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "template_doctor"
+harness = false

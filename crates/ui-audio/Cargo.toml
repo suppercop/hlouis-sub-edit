@@ -1,0 +1,26 @@
+[package]
+name = "ui-audio"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+audio-peaks = { path = "../audio-peaks" }
+audio-view = { path = "../audio-view" }
+egui = { workspace = true, features = ["default_fonts"] }
+i18n-catalog = { path = "../i18n-catalog" }
+karaoke-timing = { path = "../karaoke-timing" }
+theme = { path = "../theme" }
+timing-controller = { path = "../timing-controller" }
+ui-theme = { path = "../ui-theme" }
+
+[dev-dependencies]
+criterion = "0.5"
+egui_kittest = "0.37.0"
+
+[[bench]]
+name = "ui_audio"
+harness = false

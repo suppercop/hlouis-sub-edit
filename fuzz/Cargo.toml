@@ -1,0 +1,116 @@
+[package]
+name = "hlouis-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[features]
+default = []
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", optional = true }
+aegisub-config = { path = "../crates/aegisub-config" }
+ass-core = { path = "../crates/ass-core" }
+karaskel = { path = "../crates/karaskel" }
+keyframes = { path = "../crates/keyframes" }
+mkv-subs = { path = "../crates/mkv-subs" }
+project = { path = "../crates/project" }
+settings = { path = "../crates/settings" }
+styles-catalog = { path = "../crates/styles-catalog" }
+syntax-highlight = { path = "../crates/syntax-highlight" }
+template-doctor = { path = "../crates/template-doctor" }
+visual-tools = { path = "../crates/visual-tools" }
+
+[[bin]]
+name = "fuzz_ass_core"
+path = "fuzz_targets/fuzz_ass_core.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_mkv_subs"
+path = "fuzz_targets/fuzz_mkv_subs.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_keyframes"
+path = "fuzz_targets/fuzz_keyframes.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_aegisub_config"
+path = "fuzz_targets/fuzz_aegisub_config.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_settings"
+path = "fuzz_targets/fuzz_settings.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_project"
+path = "fuzz_targets/fuzz_project.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_styles_catalog"
+path = "fuzz_targets/fuzz_styles_catalog.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_karaskel"
+path = "fuzz_targets/fuzz_karaskel.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_syntax_highlight"
+path = "fuzz_targets/fuzz_syntax_highlight.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_visual_tools"
+path = "fuzz_targets/fuzz_visual_tools.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "fuzz_template_doctor"
+path = "fuzz_targets/fuzz_template_doctor.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]

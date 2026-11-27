@@ -1,0 +1,114 @@
+name: Nightly Fuzzing
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      minutes_per_target:
+        description: 'Minutes to fuzz each target'
+        required: false
+        default: '5'
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    fail-fast: false
+    strategy:
+      matrix:
+        target:
+          - fuzz_ass_core
+          - fuzz_mkv_subs
+          - fuzz_keyframes
+          - fuzz_aegisub_config
+          - fuzz_settings
+          - fuzz_project
+          - fuzz_styles_catalog
+          - fuzz_karaskel
+          - fuzz_syntax_highlight
+          - fuzz_visual_tools
+          - fuzz_template_doctor
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly + cargo-fuzz
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo-fuzz & fuzz target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-${{ matrix.target }}-
+            ${{ runner.os }}-fuzz-
+
+      - name: Install cargo-fuzz if missing
+        run: |
+          if ! command -v cargo-fuzz >/dev/null 2>&1; then
+            cargo install cargo-fuzz --locked
+          fi
+
+      - name: Generate seed corpus from test fixtures
+        env:
+          HLOUIS_WRITE_CORPUS: "1"
+        run: |
+          cargo +nightly check --manifest-path fuzz/Cargo.toml
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          find crates -path '*/tests/fixtures/*' -type f -size -256k -exec cp -n {} "fuzz/corpus/${{ matrix.target }}/" \; 2>/dev/null || true
+
+      - name: Run libFuzzer for ${{ inputs.minutes_per_target || '5' }} minute(s)
+        id: fuzz_run
+        continue-on-error: true
+        run: |
+          MINUTES="${{ inputs.minutes_per_target || '5' }}"
+          SECONDS_LIMIT=$(( MINUTES * 60 ))
+          cargo +nightly fuzz run \
+            --fuzz-dir fuzz \
+            --features libfuzzer \
+            "${{ matrix.target }}" \
+            "fuzz/corpus/${{ matrix.target }}" \
+            -- -max_total_time="${SECONDS_LIMIT}" -max_len=65536 -rss_limit_mb=2048
+
+      - name: Upload crash artifacts
+        if: steps.fuzz_run.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Open GitHub issue on new crash
+        if: steps.fuzz_run.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="[fuzz] Crash in ${{ matrix.target }}"
+          EXISTING=$(gh issue list --state open --search "\"${TITLE}\" in:title" --json number --jq 'length')
+          if [ "${EXISTING}" = "0" ]; then
+            gh issue create \
+              --title "${TITLE}" \
+              --label "bug,fuzz" \
+              --body "Nightly fuzzing found a crash in \`${{ matrix.target }}\`.\n\nWorkflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n\nDownload the \`fuzz-crash-${{ matrix.target }}-${{ github.run_id }}\` artifact to reproduce locally with:\n\`\`\`bash\ncargo +nightly fuzz run --fuzz-dir fuzz --features libfuzzer ${{ matrix.target }} <crash-file>\n\`\`\`"
+          fi
+
+      - name: Fail job if fuzzer crashed
+        if: steps.fuzz_run.outcome == 'failure'
+        run: exit 1

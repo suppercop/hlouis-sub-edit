@@ -104,9 +104,9 @@ impl Default for LayoutState {
     fn default() -> Self {
         Self {
             mode: ViewMode::Full,
-            top_height_ratio: 0.52,
-            video_width_ratio: 0.45,
-            audio_height_ratio: 0.55,
+            top_height_ratio: 0.62,
+            video_width_ratio: 0.52,
+            audio_height_ratio: 0.52,
             detached_video: DetachedVideoState::default(),
             mins: MinPanelSizes::default(),
         }
@@ -126,6 +126,13 @@ pub struct ComputedLayout {
 }
 
 impl LayoutState {
+    /// Computes all panel and splitter rectangles directly in logical points (no extra DPI division).
+    #[inline]
+    #[must_use]
+    pub fn compute_logical(&self, logical_w: f32, logical_h: f32) -> ComputedLayout {
+        self.compute(logical_w, logical_h, 1.0)
+    }
+
     /// Computes all panel and splitter rectangles for a window of `win_w × win_h` physical pixels
     /// at `dpi_scale` (returns logical coordinates). Zero allocations.
     #[inline]

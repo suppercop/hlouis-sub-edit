@@ -1,0 +1,27 @@
+[package]
+name = "ui-editbox"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ass-core = { path = "../ass-core" }
+document = { path = "../document" }
+edit-box-ops = { path = "../edit-box-ops" }
+egui = { workspace = true, features = ["default_fonts"] }
+i18n-catalog = { path = "../i18n-catalog" }
+keyframes = { path = "../keyframes" }
+syntax-highlight = { path = "../syntax-highlight" }
+theme = { path = "../theme" }
+ui-theme = { path = "../ui-theme" }
+
+[dev-dependencies]
+criterion = "0.5"
+egui_kittest = "0.37.0"
+
+[[bench]]
+name = "ui_editbox"
+harness = false

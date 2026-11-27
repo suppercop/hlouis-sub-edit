@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]
 members = [
     "crates/app",
     "crates/ass-core",
@@ -50,6 +51,24 @@ members = [
     "crates/mkv-import",
     "crates/dialogs-model",
     "crates/i18n-catalog",
+    "crates/hlouis-tools",
+    "crates/template-doctor",
+    "crates/ui-theme",
+    "crates/ui-grid",
+    "crates/ui-editbox",
+    "crates/ui-audio",
+    "crates/ui-video",
+    "crates/ui-dialogs",
+    "crates/ui-shell",
+    "crates/kara-templater",
+    "crates/spectrum",
+    "crates/ui-preferences",
+    "crates/log-window",
+    "crates/recovery",
+    "crates/version-check",
+    "crates/perf-report",
+    "crates/golden-tools",
+    "crates/ui-mkv-import",
 ]
 
 [workspace.package]

@@ -1,0 +1,25 @@
+[package]
+name = "ui-grid"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ass-core = { path = "../ass-core" }
+egui = { workspace = true, features = ["default_fonts"] }
+grid-model = { path = "../grid-model" }
+i18n-catalog = { path = "../i18n-catalog" }
+syntax-highlight = { path = "../syntax-highlight" }
+theme = { path = "../theme" }
+ui-theme = { path = "../ui-theme" }
+
+[dev-dependencies]
+criterion = "0.5"
+egui_kittest = "0.37.0"
+
+[[bench]]
+name = "ui_grid"
+harness = false

@@ -1,0 +1,19 @@
+[package]
+name = "hlouis-tools"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ass-core = { path = "../ass-core" }
+ass-tools = { path = "../ass-tools" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "hlouis_tools"
+harness = false

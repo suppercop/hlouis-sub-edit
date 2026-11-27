@@ -1064,6 +1064,24 @@ pub const COMMANDS: &[CommandMeta] = &[
         ftl_help: "cmd-tool-visual-vector-clip-help",
         aegisub_source: "command/vis_tool.cpp",
     },
+    CommandMeta {
+        id: "hlouis/select_by_style",
+        ftl_name: "cmd-hlouis-select-by-style",
+        ftl_help: "cmd-hlouis-select-by-style-help",
+        aegisub_source: "hlouis-tools",
+    },
+    CommandMeta {
+        id: "hlouis/select_by_style_dialog",
+        ftl_name: "cmd-hlouis-select-by-style-dialog",
+        ftl_help: "cmd-hlouis-select-by-style-dialog-help",
+        aegisub_source: "hlouis-tools",
+    },
+    CommandMeta {
+        id: "hlouis/clean_whitespace",
+        ftl_name: "cmd-hlouis-clean-whitespace",
+        ftl_help: "cmd-hlouis-clean-whitespace-help",
+        aegisub_source: "hlouis-tools",
+    },
 ];
 
 /// Menu item entry (either a command ID or a separator).
@@ -1100,6 +1118,7 @@ pub enum HotkeyContext {
     Video = 6,
     Timing = 7,
     Karaoke = 8,
+    StylingAssistant = 9,
 }
 
 impl HotkeyContext {
@@ -1116,7 +1135,25 @@ impl HotkeyContext {
             "Video" => Some(Self::Video),
             "Timing" => Some(Self::Timing),
             "Karaoke" => Some(Self::Karaoke),
+            "Styling Assistant" => Some(Self::StylingAssistant),
             _ => None,
+        }
+    }
+
+    /// Returns the canonical Aegisub context name.
+    #[must_use]
+    pub const fn as_aegisub_name(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::Default => "Default",
+            Self::MainFrame => "Main Frame",
+            Self::SubtitleGrid => "Subtitle Grid",
+            Self::SubtitleEditBox => "Subtitle Edit Box",
+            Self::Audio => "Audio",
+            Self::Video => "Video",
+            Self::Timing => "Timing",
+            Self::Karaoke => "Karaoke",
+            Self::StylingAssistant => "Styling Assistant",
         }
     }
 }
@@ -1151,6 +1188,35 @@ impl KeyChord {
             }
         }
         Self::from_parts(mask, key_name)
+    }
+
+    /// Formats the chord for English UI display (e.g. `Ctrl+Shift+Numpad 5`).
+    #[must_use]
+    pub fn display_en(self) -> String {
+        self.format_display(false)
+    }
+
+    /// Formats the chord for Vietnamese UI display (e.g. `Ctrl+Shift+Phím số 5`).
+    #[must_use]
+    pub fn display_vi(self) -> String {
+        self.format_display(true)
+    }
+
+    fn format_display(self, vietnamese: bool) -> String {
+        let mods = ((self.0 >> 16) & 0xFF) as u8;
+        let code = (self.0 & 0xFFFF) as u16;
+        let mut out = String::new();
+        if mods & Self::CTRL != 0 {
+            out.push_str("Ctrl+");
+        }
+        if mods & Self::ALT != 0 {
+            out.push_str("Alt+");
+        }
+        if mods & Self::SHIFT != 0 {
+            out.push_str("Shift+");
+        }
+        out.push_str(&decode_key_name(code, vietnamese));
+        out
     }
 }
 
@@ -1187,7 +1253,93 @@ fn encode_key_name(name: &str) -> Option<u16> {
         "F10" => Some(290),
         "F11" => Some(291),
         "F12" => Some(292),
+        "KP_0" | "Numpad0" => Some(300),
+        "KP_1" | "Numpad1" => Some(301),
+        "KP_2" | "Numpad2" => Some(302),
+        "KP_3" | "Numpad3" => Some(303),
+        "KP_4" | "Numpad4" => Some(304),
+        "KP_5" | "Numpad5" => Some(305),
+        "KP_6" | "Numpad6" => Some(306),
+        "KP_7" | "Numpad7" => Some(307),
+        "KP_8" | "Numpad8" => Some(308),
+        "KP_9" | "Numpad9" => Some(309),
+        "KP_Enter" | "NumpadEnter" => Some(310),
+        "KP_Add" | "NumpadAdd" => Some(311),
+        "KP_Subtract" | "NumpadSubtract" => Some(312),
+        "KP_Multiply" | "NumpadMultiply" => Some(313),
+        "KP_Divide" | "NumpadDivide" => Some(314),
+        "KP_Decimal" | "NumpadDecimal" => Some(315),
         _ => None,
+    }
+}
+
+fn decode_key_name(code: u16, vietnamese: bool) -> String {
+    if (32..127).contains(&code) {
+        if let Ok(b) = u8::try_from(code) {
+            return char::from(b).to_string();
+        }
+    }
+    match code {
+        256 => (if vietnamese { "Phím cách" } else { "Space" }).to_owned(),
+        257 => "Enter".to_owned(),
+        258 => "Esc".to_owned(),
+        259 => "Tab".to_owned(),
+        260 => "Backspace".to_owned(),
+        261 => "Delete".to_owned(),
+        262 => "Insert".to_owned(),
+        263 => "Home".to_owned(),
+        264 => "End".to_owned(),
+        265 => "PageUp".to_owned(),
+        266 => "PageDown".to_owned(),
+        267 => (if vietnamese { "Trái" } else { "Left" }).to_owned(),
+        268 => (if vietnamese { "Phải" } else { "Right" }).to_owned(),
+        269 => (if vietnamese { "Lên" } else { "Up" }).to_owned(),
+        270 => (if vietnamese { "Xuống" } else { "Down" }).to_owned(),
+        281..=292 => format!("F{}", code - 280),
+        300..=309 => {
+            if vietnamese {
+                format!("Phím số {}", code - 300)
+            } else {
+                format!("Numpad {}", code - 300)
+            }
+        }
+        310 => (if vietnamese {
+            "Phím số Enter"
+        } else {
+            "Numpad Enter"
+        })
+        .to_owned(),
+        311 => (if vietnamese {
+            "Phím số +"
+        } else {
+            "Numpad +"
+        })
+        .to_owned(),
+        312 => (if vietnamese {
+            "Phím số -"
+        } else {
+            "Numpad -"
+        })
+        .to_owned(),
+        313 => (if vietnamese {
+            "Phím số *"
+        } else {
+            "Numpad *"
+        })
+        .to_owned(),
+        314 => (if vietnamese {
+            "Phím số /"
+        } else {
+            "Numpad /"
+        })
+        .to_owned(),
+        315 => (if vietnamese {
+            "Phím số ."
+        } else {
+            "Numpad ."
+        })
+        .to_owned(),
+        _ => format!("Key({code})"),
     }
 }
 
@@ -1204,7 +1356,7 @@ pub struct HotkeyConflict {
 pub struct CommandRegistry {
     by_id: HashMap<&'static str, &'static CommandMeta>,
     /// Flat per-context lookup tables (`9` contexts) indexed by `KeyChord` for sub-50ns dispatch.
-    bindings: [HashMap<KeyChord, String>; 9],
+    bindings: [HashMap<KeyChord, String>; 10],
     /// Tracks multi-bound chords for conflict reporting.
     conflicts: Vec<HotkeyConflict>,
 }
@@ -1290,6 +1442,71 @@ impl CommandRegistry {
     #[must_use]
     pub fn conflicts(&self) -> &[HotkeyConflict] {
         &self.conflicts
+    }
+
+    /// Imports an Aegisub 3.5.1 `hotkey.json` payload (including Medusa numpad bindings)
+    /// directly into this registry, returning the number of applied bindings.
+    ///
+    /// # Errors
+    /// Propagates [`aegisub_config::ConfigImportError`] on invalid JSON.
+    pub fn import_aegisub_hotkey_json(
+        &mut self,
+        hotkey_json: &str,
+    ) -> Result<usize, aegisub_config::ConfigImportError> {
+        let parsed = aegisub_config::import_hotkey_json(hotkey_json)?;
+        let before = self.bindings.len();
+        self.apply_aegisub_hotkeys(&parsed);
+        Ok(self
+            .bindings
+            .len()
+            .saturating_sub(before)
+            .max(parsed.by_context.len()))
+    }
+
+    /// Exports all active bindings to a deterministic JSON string grouped by Aegisub context.
+    #[must_use]
+    pub fn export_hotkeys_json(&self) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+
+        let mut grouped: BTreeMap<&'static str, Vec<(String, &str)>> = BTreeMap::new();
+        let ctx_names = [
+            "Always",
+            "Default",
+            "Main Frame",
+            "Subtitle Grid",
+            "Subtitle Edit Box",
+            "Audio",
+            "Video",
+            "Timing",
+            "Karaoke",
+            "Styling Assistant",
+        ];
+        for (idx, map) in self.bindings.iter().enumerate() {
+            if map.is_empty() {
+                continue;
+            }
+            let ctx_name = ctx_names[idx];
+            let entry = grouped.entry(ctx_name).or_default();
+            for (&chord, cmd) in map {
+                entry.push((chord.display_en(), cmd.as_str()));
+            }
+        }
+        let mut out = String::from("{\n");
+        for (ci, (ctx_name, mut entries)) in grouped.into_iter().enumerate() {
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            if ci > 0 {
+                out.push_str(",\n");
+            }
+            let _ = writeln!(out, "  \"{ctx_name}\": {{");
+            for (ei, (chord_str, cmd)) in entries.iter().enumerate() {
+                let comma = if ei + 1 < entries.len() { "," } else { "" };
+                let _ = writeln!(out, "    \"{chord_str}\": \"{cmd}\"{comma}");
+            }
+            out.push_str("  }");
+        }
+        out.push_str("\n}\n");
+        out
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1455,6 +1672,24 @@ impl CommandRegistry {
                 KeyChord::CTRL,
                 "U",
                 "edit/style/underline",
+            ),
+            (
+                HotkeyContext::SubtitleGrid,
+                KeyChord::CTRL | KeyChord::ALT,
+                "S",
+                "hlouis/select_by_style",
+            ),
+            (
+                HotkeyContext::SubtitleGrid,
+                KeyChord::CTRL | KeyChord::ALT | KeyChord::SHIFT,
+                "S",
+                "hlouis/select_by_style_dialog",
+            ),
+            (
+                HotkeyContext::SubtitleGrid,
+                KeyChord::CTRL | KeyChord::ALT,
+                "W",
+                "hlouis/clean_whitespace",
             ),
         ];
         for &(ctx, mods, key, cmd) in defaults {
@@ -1632,5 +1867,41 @@ mod tests {
             count >= 120,
             "expected >= 120 in-scope commands, got {count}"
         );
+    }
+
+    #[test]
+    fn medusa_numpad_hotkey_json_import_conflicts_display_and_export() {
+        let json = r#"{
+            "Audio": {
+                "audio/play/selection": [{"modifiers": [], "key": "KP_5"}],
+                "audio/commit": [{"modifiers": [], "key": "KP_Enter"}],
+                "audio/prev": [{"modifiers": ["Ctrl"], "key": "KP_4"}]
+            },
+            "Styling Assistant": {
+                "edit/undo": [{"modifiers": ["Ctrl"], "key": "Z"}]
+            }
+        }"#;
+        let mut reg = CommandRegistry::new_default();
+        let count = reg.import_aegisub_hotkey_json(json).expect("import");
+        assert!(count >= 2);
+
+        let kp5 = KeyChord::from_parts(0, "KP_5").expect("KP_5");
+        assert_eq!(kp5.display_en(), "Numpad 5");
+        assert_eq!(kp5.display_vi(), "Phím số 5");
+        assert_eq!(
+            reg.lookup(HotkeyContext::Audio, kp5),
+            Some("audio/play/selection")
+        );
+
+        let ctrl_z = KeyChord::from_parts(KeyChord::CTRL, "Z").expect("Ctrl+Z");
+        assert_eq!(
+            reg.lookup(HotkeyContext::StylingAssistant, ctrl_z),
+            Some("edit/undo")
+        );
+
+        // Verify export JSON contains both Audio and Styling Assistant sections.
+        let exported = reg.export_hotkeys_json();
+        assert!(exported.contains("\"Audio\""));
+        assert!(exported.contains("\"Styling Assistant\""));
     }
 }

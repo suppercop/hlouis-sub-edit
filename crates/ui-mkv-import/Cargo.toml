@@ -1,0 +1,24 @@
+[package]
+name = "ui-mkv-import"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+egui = { workspace = true, features = ["default_fonts"] }
+i18n-catalog = { path = "../i18n-catalog" }
+mkv-import = { path = "../mkv-import" }
+mkv-subs = { path = "../mkv-subs" }
+
+[dev-dependencies]
+theme = { path = "../theme" }
+ui-theme = { path = "../ui-theme" }
+criterion = "0.5"
+egui_kittest = "0.37.0"
+
+[[bench]]
+name = "ui_mkv_import"
+harness = false

@@ -1,0 +1,28 @@
+[package]
+name = "ui-dialogs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+commands = { path = "../commands" }
+dialogs-model = { path = "../dialogs-model" }
+egui = { workspace = true, features = ["default_fonts"] }
+hlouis-tools = { path = "../hlouis-tools" }
+i18n-catalog = { path = "../i18n-catalog" }
+mkv-import = { path = "../mkv-import" }
+settings = { path = "../settings" }
+template-doctor = { path = "../template-doctor" }
+theme = { path = "../theme" }
+ui-theme = { path = "../ui-theme" }
+
+[dev-dependencies]
+criterion = "0.5"
+egui_kittest = "0.37.0"
+
+[[bench]]
+name = "ui_dialogs"
+harness = false
