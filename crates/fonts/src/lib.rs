@@ -69,6 +69,40 @@ pub struct MissingGlyphReport {
     pub lines: BTreeSet<usize>,
 }
 
+/// Explicit diagnostics so a font check never "succeeds" silently with nothing checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FontCheckWarning {
+    /// The script has no `[Events]` section, so no font could be checked.
+    NoEventsSection,
+    /// No active `Dialogue` line rendered any text, so no font could be checked.
+    NoRenderedText,
+    /// A dialogue line references a style that is not defined; the default style's font was assumed.
+    UnknownStyle {
+        /// 0-based logical event index.
+        line: usize,
+        style: String,
+    },
+}
+
+impl std::fmt::Display for FontCheckWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoEventsSection => {
+                write!(f, "the script has no [Events] section; no fonts were checked")
+            }
+            Self::NoRenderedText => write!(
+                f,
+                "no dialogue line contains visible text; no fonts were checked"
+            ),
+            Self::UnknownStyle { line, style } => write!(
+                f,
+                "line {} uses undefined style `{style}`; the default style's font was assumed",
+                line + 1
+            ),
+        }
+    }
+}
+
 /// Result of checking a script's used fonts against a [`FontProvider`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FontCheckReport {
@@ -78,9 +112,18 @@ pub struct FontCheckReport {
     pub missing_fonts: Vec<FontUsage>,
     /// Installed fonts that are missing one or more glyphs required by the script.
     pub missing_glyphs: Vec<MissingGlyphReport>,
+    /// Diagnostics the UI must show (empty script, undefined styles, ...).
+    pub warnings: Vec<FontCheckWarning>,
 }
 
 impl FontCheckReport {
+    /// `false` when nothing could be checked (see [`FontCheckReport::warnings`]); a report that
+    /// is "clean" but not conclusive must not be shown as "all fonts OK".
+    #[must_use]
+    pub fn is_conclusive(&self) -> bool {
+        !self.used_fonts.is_empty()
+    }
+
     /// Returns `true` if every used font is installed and covers all required glyphs.
     #[must_use]
     pub const fn is_clean(&self) -> bool {
@@ -101,6 +144,15 @@ pub trait FontProvider {
 /// logical line indices and distinct glyphs rendered with each font.
 #[must_use]
 pub fn collect_used_fonts(script: &ScriptFile) -> Vec<FontUsage> {
+    collect_used_fonts_with_warnings(script).0
+}
+
+/// Like [`collect_used_fonts`] but also returns the diagnostics (undefined styles, nothing to check).
+#[must_use]
+pub fn collect_used_fonts_with_warnings(
+    script: &ScriptFile,
+) -> (Vec<FontUsage>, Vec<FontCheckWarning>) {
+    let mut warnings = Vec::new();
     let mut style_map: HashMap<&str, FontSpec> = HashMap::new();
     let mut default_spec = FontSpec::new("Arial", WEIGHT_NORMAL, false);
 
@@ -115,7 +167,8 @@ pub fn collect_used_fonts(script: &ScriptFile) -> Vec<FontUsage> {
     }
 
     let Some(events_sec) = script.events_section() else {
-        return Vec::new();
+        warnings.push(FontCheckWarning::NoEventsSection);
+        return (Vec::new(), warnings);
     };
 
     let mut usage_map: BTreeMap<FontSpec, (BTreeSet<usize>, BTreeSet<char>)> = BTreeMap::new();
@@ -130,7 +183,15 @@ pub fn collect_used_fonts(script: &ScriptFile) -> Vec<FontUsage> {
         }
 
         let style_name = ev.style().strip_prefix('*').unwrap_or(ev.style());
-        let base_spec = style_map.get(style_name).unwrap_or(&default_spec);
+        let base_spec = if let Some(spec) = style_map.get(style_name) {
+            spec
+        } else {
+            warnings.push(FontCheckWarning::UnknownStyle {
+                line: line_idx,
+                style: style_name.to_owned(),
+            });
+            &default_spec
+        };
 
         // Fast path: lines without `{` override blocks use the base style directly.
         if !text.contains('{') {
@@ -173,20 +234,24 @@ pub fn collect_used_fonts(script: &ScriptFile) -> Vec<FontUsage> {
         }
     }
 
-    usage_map
+    if usage_map.is_empty() {
+        warnings.push(FontCheckWarning::NoRenderedText);
+    }
+    let usages = usage_map
         .into_iter()
         .map(|(spec, (lines, glyphs))| FontUsage {
             spec,
             lines,
             glyphs,
         })
-        .collect()
+        .collect();
+    (usages, warnings)
 }
 
 /// Collects used fonts in `script` and checks availability and glyph coverage against `provider`.
 #[must_use]
 pub fn check_fonts(script: &ScriptFile, provider: &dyn FontProvider) -> FontCheckReport {
-    let used_fonts = collect_used_fonts(script);
+    let (used_fonts, warnings) = collect_used_fonts_with_warnings(script);
     let mut missing_fonts = Vec::new();
     let mut missing_glyphs = Vec::new();
 
@@ -209,6 +274,7 @@ pub fn check_fonts(script: &ScriptFile, provider: &dyn FontProvider) -> FontChec
         used_fonts,
         missing_fonts,
         missing_glyphs,
+        warnings,
     }
 }
 
@@ -435,5 +501,43 @@ Dialogue: 0,0:00:03.00,0:00:05.00,Default,,0,0,0,,{\\fnEmptySwitch}{\\fn@Meiryo\
         assert_eq!(report.missing_glyphs.len(), 1);
         assert_eq!(report.missing_glyphs[0].spec, yugoth_bi);
         assert_eq!(report.missing_glyphs[0].missing, vec!['本']);
+    }
+
+    #[test]
+    fn empty_script_reports_that_nothing_was_checked() {
+        let script = parse_ass("[Script Info]
+ScriptType: v4.00+
+").value;
+        let report = check_fonts(&script, &MockFontProvider::default());
+        assert!(report.is_clean());
+        assert!(!report.is_conclusive());
+        assert!(report.warnings.contains(&FontCheckWarning::NoEventsSection));
+    }
+
+    #[test]
+    fn comment_only_script_reports_no_rendered_text() {
+        let raw = "[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Comment: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,note
+";
+        let script = parse_ass(raw).value;
+        let report = check_fonts(&script, &MockFontProvider::default());
+        assert!(!report.is_conclusive());
+        assert!(report.warnings.contains(&FontCheckWarning::NoRenderedText));
+        assert!(report.warnings[0].to_string().contains("no fonts were checked"));
+    }
+
+    #[test]
+    fn undefined_style_is_reported() {
+        let raw = "[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Ghost,,0,0,0,,hi
+";
+        let script = parse_ass(raw).value;
+        let report = check_fonts(&script, &MockFontProvider::default());
+        assert!(report.warnings.iter().any(|w| matches!(
+            w,
+            FontCheckWarning::UnknownStyle { line: 0, style } if style == "Ghost"
+        )));
     }
 }

@@ -17,6 +17,19 @@ pub enum KeyframeFormat {
     PlainFrameList,
 }
 
+impl KeyframeFormat {
+    /// Human-readable format name used in error messages.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AegisubV1 => "an Aegisub keyframe file",
+            Self::XvidPassLog => "an XviD pass log",
+            Self::X264Stats => "an x264/x265 stats log",
+            Self::PlainFrameList => "a plain frame list",
+        }
+    }
+}
+
 /// Auto-detects the format of `input` and parses sorted, deduplicated 0-based keyframe indices.
 pub fn parse_keyframes(input: &str) -> Result<(Vec<u32>, KeyframeFormat), KeyframeError> {
     let body = input.strip_prefix('\u{FEFF}').unwrap_or(input);
@@ -26,12 +39,18 @@ pub fn parse_keyframes(input: &str) -> Result<(Vec<u32>, KeyframeFormat), Keyfra
     let mut keyframes = match format {
         KeyframeFormat::AegisubV1 => parse_aegisub_v1(&lines)?,
         KeyframeFormat::XvidPassLog => parse_xvid(&lines),
-        KeyframeFormat::X264Stats => parse_x264_stats(&lines),
+        KeyframeFormat::X264Stats => parse_x264_stats(&lines)?,
         KeyframeFormat::PlainFrameList => parse_plain_list(&lines)?,
     };
 
     keyframes.sort_unstable();
     keyframes.dedup();
+    if keyframes.is_empty() {
+        // "Success with 0 keyframes" would silently disable keyframe snapping; report it instead.
+        return Err(KeyframeError::NoKeyframes {
+            format: format.label(),
+        });
+    }
     Ok((keyframes, format))
 }
 
@@ -131,10 +150,10 @@ fn parse_xvid(lines: &[&str]) -> Vec<u32> {
     out
 }
 
-fn parse_x264_stats(lines: &[&str]) -> Vec<u32> {
+fn parse_x264_stats(lines: &[&str]) -> Result<Vec<u32>, KeyframeError> {
     let mut out = Vec::new();
     let mut fallback_idx = 0u32;
-    for &raw in lines {
+    for (line_no, &raw) in lines.iter().enumerate() {
         let t = raw.trim();
         if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
             continue;
@@ -145,9 +164,13 @@ fn parse_x264_stats(lines: &[&str]) -> Vec<u32> {
 
         for tok in t.split_whitespace() {
             if let Some(num) = tok.strip_prefix("in:") {
-                if let Ok(n) = num.parse::<u32>() {
-                    frame_in = Some(n);
-                }
+                let n = num
+                    .parse::<u32>()
+                    .map_err(|_| KeyframeError::InvalidKeyframeLine {
+                        line: line_no + 1,
+                        message: format!("expected integer after `in:`, got `{tok}`"),
+                    })?;
+                frame_in = Some(n);
             } else if let Some(kind) = tok.strip_prefix("type:") {
                 saw_type = true;
                 // x264 uses `type:I` (IDR) and `type:i` (non-IDR I); x265 uses `type:I` / `type:K`.
@@ -164,7 +187,7 @@ fn parse_x264_stats(lines: &[&str]) -> Vec<u32> {
             fallback_idx = fallback_idx.saturating_add(1);
         }
     }
-    out
+    Ok(out)
 }
 
 fn parse_plain_list(lines: &[&str]) -> Result<Vec<u32>, KeyframeError> {

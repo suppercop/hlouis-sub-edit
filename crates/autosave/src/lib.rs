@@ -48,6 +48,14 @@ pub enum AutosaveError {
     WorkerSpawn(#[source] std::io::Error),
     #[error("autosave worker thread is no longer running")]
     WorkerDisconnected,
+    #[error("the autosave was written, but old autosave {path} could not be removed: {source}")]
+    PruneFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the system clock is set before 1970-01-01; cannot name the autosave file")]
+    ClockBeforeEpoch,
 }
 
 fn classify_io_err(path: PathBuf, err: std::io::Error) -> AutosaveError {
@@ -157,7 +165,7 @@ pub fn write_autosave_now(
         return Err(AutosaveError::Cancelled);
     }
     let safe_stem = sanitize_stem(doc_stem);
-    let ts = timestamp_tag();
+    let ts = timestamp_tag()?;
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let file_name = format!("{safe_stem}.AUTOSAVE.{ts}-{seq:04}.ass");
     let target = autosave_dir.join(file_name);
@@ -201,7 +209,7 @@ impl SessionLock {
             .map_err(|e| classify_io_err(autosave_dir.to_path_buf(), e))?;
         let lock_path = autosave_dir.join(format!("{}.session.lock", sanitize_stem(doc_stem)));
         let had_stale = lock_path.exists();
-        let marker = format!("pid={}\nts={}\n", std::process::id(), timestamp_tag());
+        let marker = format!("pid={}\nts={}\n", std::process::id(), timestamp_tag()?);
         write_atomic(&lock_path, marker.as_bytes())?;
         Ok((Self { lock_path }, had_stale))
     }
@@ -215,7 +223,16 @@ impl SessionLock {
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_path);
+        // Drop cannot return an error; a stale lock only triggers the (visible) recovery prompt
+        // next start, so report it on stderr instead of ignoring it.
+        if let Err(e) = fs::remove_file(&self.lock_path) {
+            if e.kind() != ErrorKind::NotFound {
+                eprintln!(
+                    "autosave: could not remove session lock {}: {e}",
+                    self.lock_path.display()
+                );
+            }
+        }
     }
 }
 
@@ -233,6 +250,9 @@ pub struct RecoveryReport {
     pub unclean_shutdown_detected: bool,
     /// Valid autosave files newer than `saved_file` (sorted newest-first), ignoring `.tmp-*` files.
     pub candidates: Vec<RecoveryCandidate>,
+    /// Human-readable reasons for autosave files that could not be inspected (never silently skipped),
+    /// plus a note when the saved file's modification time could not be read.
+    pub warnings: Vec<String>,
 }
 
 /// Scans `autosave_dir` for autosaves matching `doc_stem` that are newer than `saved_file`
@@ -253,12 +273,26 @@ pub fn discover_recoveries(
         return Ok(RecoveryReport {
             unclean_shutdown_detected,
             candidates: Vec::new(),
+            warnings: Vec::new(),
         });
     }
 
-    let saved_mtime = saved_file
-        .and_then(|p| fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok());
+    let mut warnings = Vec::new();
+    let saved_mtime = match saved_file {
+        None => None,
+        Some(p) => match fs::metadata(p).and_then(|m| m.modified()) {
+            Ok(t) => Some(t),
+            // A saved file that does not exist yet (never saved) is a normal state, not a problem.
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => {
+                warnings.push(format!(
+                    "could not read the modification time of {} ({e}); offering every autosave",
+                    p.display()
+                ));
+                None
+            }
+        },
+    };
 
     let prefix = format!("{safe_stem}.AUTOSAVE.");
     let mut candidates = Vec::new();
@@ -282,11 +316,15 @@ pub fn discover_recoveries(
         {
             continue;
         }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let Ok(mtime) = meta.modified() else {
-            continue;
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) => {
+                warnings.push(format!(
+                    "could not inspect autosave {} ({e}); it was not offered for recovery",
+                    path.display()
+                ));
+                continue;
+            }
         };
         if saved_mtime.is_none_or(|sm| mtime > sm) {
             candidates.push(RecoveryCandidate {
@@ -306,6 +344,7 @@ pub fn discover_recoveries(
     Ok(RecoveryReport {
         unclean_shutdown_detected,
         candidates,
+        warnings,
     })
 }
 
@@ -488,8 +527,19 @@ fn prune_old_autosaves(
     files.sort();
     if files.len() > max_keep {
         let to_remove = files.len() - max_keep;
+        let mut first_failure: Option<AutosaveError> = None;
         for old in &files[..to_remove] {
-            let _ = fs::remove_file(old);
+            if let Err(e) = fs::remove_file(old) {
+                if first_failure.is_none() {
+                    first_failure = Some(AutosaveError::PruneFailed {
+                        path: old.clone(),
+                        source: e,
+                    });
+                }
+            }
+        }
+        if let Some(err) = first_failure {
+            return Err(err);
         }
     }
     Ok(())
@@ -513,11 +563,11 @@ fn sanitize_stem(stem: &str) -> String {
     }
 }
 
-fn timestamp_tag() -> String {
+fn timestamp_tag() -> Result<String, AutosaveError> {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{:013}", dur.as_millis())
+        .map_err(|_| AutosaveError::ClockBeforeEpoch)?;
+    Ok(format!("{:013}", dur.as_millis()))
 }
 
 #[cfg(test)]
@@ -630,5 +680,27 @@ mod tests {
         perms2.set_readonly(false);
         let _ = fs::set_permissions(&target, perms2);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prune_failure_is_reported_not_swallowed() {
+        let dir = temp_test_dir("prune_fail");
+        // A directory squatting on an old autosave name cannot be removed with remove_file.
+        let blocker = dir.join("doc.AUTOSAVE.0000000000001-0000.ass");
+        fs::create_dir_all(&blocker).unwrap();
+        let res = write_autosave_now(&dir, "doc", b"x", 1, None);
+        assert!(matches!(res, Err(AutosaveError::PruneFailed { .. })), "{res:?}");
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("could not be removed"), "{msg}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_report_carries_warnings_field() {
+        let dir = temp_test_dir("recovery_warn");
+        let report = discover_recoveries(&dir, "doc", None).unwrap();
+        assert!(report.warnings.is_empty());
+        assert!(report.candidates.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

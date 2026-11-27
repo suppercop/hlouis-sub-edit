@@ -21,6 +21,9 @@ pub struct ExtractedTrack {
     pub track: TrackInfo,
     pub script: ScriptFile,
     pub event_count: usize,
+    /// Non-fatal problems found while converting the track (malformed blocks, invalid UTF-8,
+    /// unparseable header fields...). The UI must show these; they are never silently dropped.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -595,9 +598,14 @@ fn build_extracted_scripts(
             }
         }
 
+        let mut warnings = Vec::new();
         let script = match &info.subtitle_codec {
-            SubtitleCodec::Ass | SubtitleCodec::Ssa => build_ass_script(info, &raw_list),
-            SubtitleCodec::Srt | SubtitleCodec::WebVtt => build_text_script(&raw_list),
+            SubtitleCodec::Ass | SubtitleCodec::Ssa => {
+                build_ass_script(info, &raw_list, &mut warnings)
+            }
+            SubtitleCodec::Srt | SubtitleCodec::WebVtt => {
+                build_text_script(&raw_list, &mut warnings)
+            }
             SubtitleCodec::UnsupportedImage(c) | SubtitleCodec::Other(c) => {
                 return Err(MkvError::UnsupportedCodec {
                     track: track_num,
@@ -620,6 +628,7 @@ fn build_extracted_scripts(
                 track: info.clone(),
                 script,
                 event_count,
+                warnings,
             },
         );
     }
@@ -627,19 +636,42 @@ fn build_extracted_scripts(
     Ok(out)
 }
 
-fn build_ass_script(info: &TrackInfo, packets: &[RawSubPacket]) -> ScriptFile {
+fn build_ass_script(
+    info: &TrackInfo,
+    packets: &[RawSubPacket],
+    warnings: &mut Vec<String>,
+) -> ScriptFile {
     let mut script = if let Some(ref priv_bytes) = info.codec_private {
         let (outcome, _) = parse_ass_bytes(priv_bytes);
+        if !outcome.warnings.is_empty() {
+            warnings.push(format!(
+                "the track header (CodecPrivate) had {} problem(s); first: line {}: {}",
+                outcome.warnings.len(),
+                outcome.warnings[0].line,
+                outcome.warnings[0].message
+            ));
+        }
         outcome.value
     } else {
+        warnings.push(
+            "the track has no CodecPrivate header; a default script header and style were used"
+                .to_owned(),
+        );
         ScriptFile::new_default()
     };
 
     // Matroska ASS/SSA block payload format:
     // ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     let mut indexed_events: Vec<(i64, usize, AssEvent)> = Vec::with_capacity(packets.len());
+    let mut malformed = 0usize;
+    let mut bad_numbers = 0usize;
+    let mut bad_utf8 = 0usize;
+    let mut first_bad: Option<usize> = None;
     for (seq, pkt) in packets.iter().enumerate() {
         let line = String::from_utf8_lossy(&pkt.payload);
+        if matches!(line, std::borrow::Cow::Owned(_)) {
+            bad_utf8 += 1;
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         let fields: Vec<&str> = trimmed.splitn(9, ',').collect();
 
@@ -648,27 +680,61 @@ fn build_ass_script(info: &TrackInfo, packets: &[RawSubPacket]) -> ScriptFile {
             AssTime::from_ms_rounded(pkt.start_ms.saturating_add(pkt.duration_ms.unwrap_or(0)));
 
         let (read_order, ev) = if fields.len() >= 9 {
-            let ro = fields[0]
-                .trim()
-                .parse::<i64>()
-                .unwrap_or(i64::try_from(seq).unwrap_or(0));
+            let mut numeric_ok = true;
+            let mut num = |raw: &str| {
+                raw.trim().parse::<i32>().unwrap_or_else(|_| {
+                    numeric_ok = false;
+                    0
+                })
+            };
+            let layer = num(fields[1]);
+            let margin_l = num(fields[4]);
+            let margin_r = num(fields[5]);
+            let margin_v = num(fields[6]);
+            let ro = fields[0].trim().parse::<i64>().unwrap_or_else(|_| {
+                numeric_ok = false;
+                i64::try_from(seq).unwrap_or(0)
+            });
+            if !numeric_ok {
+                bad_numbers += 1;
+                first_bad.get_or_insert(seq);
+            }
             let mut ev = AssEvent::dialogue(start, end, fields[8]);
             ev.set_kind(EventKind::Dialogue);
-            ev.set_layer(fields[1].trim().parse::<i32>().unwrap_or(0));
+            ev.set_layer(layer);
             ev.set_style(fields[2]);
             ev.set_name(fields[3]);
-            ev.set_margin_l(fields[4].trim().parse::<i32>().unwrap_or(0));
-            ev.set_margin_r(fields[5].trim().parse::<i32>().unwrap_or(0));
-            ev.set_margin_v(fields[6].trim().parse::<i32>().unwrap_or(0));
+            ev.set_margin_l(margin_l);
+            ev.set_margin_r(margin_r);
+            ev.set_margin_v(margin_v);
             ev.set_effect(fields[7]);
             (ro, ev)
         } else {
+            malformed += 1;
+            first_bad.get_or_insert(seq);
             (
                 i64::try_from(seq).unwrap_or(0),
                 AssEvent::dialogue(start, end, trimmed),
             )
         };
         indexed_events.push((read_order, seq, ev));
+    }
+
+    if malformed > 0 {
+        warnings.push(format!(
+            "{malformed} block(s) did not have the 9 ASS fields and were imported as plain text (first at block {})",
+            first_bad.map_or(0, |i| i + 1)
+        ));
+    }
+    if bad_numbers > 0 {
+        warnings.push(format!(
+            "{bad_numbers} block(s) had a non-numeric ReadOrder/Layer/Margin field; 0 (or the block order) was used"
+        ));
+    }
+    if bad_utf8 > 0 {
+        warnings.push(format!(
+            "{bad_utf8} block(s) contained invalid UTF-8 that was replaced with U+FFFD"
+        ));
     }
 
     indexed_events.sort_by_key(|&(ro, seq, _)| (ro, seq));
@@ -680,14 +746,21 @@ fn build_ass_script(info: &TrackInfo, packets: &[RawSubPacket]) -> ScriptFile {
     script
 }
 
-fn build_text_script(packets: &[RawSubPacket]) -> ScriptFile {
+fn build_text_script(packets: &[RawSubPacket], warnings: &mut Vec<String>) -> ScriptFile {
     let mut script = ScriptFile::new_default();
     let mut entries = Vec::with_capacity(packets.len());
+    let mut empty = 0usize;
+    let mut bad_utf8 = 0usize;
+    let mut unparsed = 0usize;
 
     for pkt in packets {
         let raw_text = String::from_utf8_lossy(&pkt.payload);
+        if matches!(raw_text, std::borrow::Cow::Owned(_)) {
+            bad_utf8 += 1;
+        }
         let cleaned = raw_text.trim_end_matches(['\r', '\n', '\0']);
         if cleaned.is_empty() {
+            empty += 1;
             continue;
         }
         let start = AssTime::from_ms_rounded(pkt.start_ms);
@@ -707,7 +780,22 @@ fn build_text_script(packets: &[RawSubPacket]) -> ScriptFile {
             fixed.set_start(start);
             fixed.set_end(end);
             entries.push(EventEntry::Event(fixed));
+        } else {
+            unparsed += 1;
         }
+    }
+    if empty > 0 {
+        warnings.push(format!("{empty} empty subtitle block(s) were skipped"));
+    }
+    if unparsed > 0 {
+        warnings.push(format!(
+            "{unparsed} subtitle block(s) could not be converted and were skipped"
+        ));
+    }
+    if bad_utf8 > 0 {
+        warnings.push(format!(
+            "{bad_utf8} block(s) contained invalid UTF-8 that was replaced with U+FFFD"
+        ));
     }
 
     script.ensure_events_section_mut().entries = entries;
@@ -741,4 +829,69 @@ fn strip_webvtt_class_tags(input: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkt(start_ms: u64, payload: &[u8]) -> RawSubPacket {
+        RawSubPacket {
+            start_ms,
+            duration_ms: Some(1000),
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn track(codec: SubtitleCodec) -> TrackInfo {
+        TrackInfo {
+            number: 1,
+            track_type: crate::tracks::TrackType::Subtitle,
+            codec_id: "S_TEXT/ASS".to_owned(),
+            subtitle_codec: codec,
+            language: None,
+            language_bcp47: None,
+            name: None,
+            is_default: false,
+            is_forced: false,
+            codec_private: None,
+            encodings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ass_blocks_with_bad_fields_produce_warnings() {
+        let packets = [
+            pkt(0, b"0,0,Default,,0,0,0,,fine"),
+            pkt(1000, b"x,y,Default,,0,0,0,,bad numbers"),
+            pkt(2000, b"too,few"),
+            pkt(3000, b"3,0,Default,,0,0,0,,bad \xFF utf8"),
+        ];
+        let mut warnings = Vec::new();
+        let script = build_ass_script(&track(SubtitleCodec::Ass), &packets, &mut warnings);
+        assert_eq!(script.events().count(), 4);
+        let joined = warnings.join("\n");
+        assert!(joined.contains("no CodecPrivate"), "{joined}");
+        assert!(joined.contains("did not have the 9 ASS fields"), "{joined}");
+        assert!(joined.contains("non-numeric"), "{joined}");
+        assert!(joined.contains("invalid UTF-8"), "{joined}");
+    }
+
+    #[test]
+    fn clean_ass_blocks_only_warn_about_missing_header() {
+        let mut info = track(SubtitleCodec::Ass);
+        info.codec_private = Some(b"[Script Info]\nScriptType: v4.00+\n".to_vec());
+        let mut warnings = Vec::new();
+        let _ = build_ass_script(&info, &[pkt(0, b"0,0,Default,,0,0,0,,ok")], &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn empty_text_blocks_are_counted_not_dropped_silently() {
+        let packets = [pkt(0, b"hello"), pkt(1000, b""), pkt(2000, b"\n")];
+        let mut warnings = Vec::new();
+        let script = build_text_script(&packets, &mut warnings);
+        assert_eq!(script.events().count(), 1);
+        assert_eq!(warnings, vec!["2 empty subtitle block(s) were skipped"]);
+    }
 }
