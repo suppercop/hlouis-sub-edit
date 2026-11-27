@@ -1,0 +1,21 @@
+{
+  "Default": {
+    "edit/undo": [
+      { "modifiers": ["Ctrl"], "key": "Z" }
+    ],
+    "edit/redo": [
+      { "modifiers": ["Ctrl"], "key": "Y" }
+    ],
+    "time/shift": [
+      { "modifiers": ["Ctrl"], "key": "I" }
+    ],
+    "custom/legacy_lua_macro_unmapped": [
+      { "modifiers": ["Ctrl", "Alt"], "key": "M" }
+    ]
+  },
+  "Audio": {
+    "audio/commit": [
+      { "modifiers": [], "key": "G" }
+    ]
+  }
+}

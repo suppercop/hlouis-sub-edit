@@ -8,6 +8,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod media;
+pub mod owner_defaults;
 
 use ass_core::{
     AssEvent, AssStyle, AssTime, EditCommand, EventKind, ScriptFile, parse_ass, serialize_ass,
@@ -92,6 +93,7 @@ pub struct EditorApp {
     pub settings_path: Option<PathBuf>,
     pub clipboard: String,
     pub close_prompt_open: bool,
+    pub first_run_import: owner_defaults::FirstRunImportState,
     pub recovery_candidates: Vec<RecoveryCandidate>,
     pub video: Box<dyn VideoProvider>,
     pub audio: Option<Box<dyn AudioProvider>>,
@@ -128,6 +130,7 @@ impl EditorApp {
             settings_path: None,
             clipboard: String::new(),
             close_prompt_open: false,
+            first_run_import: owner_defaults::FirstRunImportState::default(),
             recovery_candidates: Vec::new(),
             video: Box::new(dummy_video),
             audio: Some(Box::new(synth_audio)),
@@ -706,6 +709,38 @@ impl EditorApp {
         for p in dropped {
             if let Err(err) = self.open_file(&p) {
                 self.shell.status_message = format!("Open failed: {err}");
+            }
+        }
+
+        // First-run Aegisub 3.5.1 config.json + hotkey.json import prompt (ask before importing).
+        if self.first_run_import.prompt_open {
+            let dir_disp = self
+                .first_run_import
+                .detected_dir
+                .as_ref()
+                .map_or_else(String::new, |d| d.display().to_string());
+            let mut do_accept = false;
+            let mut do_decline = false;
+            egui::Window::new("Import Aegisub Settings")
+                .order(Order::Foreground)
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Found an existing Aegisub configuration at:\n{dir_disp}\n\nImport grid columns, colours, fonts, audio/timing options, and hotkeys?"
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Import").clicked() {
+                            do_accept = true;
+                        }
+                        if ui.button("Skip").clicked() {
+                            do_decline = true;
+                        }
+                    });
+                });
+            if do_accept {
+                let _ = self.accept_aegisub_import();
+            } else if do_decline {
+                self.decline_aegisub_import();
             }
         }
 

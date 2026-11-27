@@ -839,6 +839,67 @@ fn get_color(root: &Value, path: &[&str]) -> Option<RgbaColor> {
     RgbaColor::parse_aegisub(get_str(root, path)?)
 }
 
+/// Summary report produced when importing an Aegisub 3.5.1 config + hotkey directory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AegisubImportReport {
+    pub config_loaded: bool,
+    pub hotkeys_loaded: bool,
+    pub mapped_hotkeys: usize,
+    pub unmapped_hotkeys: Vec<UnmappedHotkey>,
+    pub unmapped_keys: Vec<String>,
+}
+
+/// Detects the user's existing Aegisub config directory (`%APPDATA%\Aegisub` on Windows or
+/// `~/.aegisub` / `$XDG_CONFIG_HOME/aegisub` on Unix) if `config.json` or `hotkey.json` exists.
+#[must_use]
+pub fn detect_aegisub_config_dir() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        candidates.push(std::path::PathBuf::from(appdata).join("Aegisub"));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        candidates.push(std::path::PathBuf::from(xdg).join("aegisub"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join(".aegisub"));
+    }
+    candidates
+        .into_iter()
+        .find(|d| d.join("config.json").is_file() || d.join("hotkey.json").is_file())
+}
+
+/// Imports `config.json` and optional `hotkey.json` from `dir`, returning both the typed
+/// [`ImportedSettings`] and an [`AegisubImportReport`] listing any unmapped hotkeys or keys.
+///
+/// # Errors
+/// Returns [`ConfigImportError`] if reading or parsing `config.json` or `hotkey.json` fails.
+pub fn import_aegisub_dir(
+    dir: &Path,
+) -> Result<(ImportedSettings, AegisubImportReport), ConfigImportError> {
+    let cfg_path = dir.join("config.json");
+    let hk_path = dir.join("hotkey.json");
+    let mut report = AegisubImportReport::default();
+
+    let mut imported = if cfg_path.is_file() {
+        let raw = fs::read_to_string(&cfg_path)?;
+        report.config_loaded = true;
+        import_config_json(&raw)?
+    } else {
+        ImportedSettings::default()
+    };
+
+    if hk_path.is_file() {
+        let raw_hk = fs::read_to_string(&hk_path)?;
+        let hk = import_hotkey_json(&raw_hk)?;
+        report.hotkeys_loaded = true;
+        report.mapped_hotkeys = hk.by_context.values().map(Vec::len).sum();
+        report.unmapped_hotkeys.clone_from(&hk.unmapped);
+        imported.hotkeys = hk;
+    }
+
+    Ok((imported, report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

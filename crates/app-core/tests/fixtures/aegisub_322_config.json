@@ -1,0 +1,61 @@
+{
+  "App": {
+    "Language": "en_US",
+    "Show Toolbar": true,
+    "Auto": {
+      "Save": true,
+      "Save Every Seconds": 60,
+      "Save on Every Change": false,
+      "Backup": true
+    }
+  },
+  "Audio": {
+    "Spectrum": true,
+    "Lead": {
+      "IN": 200,
+      "OUT": 300
+    },
+    "Auto": {
+      "Focus": true,
+      "Commit": false
+    }
+  },
+  "Colour": {
+    "Subtitle Grid": {
+      "Header": "rgb(165, 207, 231)",
+      "Left Column": "rgb(196, 236, 201)",
+      "Background": {
+        "Background": "rgb(255, 255, 255)",
+        "Selection": "rgb(206, 255, 231)"
+      }
+    }
+  },
+  "Subtitle": {
+    "Edit Box": {
+      "Font Face": "Segoe UI",
+      "Font Size": 10
+    },
+    "Grid": {
+      "Font Face": "Segoe UI",
+      "Font Size": 9,
+      "Hide Overrides": 1,
+      "Column": {
+        "Layer": false,
+        "Start": true,
+        "End": true,
+        "Style": true,
+        "Actor": false,
+        "Effect": false,
+        "Margin L": false,
+        "Margin R": false,
+        "Margin V": false,
+        "CPS": true
+      }
+    }
+  },
+  "Tool": {
+    "Timing": {
+      "Default Duration": 2000
+    }
+  }
+}
