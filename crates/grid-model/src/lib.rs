@@ -234,7 +234,9 @@ impl OverlapIndex {
             }
         }
 
-        // 2. Remove old packed entry (if active), update timing, and insert new entry (if active).
+        // 2. Re-position the packed entry. When the row stays active (the common edit) it is
+        //    moved with a bounded rotate (cost proportional to how far it travels, not to the
+        //    script length); otherwise fall back to remove/insert.
         #[allow(clippy::cast_possible_truncation)]
         let old_pos = if old_active {
             let old_packed = (u64::from(old_timing.start_cs) << 32) | (row as u64);
@@ -242,22 +244,35 @@ impl OverlapIndex {
         } else {
             None
         };
-        if let Some(pos) = old_pos {
-            self.sorted_starts.remove(pos);
-            self.prefix_max_end.remove(pos);
-        }
 
         self.rows[row] = new_timing;
 
         #[allow(clippy::cast_possible_truncation)]
-        let new_pos = if new_active {
-            let new_packed = (u64::from(new_timing.start_cs) << 32) | (row as u64);
-            let pos = self.sorted_starts.partition_point(|&p| p < new_packed);
-            self.sorted_starts.insert(pos, new_packed);
-            self.prefix_max_end.insert(pos, 0);
-            Some(pos)
-        } else {
-            None
+        let new_packed = (u64::from(new_timing.start_cs) << 32) | (row as u64);
+        let new_pos = match (old_pos, new_active) {
+            (Some(op), true) => {
+                let p = self.sorted_starts.partition_point(|&x| x < new_packed);
+                let target = if p > op { p - 1 } else { p };
+                if target > op {
+                    self.sorted_starts[op..=target].rotate_left(1);
+                } else if target < op {
+                    self.sorted_starts[target..=op].rotate_right(1);
+                }
+                self.sorted_starts[target] = new_packed;
+                Some(target)
+            }
+            (Some(op), false) => {
+                self.sorted_starts.remove(op);
+                self.prefix_max_end.remove(op);
+                None
+            }
+            (None, true) => {
+                let pos = self.sorted_starts.partition_point(|&x| x < new_packed);
+                self.sorted_starts.insert(pos, new_packed);
+                self.prefix_max_end.insert(pos, 0);
+                Some(pos)
+            }
+            (None, false) => None,
         };
 
         // 3. Repair `prefix_max_end` from the earliest touched position until values converge.
