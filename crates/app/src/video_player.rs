@@ -1,6 +1,7 @@
-//! Background FFMS2 video indexing/decoding + libass rendering worker.
+//! Background video decoding (instant index-free open, then frame-exact `BestSource` once its
+//! background index is ready) + libass rendering worker.
 
-use media::{FfmsVideo, MediaError, VideoInfo};
+use media::{HybridOptions, HybridVideo, MediaError, UpgradeStatus, VideoInfo, VideoProvider};
 use render::AssSubRenderer;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -40,9 +41,26 @@ pub struct ReadyFrame {
 
 /// Events emitted by the background worker to the UI thread.
 pub enum PlayerEvent {
-    IndexingProgress { current: i64, total: i64 },
+    IndexingProgress {
+        current: i64,
+        total: i64,
+    },
     IndexingCancelled,
-    VideoReady { info: VideoInfo, file_name: String },
+    VideoReady {
+        info: VideoInfo,
+        file_name: String,
+    },
+    /// Background frame-exact index progress (`eta_secs` once it can be estimated).
+    ExactIndexing {
+        fraction: f32,
+        eta_secs: Option<u64>,
+    },
+    /// The frame-exact provider took over; frame count/timestamps/keyframes may be refined.
+    ExactReady {
+        info: VideoInfo,
+    },
+    /// The frame-exact index could not be built; seeking stays approximate.
+    ExactIndexFailed(String),
     Frame(ReadyFrame),
     PlaybackEnded,
     AssError(String),
@@ -188,11 +206,13 @@ impl Drop for VideoPlayerHandle {
 }
 
 const MAX_QUEUED_FRAMES: usize = 3;
+const EXACT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_POOLED_BUFFERS_PLAYING: usize = 4;
 const MAX_POOLED_BUFFERS_PAUSED: usize = 1;
 
 struct WorkerState {
-    video: Option<FfmsVideo>,
+    video: Option<HybridVideo>,
+    last_exact_report: Instant,
     renderer: Option<AssSubRenderer>,
     ass_script: AssContent,
     current_frame: usize,
@@ -339,6 +359,7 @@ fn worker_loop(
 ) {
     let mut state = WorkerState {
         video: None,
+        last_exact_report: Instant::now(),
         renderer: None,
         ass_script: AssContent::Memory(initial_ass.to_owned()),
         current_frame: 0,
@@ -370,6 +391,13 @@ fn worker_loop(
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+        } else if state.video.as_ref().is_some_and(HybridVideo::is_indexing) {
+            // Wake up periodically to report index progress and switch to the exact provider.
+            match cmd_rx.recv_timeout(EXACT_POLL_INTERVAL) {
+                Ok(c) => Some(c),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         } else {
             match cmd_rx.recv() {
                 Ok(c) => Some(c),
@@ -396,6 +424,8 @@ fn worker_loop(
                 }
             }
         }
+
+        poll_exact_index(&mut state, evt_tx, queued_frames, ctx);
 
         if state.playing {
             let num_frames = state.video.as_ref().map_or(0, |v| v.info().num_frames);
@@ -445,6 +475,8 @@ fn handle_open_video(
     ctx: &egui::Context,
 ) {
     state.playing = false;
+    // Closing the previous file cancels its background index (HybridVideo::drop).
+    state.video = None;
     state.buffer_pool.clear();
     state.buffer_pool.shrink_to_fit();
     state.generation = state.generation.wrapping_add(1);
@@ -456,7 +488,7 @@ fn handle_open_video(
         return;
     }
     let mut last_report = Instant::now();
-    let res = FfmsVideo::open_with_progress(path, cancel, |current, total| {
+    let res = HybridVideo::open(path, &HybridOptions::default(), cancel, |current, total| {
         if open_id == latest_open_id.load(Ordering::Acquire)
             && (last_report.elapsed() >= Duration::from_millis(50) || current == total)
         {
@@ -475,9 +507,17 @@ fn handle_open_video(
                 || path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
+            let indexing = video.is_indexing();
             state.video = Some(video);
             state.current_frame = 0;
             let _ = evt_tx.send(PlayerEvent::VideoReady { info, file_name });
+            if indexing {
+                state.last_exact_report = Instant::now();
+                let _ = evt_tx.send(PlayerEvent::ExactIndexing {
+                    fraction: 0.0,
+                    eta_secs: None,
+                });
+            }
             emit_seek_frame(state, 0, evt_tx, queued_frames, ctx);
         }
         Err(MediaError::Cancelled) => {
@@ -492,6 +532,50 @@ fn handle_open_video(
                 ctx.request_repaint();
             }
         }
+    }
+}
+
+/// Reports background index progress and switches to the frame-exact provider when ready.
+fn poll_exact_index(
+    state: &mut WorkerState,
+    evt_tx: &mpsc::Sender<PlayerEvent>,
+    queued_frames: &AtomicUsize,
+    ctx: &egui::Context,
+) {
+    let Some(video) = state.video.as_mut() else {
+        return;
+    };
+    if !video.is_indexing() {
+        return;
+    }
+    match video.poll_upgrade() {
+        UpgradeStatus::Pending => {
+            if state.last_exact_report.elapsed() >= EXACT_POLL_INTERVAL {
+                state.last_exact_report = Instant::now();
+                if let Some(p) = video.index_progress() {
+                    let _ = evt_tx.send(PlayerEvent::ExactIndexing {
+                        fraction: p.fraction,
+                        eta_secs: p.eta.map(|d| d.as_secs()),
+                    });
+                    ctx.request_repaint();
+                }
+            }
+        }
+        UpgradeStatus::Switched => {
+            let info = video.info().clone();
+            state.current_frame = state.current_frame.min(info.num_frames.saturating_sub(1));
+            let _ = evt_tx.send(PlayerEvent::ExactReady { info });
+            if !state.playing {
+                state.generation = state.generation.wrapping_add(1);
+                emit_seek_frame(state, state.current_frame, evt_tx, queued_frames, ctx);
+            }
+            ctx.request_repaint();
+        }
+        UpgradeStatus::Failed(err) => {
+            let _ = evt_tx.send(PlayerEvent::ExactIndexFailed(err.to_string()));
+            ctx.request_repaint();
+        }
+        UpgradeStatus::Done => {}
     }
 }
 

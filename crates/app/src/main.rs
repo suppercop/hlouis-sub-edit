@@ -19,6 +19,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Background frame-exact index state shown under the video status line.
+#[derive(Debug, Clone, PartialEq)]
+enum ExactIndexUi {
+    None,
+    Indexing {
+        fraction: f32,
+        eta_secs: Option<u64>,
+    },
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum VideoScaleMode {
     #[default]
@@ -228,6 +239,7 @@ struct SpikeApp {
     video_file_name: String,
     ass_source: AssSource,
     indexing_progress: Option<(i64, i64)>,
+    exact_index: ExactIndexUi,
     playback_state: PlaybackState,
     loop_playback: bool,
     log_metrics: bool,
@@ -296,6 +308,7 @@ impl SpikeApp {
             video_file_name,
             ass_source,
             indexing_progress,
+            exact_index: ExactIndexUi::None,
             playback_state: PlaybackState::Paused,
             loop_playback: cli.loop_playback,
             log_metrics: cli.log_metrics,
@@ -372,8 +385,19 @@ impl SpikeApp {
                 PlayerEvent::IndexingCancelled => {
                     self.indexing_progress = None;
                 }
+                PlayerEvent::ExactIndexing { fraction, eta_secs } => {
+                    self.exact_index = ExactIndexUi::Indexing { fraction, eta_secs };
+                }
+                PlayerEvent::ExactReady { info } => {
+                    self.exact_index = ExactIndexUi::None;
+                    self.video_info = Some(info);
+                }
+                PlayerEvent::ExactIndexFailed(msg) => {
+                    self.exact_index = ExactIndexUi::Failed(msg);
+                }
                 PlayerEvent::VideoReady { info, file_name } => {
                     self.indexing_progress = None;
+                    self.exact_index = ExactIndexUi::None;
                     self.error_banner = None;
                     self.video_file_name = file_name;
                     self.video_info = Some(info);
@@ -760,6 +784,47 @@ impl SpikeApp {
             ));
         } else {
             ui.label(self.i18n.tr("status-no-video"));
+        }
+        self.render_exact_index_status(ui);
+    }
+
+    /// Background frame-exact indexing is never silent: progress + ETA, or why it failed.
+    fn render_exact_index_status(&self, ui: &mut egui::Ui) {
+        match &self.exact_index {
+            ExactIndexUi::None => {}
+            ExactIndexUi::Indexing { fraction, eta_secs } => {
+                let percent = FluentValue::from(f64::from((fraction * 100.0).round()));
+                let text = match eta_secs {
+                    Some(s) if *s >= 90 => self.i18n.tr_args(
+                        "status-exact-indexing-eta-min",
+                        &[
+                            ("percent", percent),
+                            ("minutes", FluentValue::from(s.div_ceil(60))),
+                        ],
+                    ),
+                    Some(s) => self.i18n.tr_args(
+                        "status-exact-indexing-eta-s",
+                        &[
+                            ("percent", percent),
+                            ("seconds", FluentValue::from((*s).max(1))),
+                        ],
+                    ),
+                    None => self
+                        .i18n
+                        .tr_args("status-exact-indexing", &[("percent", percent)]),
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                        .desired_width(ui.available_width().max(120.0))
+                        .text(text),
+                );
+            }
+            ExactIndexUi::Failed(msg) => {
+                ui.label(self.i18n.tr_args(
+                    "status-exact-index-failed",
+                    &[("message", FluentValue::from(msg.as_str()))],
+                ));
+            }
         }
     }
 
