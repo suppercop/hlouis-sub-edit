@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use media::{copy_rgba_plane, FfmsVideo};
+use media::{copy_rgba_plane, BestSourceOptions, BestSourceProvider, FfmsVideo, VideoProvider};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -34,6 +34,24 @@ fn bench_media(c: &mut Criterion) {
             let mut idx = 0usize;
             group.sample_size(20);
             group.bench_function("media_decode_1080p", |b| {
+                b.iter(|| {
+                    idx = (idx + 1) % frame_count;
+                    let res = video.decode_frame_into(idx, &mut rgba);
+                    black_box((res.is_ok(), rgba.len()));
+                });
+            });
+        }
+        if let Ok(mut video) = BestSourceProvider::open_with_progress(
+            Path::new(&path_str),
+            &BestSourceOptions::default(),
+            &cancel,
+            |_, _| {},
+        ) {
+            let frame_count = video.info().num_frames.clamp(1, 240);
+            let mut rgba = Vec::new();
+            let _ = video.decode_frame_into(0, &mut rgba);
+            let mut idx = 0usize;
+            group.bench_function("bestsource_decode_1080p", |b| {
                 b.iter(|| {
                     idx = (idx + 1) % frame_count;
                     let res = video.decode_frame_into(idx, &mut rgba);

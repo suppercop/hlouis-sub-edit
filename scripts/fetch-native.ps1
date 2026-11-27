@@ -326,10 +326,12 @@ foreach ($libName in @("avcodec.lib", "avformat.lib", "avutil.lib", "swscale.lib
     Copy-Item -Force (Join-Path $ffmpegRoot "lib\$libName") $LibOut
 }
 
-# The same LGPL ffmpeg.exe, used by tests/benches to generate clips (kept off PATH on purpose)
+# The same LGPL ffmpeg.exe/ffprobe.exe, used by tests/benches to generate and probe clips
+# (kept off PATH on purpose)
 $ToolsOut = Join-Path $OutputDir "tools"
 New-Item -ItemType Directory -Force -Path $ToolsOut | Out-Null
 Copy-Item -Force (Join-Path $ffmpegRoot "bin\ffmpeg.exe") $ToolsOut
+Copy-Item -Force (Join-Path $ffmpegRoot "bin\ffprobe.exe") $ToolsOut
 Get-ChildItem (Join-Path $ffmpegRoot "bin") -Filter "*.dll" | ForEach-Object { Copy-Item -Force $_.FullName $ToolsOut }
 
 # Headers
