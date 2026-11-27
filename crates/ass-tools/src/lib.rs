@@ -40,4 +40,6 @@ pub enum ToolsError {
     EmptyFrameTable,
     #[error("invalid target resolution {0}x{1} (must be > 0)")]
     InvalidResolution(u32, u32),
+    #[error("the script's {key} is `{value}`, which is not a positive integer; set it or pass an explicit source resolution")]
+    InvalidSourceResolution { key: &'static str, value: String },
 }

@@ -318,6 +318,26 @@ impl Default for AppSettings {
     }
 }
 
+fn diff_json(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut Vec<String>) {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            for (k, va) in x {
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                if let Some(vb) = y.get(k) {
+                    diff_json(&p, va, vb, out);
+                }
+            }
+        }
+        _ if a != b => out.push(format!("{path}: {a} -> {b}")),
+        _ => {}
+    }
+}
+
 impl AppSettings {
     /// Loads settings from JSON, applies schema migrations, and clamps out-of-range values.
     ///
@@ -328,6 +348,23 @@ impl AppSettings {
         settings.migrate();
         settings.validate_and_clamp();
         Ok(settings)
+    }
+
+    /// Like [`AppSettings::load_json`] but also lists every value that migration or clamping
+    /// changed (`"general.undo_levels: 5 -> 10"`), so the UI can tell the user their config
+    /// was adjusted instead of silently rewriting it.
+    ///
+    /// # Errors
+    /// Returns [`SettingsError::Json`] if `json` is syntactically invalid.
+    pub fn load_json_with_report(json: &str) -> Result<(Self, Vec<String>), SettingsError> {
+        let mut settings: Self = serde_json::from_str(json)?;
+        let before = serde_json::to_value(&settings)?;
+        settings.migrate();
+        settings.validate_and_clamp();
+        let after = serde_json::to_value(&settings)?;
+        let mut changes = Vec::new();
+        diff_json("", &before, &after, &mut changes);
+        Ok((settings, changes))
     }
 
     /// Serializes settings to pretty JSON (preserving unknown keys).
@@ -505,5 +542,22 @@ mod tests {
             s.appearance.theme_mode = ThemeMode::Light;
         });
         assert_eq!(hits.get(), 1);
+    }
+
+    #[test]
+    fn clamped_values_are_reported() {
+        let mut s = AppSettings::default();
+        s.general.undo_levels = 5;
+        let json = s.save_json().unwrap();
+        let (loaded, changes) = AppSettings::load_json_with_report(&json).unwrap();
+        assert_eq!(loaded.general.undo_levels, 10);
+        assert!(
+            changes.iter().any(|c| c.starts_with("general.undo_levels")),
+            "{changes:?}"
+        );
+        let (_, none) =
+            AppSettings::load_json_with_report(&AppSettings::default().save_json().unwrap())
+                .unwrap();
+        assert!(none.is_empty(), "{none:?}");
     }
 }

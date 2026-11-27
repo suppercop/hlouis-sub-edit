@@ -14,6 +14,9 @@ pub enum VersionError {
     /// Invalid semver string.
     #[error("invalid semver string: {0}")]
     InvalidSemVer(String),
+    /// The JSON was valid but is not a release object or an array of them.
+    #[error("releases JSON has an unexpected shape (expected an array or object)")]
+    UnexpectedShape,
 }
 
 /// Update release channel.
@@ -123,18 +126,34 @@ pub struct ReleaseInfo {
 /// # Errors
 /// Returns [`VersionError::Json`] if `json` is invalid JSON.
 pub fn parse_github_releases_json(json: &str) -> Result<Vec<ReleaseInfo>, VersionError> {
+    parse_github_releases_with_skipped(json).map(|(releases, _)| releases)
+}
+
+/// Like [`parse_github_releases_json`] but also returns one reason per release entry that was
+/// skipped (missing `tag_name`, tag that is not a semantic version) so the update check can tell
+/// the user why a release did not show up.
+///
+/// # Errors
+/// Returns [`VersionError::Json`] for invalid JSON and [`VersionError::UnexpectedShape`] when the
+/// document is neither an array nor an object.
+pub fn parse_github_releases_with_skipped(
+    json: &str,
+) -> Result<(Vec<ReleaseInfo>, Vec<String>), VersionError> {
     let val: Value = serde_json::from_str(json)?;
     let items: Vec<&Value> = match &val {
         Value::Array(arr) => arr.iter().collect(),
         Value::Object(_) => vec![&val],
-        _ => Vec::new(),
+        _ => return Err(VersionError::UnexpectedShape),
     };
     let mut out = Vec::with_capacity(items.len());
-    for item in items {
+    let mut skipped = Vec::new();
+    for (i, item) in items.into_iter().enumerate() {
         let Some(tag) = item.get("tag_name").and_then(Value::as_str) else {
+            skipped.push(format!("release #{} has no tag_name", i + 1));
             continue;
         };
         let Ok(version) = SemVer::parse(tag) else {
+            skipped.push(format!("release tag `{tag}` is not a valid version"));
             continue;
         };
         let draft = item.get("draft").and_then(Value::as_bool).unwrap_or(false);
@@ -167,7 +186,7 @@ pub fn parse_github_releases_json(json: &str) -> Result<Vec<ReleaseInfo>, Versio
             draft,
         });
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 /// Persistent update-check state supporting channel selection, skip-version, remind-later, and

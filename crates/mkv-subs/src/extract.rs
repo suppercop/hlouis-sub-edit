@@ -880,7 +880,10 @@ mod tests {
     #[test]
     fn clean_ass_blocks_only_warn_about_missing_header() {
         let mut info = track(SubtitleCodec::Ass);
-        info.codec_private = Some(b"[Script Info]\nScriptType: v4.00+\n".to_vec());
+        info.codec_private = Some(
+            b"[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                .to_vec(),
+        );
         let mut warnings = Vec::new();
         let _ = build_ass_script(&info, &[pkt(0, b"0,0,Default,,0,0,0,,ok")], &mut warnings);
         assert!(warnings.is_empty(), "{warnings:?}");
