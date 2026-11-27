@@ -218,11 +218,14 @@ struct CachedEditGalley {
 
 struct SpikeApp {
     i18n: I18n,
+    cached_locale: Locale,
+    cached_headers: [String; 6],
     theme_mode: ThemeMode,
     palette: ThemePalette,
     last_theme_check: Instant,
     grid: GridState,
     cached_edit_galley: Option<CachedEditGalley>,
+    syntax_scratch: Vec<syntax::HighlightSpan>,
     player: VideoPlayerHandle,
     video_info: Option<VideoInfo>,
     video_file_name: String,
@@ -249,11 +252,24 @@ struct SpikeApp {
     last_metrics_log: Instant,
 }
 
+fn build_grid_headers(i18n: &I18n) -> [String; 6] {
+    [
+        i18n.tr("col-index"),
+        i18n.tr("col-start"),
+        i18n.tr("col-end"),
+        i18n.tr("col-cps"),
+        i18n.tr("col-style"),
+        i18n.tr("col-text"),
+    ]
+}
+
 impl SpikeApp {
     fn new(cc: &eframe::CreationContext<'_>, cli: CliOptions) -> anyhow::Result<Self> {
         configure_fonts(&cc.egui_ctx);
 
         let i18n = I18n::new(cli.lang.unwrap_or(Locale::En))?;
+        let cached_locale = i18n.locale();
+        let cached_headers = build_grid_headers(&i18n);
         let theme_mode = cli.theme.unwrap_or(ThemeMode::FollowWindows);
         let palette = theme::resolve_palette(theme_mode);
         theme::apply_to_egui(&cc.egui_ctx, &palette);
@@ -286,11 +302,14 @@ impl SpikeApp {
         let mem = ffi::process_memory_mib().unwrap_or_default();
         Ok(Self {
             i18n,
+            cached_locale,
+            cached_headers,
             theme_mode,
             palette,
             last_theme_check: now,
             grid: GridState::generate(50_000),
             cached_edit_galley: None,
+            syntax_scratch: Vec::with_capacity(32),
             player,
             video_info: None,
             video_file_name,
@@ -535,7 +554,11 @@ impl SpikeApp {
         self.video_metrics.current_frame = ready.frame_index;
         self.video_metrics.current_pts_ms = ready.pts_ms;
         self.video_metrics.rendered_frames += 1;
-        self.seek_input = ready.frame_index.to_string();
+        {
+            use std::fmt::Write as _;
+            self.seek_input.clear();
+            let _ = write!(self.seek_input, "{}", ready.frame_index);
+        }
     }
 
     fn clear_frame_queue(&mut self) {
@@ -1088,6 +1111,7 @@ impl SpikeApp {
         let palette = self.palette;
         let mono_font = FontId::monospace(15.0);
         let cache = &mut self.cached_edit_galley;
+        let syntax_scratch = &mut self.syntax_scratch;
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
             let text_str = text.as_str();
             let wrap_bits = wrap_width.to_bits();
@@ -1099,7 +1123,13 @@ impl SpikeApp {
                     return Arc::clone(&cached.galley);
                 }
             }
-            let job = syntax::build_layout_job(text_str, &mono_font, wrap_width, &palette);
+            let job = syntax::build_layout_job_with_scratch(
+                text_str,
+                &mono_font,
+                wrap_width,
+                &palette,
+                syntax_scratch,
+            );
             let galley = ui.fonts_mut(|f| f.layout_job(job));
             *cache = Some(CachedEditGalley {
                 text: text_str.to_owned(),
@@ -1134,20 +1164,30 @@ impl SpikeApp {
     }
 
     fn render_grid_table(&mut self, ui: &mut egui::Ui) {
-        let headers = [
-            self.i18n.tr("col-index"),
-            self.i18n.tr("col-start"),
-            self.i18n.tr("col-end"),
-            self.i18n.tr("col-cps"),
-            self.i18n.tr("col-style"),
-            self.i18n.tr("col-text"),
-        ];
-        hlouis_sub_edit::render_grid_table(
-            ui,
-            &mut self.grid,
-            &self.palette,
-            headers.each_ref().map(String::as_str),
-        );
+        if self.i18n.locale() != self.cached_locale {
+            self.cached_locale = self.i18n.locale();
+            self.cached_headers = build_grid_headers(&self.i18n);
+        }
+        let headers = self.cached_headers.each_ref().map(String::as_str);
+        hlouis_sub_edit::render_grid_table(ui, &mut self.grid, &self.palette, headers);
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn next_playback_repaint_delay(&self) -> Duration {
+        let fallback_ms = self
+            .video_info
+            .as_ref()
+            .map_or(16.0, |info| (1000.0 / info.fps.max(1.0)).clamp(4.0, 16.0));
+        let Some(front) = self.frame_queue.front() else {
+            return Duration::from_millis(fallback_ms.round() as u64);
+        };
+        let Some(clock) = &self.playback_clock else {
+            return Duration::from_millis(4);
+        };
+        let elapsed_ms = clock.start_instant.elapsed().as_secs_f64() * 1000.0;
+        let current_media_ms = clock.start_pts_ms + elapsed_ms;
+        let wait_ms = (front.pts_ms as f64 - current_media_ms).clamp(2.0, 16.0);
+        Duration::from_millis(wait_ms.round() as u64)
     }
 }
 
@@ -1214,7 +1254,7 @@ impl eframe::App for SpikeApp {
         self.render_editor_and_grid(ui, seek_focused, allow_cursor_blink);
 
         if self.playback_state == PlaybackState::Playing {
-            ctx.request_repaint_after(Duration::from_millis(4));
+            ctx.request_repaint_after(self.next_playback_repaint_delay());
         }
     }
 }

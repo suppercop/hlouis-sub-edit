@@ -8,7 +8,7 @@
 //! - Returns a single `EditCommand::Batch` so Replace All is undoable in one step.
 
 use crate::ToolsError;
-use ass_core::{parse_text_blocks, serialize_text_blocks, EditCommand, ScriptFile, TextBlock};
+use ass_core::{scan_override_block, EditCommand, RawOverrideItem, ScriptFile};
 use regex::RegexBuilder;
 use std::collections::BTreeSet;
 
@@ -86,13 +86,16 @@ pub fn find_and_replace(
         };
 
         let (replaced, count) = if opts.field == SearchField::Text && opts.skip_tags {
-            replace_skipping_tags(
+            match replace_skipping_tags(
                 current_val,
                 opts.query,
                 opts.replacement,
                 regex.as_ref(),
                 opts.use_regex,
-            )
+            ) {
+                Some(res) => res,
+                None => continue,
+            }
         } else {
             replace_segment(
                 current_val,
@@ -139,22 +142,152 @@ fn replace_skipping_tags(
     replacement: &str,
     regex: Option<&regex::Regex>,
     use_regex: bool,
-) -> (String, usize) {
-    let mut blocks = parse_text_blocks(text);
+) -> Option<(String, usize)> {
+    // Fast pre-filter: if no regex is used and `query` does not occur anywhere in `text`,
+    // it cannot match any plain dialogue span either.
+    if regex.is_none() && !text.contains(query) {
+        return None;
+    }
+
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::new();
     let mut total = 0usize;
-    for block in &mut blocks {
-        if let TextBlock::Plain(ref mut plain) = block {
-            let (new_s, count) = replace_segment(plain, query, replacement, regex, use_regex);
-            if count > 0 {
-                *plain = new_s;
-                total += count;
+    let mut drawing_level = 0u32;
+    let mut copied_until = 0usize;
+    let mut i = 0usize;
+
+    while i < len {
+        if bytes[i] == b'{' {
+            let (next, _) = scan_override_block(text, i + 1, |item| {
+                if let RawOverrideItem::Tag {
+                    name: "p",
+                    raw_args,
+                } = item
+                {
+                    if let Ok(lvl) = raw_args.trim().parse::<u32>() {
+                        drawing_level = lvl;
+                    }
+                }
+            });
+            i = next;
+        } else {
+            let next_brace = bytes[i..]
+                .iter()
+                .position(|&b| b == b'{')
+                .map_or(len, |rel| i + rel);
+            if drawing_level == 0 {
+                // Split plain text around `\N`, `\n`, `\h` escapes so they are skipped like tags.
+                let mut seg_start = i;
+                let mut j = i;
+                while j < next_brace {
+                    if bytes[j] == b'\\'
+                        && j + 1 < next_brace
+                        && matches!(bytes[j + 1], b'N' | b'n' | b'h')
+                    {
+                        if j > seg_start {
+                            let plain = &text[seg_start..j];
+                            apply_plain_replace(
+                                text,
+                                seg_start,
+                                plain,
+                                query,
+                                replacement,
+                                regex,
+                                use_regex,
+                                &mut out,
+                                &mut copied_until,
+                                &mut total,
+                            );
+                        }
+                        j += 2;
+                        seg_start = j;
+                    } else {
+                        j += 1;
+                    }
+                }
+                if next_brace > seg_start {
+                    let plain = &text[seg_start..next_brace];
+                    apply_plain_replace(
+                        text,
+                        seg_start,
+                        plain,
+                        query,
+                        replacement,
+                        regex,
+                        use_regex,
+                        &mut out,
+                        &mut copied_until,
+                        &mut total,
+                    );
+                }
             }
+            i = next_brace;
         }
     }
+
     if total == 0 {
-        (text.to_owned(), 0)
+        None
     } else {
-        (serialize_text_blocks(&blocks), total)
+        out.push_str(&text[copied_until..]);
+        Some((out, total))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_plain_replace(
+    full_text: &str,
+    plain_start: usize,
+    plain: &str,
+    query: &str,
+    replacement: &str,
+    regex: Option<&regex::Regex>,
+    use_regex: bool,
+    out: &mut String,
+    copied_until: &mut usize,
+    total: &mut usize,
+) {
+    if let Some(re) = regex {
+        let mut iter = re.captures_iter(plain).peekable();
+        if iter.peek().is_none() {
+            return;
+        }
+        if out.capacity() == 0 {
+            out.reserve(full_text.len() + 16);
+        }
+        out.push_str(&full_text[*copied_until..plain_start]);
+        let mut last = 0usize;
+        for caps in iter {
+            let Some(m) = caps.get(0) else { continue };
+            out.push_str(&plain[last..m.start()]);
+            if use_regex {
+                caps.expand(replacement, out);
+            } else {
+                out.push_str(replacement);
+            }
+            last = m.end();
+            *total += 1;
+        }
+        out.push_str(&plain[last..]);
+        *copied_until = plain_start + plain.len();
+    } else {
+        let mut iter = plain.match_indices(query).peekable();
+        if iter.peek().is_none() {
+            return;
+        }
+        if out.capacity() == 0 {
+            out.reserve(full_text.len() + 16);
+        }
+        out.push_str(&full_text[*copied_until..plain_start]);
+        let mut last = 0usize;
+        for (start, matched) in iter {
+            out.push_str(&plain[last..start]);
+            out.push_str(replacement);
+            last = start + matched.len();
+            *total += 1;
+        }
+        out.push_str(&plain[last..]);
+        *copied_until = plain_start + plain.len();
     }
 }
 

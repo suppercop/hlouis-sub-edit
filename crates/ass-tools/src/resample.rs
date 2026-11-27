@@ -17,10 +17,7 @@
 //!   `\pbo`, including tags nested inside `\t(...)`) plus `\p>0` vector drawing coordinates.
 
 use crate::ToolsError;
-use ass_core::{
-    parse_tag_args, scan_override_block, AssStyle, EditCommand, OverrideItem, RawOverrideItem,
-    ScriptFile, TagArgs,
-};
+use ass_core::{scan_override_block, AssStyle, EditCommand, RawOverrideItem, ScriptFile};
 use std::fmt::Write as _;
 
 /// Aspect-ratio handling mode matching Aegisub 3.5.1's Resample Resolution dialog.
@@ -303,7 +300,9 @@ pub fn resample_resolution(
     let mut state = compute_state(src_x, src_y, opts);
     state.color_conv = resolve_color_converter(script, opts);
 
-    let mut cmds = Vec::new();
+    let ev_cap = script.events_section().map_or(0, |s| s.entries.len());
+    let st_cap = script.styles_section().map_or(0, |s| s.entries.len());
+    let mut cmds = Vec::with_capacity(ev_cap + st_cap + 6);
     let width_str = opts.dest_x.to_string();
     let height_str = opts.dest_y.to_string();
     let info = script.script_info();
@@ -510,11 +509,12 @@ fn resample_event_text(text: &str, state: ResampleState) -> Option<String> {
             let (next, closed) = scan_override_block(text, i + 1, |item| match item {
                 RawOverrideItem::Comment(c) => out.push_str(c),
                 RawOverrideItem::Tag { name, raw_args } => {
-                    let args = parse_tag_args(name, raw_args);
-                    if let TagArgs::DrawingMode(lvl) = args {
-                        drawing_level = lvl;
+                    if name == "p" {
+                        if let Ok(lvl) = raw_args.trim().parse::<u32>() {
+                            drawing_level = lvl;
+                        }
                     }
-                    write_resampled_tag(&mut out, name, raw_args, &args, state, &mut changed);
+                    write_resampled_tag(&mut out, name, raw_args, state, &mut changed, 0);
                 }
             });
             if closed {
@@ -555,149 +555,303 @@ fn resample_event_text(text: &str, state: ResampleState) -> Option<String> {
     changed.then_some(out)
 }
 
-fn write_resampled_item(
-    out: &mut String,
-    item: &OverrideItem,
-    state: ResampleState,
-    changed: &mut bool,
-) {
-    match item {
-        OverrideItem::Comment(c) => out.push_str(c),
-        OverrideItem::Tag(tag) => {
-            write_resampled_tag(out, &tag.name, &tag.raw_args, &tag.args, state, changed);
-        }
-    }
-}
-
 fn write_resampled_tag(
     out: &mut String,
     name: &str,
     raw_args: &str,
-    args: &TagArgs,
     s: ResampleState,
     changed: &mut bool,
+    depth: u8,
 ) {
     out.push('\\');
     out.push_str(name);
 
-    match args {
-        TagArgs::Point { x, y } => {
-            *changed = true;
-            let nx = x * s.rx + s.shift_x;
-            let ny = y * s.ry + s.shift_y;
-            let _ = write!(out, "({},{})", fmt_num(nx), fmt_num(ny));
-        }
-        TagArgs::Move {
-            x1,
-            y1,
-            x2,
-            y2,
-            t1,
-            t2,
-        } => {
-            *changed = true;
-            let nx1 = x1 * s.rx + s.shift_x;
-            let ny1 = y1 * s.ry + s.shift_y;
-            let nx2 = x2 * s.rx + s.shift_x;
-            let ny2 = y2 * s.ry + s.shift_y;
-            if let (Some(a), Some(b)) = (t1, t2) {
-                let _ = write!(
-                    out,
-                    "({},{},{},{},{a},{b})",
-                    fmt_num(nx1),
-                    fmt_num(ny1),
-                    fmt_num(nx2),
-                    fmt_num(ny2)
-                );
-            } else {
-                let _ = write!(
-                    out,
-                    "({},{},{},{})",
-                    fmt_num(nx1),
-                    fmt_num(ny1),
-                    fmt_num(nx2),
-                    fmt_num(ny2)
-                );
-            }
-        }
-        TagArgs::ClipRect { x1, y1, x2, y2, .. } => {
-            *changed = true;
-            let _ = write!(
-                out,
-                "({},{},{},{})",
-                fmt_num(x1 * s.rx + s.shift_x),
-                fmt_num(y1 * s.ry + s.shift_y),
-                fmt_num(x2 * s.rx + s.shift_x),
-                fmt_num(y2 * s.ry + s.shift_y)
-            );
-        }
-        TagArgs::ClipVector {
-            scale, commands, ..
-        } => {
-            *changed = true;
-            if *scale == 1 {
-                out.push('(');
-            } else {
-                let _ = write!(out, "({scale},");
-            }
-            scale_drawing_commands(out, commands, s.rx, s.ry, s.shift_x, s.shift_y, *scale);
-            out.push(')');
-        }
-        TagArgs::Transform {
-            t1,
-            t2,
-            accel,
-            items,
-        } => {
-            let mut inner = String::new();
-            let mut inner_changed = false;
-            for item in items {
-                write_resampled_item(&mut inner, item, s, &mut inner_changed);
-            }
-            if inner_changed {
+    match name {
+        "pos" | "org" => {
+            if let Some((x, y)) = parse_paren_f64_2(raw_args) {
                 *changed = true;
                 out.push('(');
-                if let (Some(a), Some(b)) = (t1, t2) {
-                    let _ = write!(out, "{a},{b},");
-                }
-                if let Some(acc) = accel {
-                    let _ = write!(out, "{},", fmt_num(*acc));
-                }
-                out.push_str(&inner);
+                write_num(out, x * s.rx + s.shift_x);
+                out.push(',');
+                write_num(out, y * s.ry + s.shift_y);
                 out.push(')');
-            } else {
-                out.push_str(raw_args);
-            }
-        }
-        TagArgs::Raw(raw) => write_resampled_raw_tag(out, name, raw, s, changed),
-        _ => out.push_str(raw_args),
-    }
-}
-
-fn write_resampled_raw_tag(
-    out: &mut String,
-    name: &str,
-    raw: &str,
-    s: ResampleState,
-    changed: &mut bool,
-) {
-    if let Some(conv) = s.color_conv {
-        if matches!(name, "c" | "1c" | "2c" | "3c" | "4c") {
-            if let Some(converted) = convert_ass_override_colour(raw, conv) {
-                if converted != raw {
-                    *changed = true;
-                }
-                out.push_str(&converted);
                 return;
             }
         }
+        "move" => {
+            if let Some((vals, count)) = parse_paren_f64_up_to_6(raw_args) {
+                if count == 4 || count == 6 {
+                    *changed = true;
+                    out.push('(');
+                    write_num(out, vals[0] * s.rx + s.shift_x);
+                    out.push(',');
+                    write_num(out, vals[1] * s.ry + s.shift_y);
+                    out.push(',');
+                    write_num(out, vals[2] * s.rx + s.shift_x);
+                    out.push(',');
+                    write_num(out, vals[3] * s.ry + s.shift_y);
+                    if count == 6 {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let a = vals[4].round() as i64;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let b = vals[5].round() as i64;
+                        out.push(',');
+                        write_i64_ascii(out, a);
+                        out.push(',');
+                        write_i64_ascii(out, b);
+                    }
+                    out.push(')');
+                    return;
+                }
+            }
+        }
+        "clip" | "iclip" => {
+            if write_resampled_clip(out, raw_args, s, changed) {
+                return;
+            }
+        }
+        "t" if depth < 16 => {
+            if let Some(inner) = strip_outer_parens(raw_args) {
+                write_resampled_transform(out, raw_args, inner, s, changed, depth);
+                return;
+            }
+        }
+        "c" | "1c" | "2c" | "3c" | "4c" => {
+            if let Some(conv) = s.color_conv {
+                if write_converted_override_colour(out, raw_args, conv, changed) {
+                    return;
+                }
+            }
+        }
+        "fs" | "bord" | "ybord" | "shad" | "yshad" | "be" | "blur" | "pbo" => {
+            if write_scaled_scalar(out, raw_args, s.ry, changed) {
+                return;
+            }
+        }
+        "fsp" | "xbord" | "xshad" => {
+            if write_scaled_scalar(out, raw_args, s.rx, changed) {
+                return;
+            }
+        }
+        "fscx"
+            if (s.ar - 1.0).abs() > 1e-6 && write_scaled_scalar(out, raw_args, s.ar, changed) =>
+        {
+            return;
+        }
+        _ => {}
     }
-    if let Some(scaled) = scale_scalar_tag(name, raw, s) {
-        *changed = true;
-        out.push_str(&scaled);
+
+    out.push_str(raw_args);
+}
+
+fn write_resampled_clip(
+    out: &mut String,
+    raw_args: &str,
+    s: ResampleState,
+    changed: &mut bool,
+) -> bool {
+    let Some(inner) = strip_outer_parens(raw_args) else {
+        return false;
+    };
+    *changed = true;
+    out.push('(');
+    if let Some([x1, y1, x2, y2]) = parse_csv_f64_4(inner) {
+        write_num(out, x1 * s.rx + s.shift_x);
+        out.push(',');
+        write_num(out, y1 * s.ry + s.shift_y);
+        out.push(',');
+        write_num(out, x2 * s.rx + s.shift_x);
+        out.push(',');
+        write_num(out, y2 * s.ry + s.shift_y);
     } else {
-        out.push_str(raw);
+        let (scale, cmds) = inner
+            .split_once(',')
+            .and_then(|(sc, cmds)| sc.trim().parse::<u32>().ok().map(|v| (v, cmds.trim())))
+            .unwrap_or((1, inner.trim()));
+        if scale != 1 {
+            write_i64_ascii(out, i64::from(scale));
+            out.push(',');
+        }
+        scale_drawing_commands(out, cmds, s.rx, s.ry, s.shift_x, s.shift_y, scale);
     }
+    out.push(')');
+    true
+}
+
+fn write_resampled_transform(
+    out: &mut String,
+    raw_args: &str,
+    inner: &str,
+    s: ResampleState,
+    changed: &mut bool,
+    depth: u8,
+) {
+    let mut parts = [""; 4];
+    let mut count = 0usize;
+    let mut depth_parens: u32 = 0;
+    let mut start = 0usize;
+    for (idx, b) in inner.bytes().enumerate() {
+        match b {
+            b'(' => depth_parens = depth_parens.saturating_add(1),
+            b')' => depth_parens = depth_parens.saturating_sub(1),
+            b',' if depth_parens == 0 => {
+                if count < 4 {
+                    parts[count] = &inner[start..idx];
+                }
+                count += 1;
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if count < 4 {
+        parts[count] = &inner[start..];
+    }
+    count += 1;
+
+    let (t1, t2, accel, tags_str) = match count {
+        1 => (None, None, None, parts[0]),
+        2 => (None, None, parts[0].trim().parse::<f64>().ok(), parts[1]),
+        3 => (
+            parts[0].trim().parse::<i64>().ok(),
+            parts[1].trim().parse::<i64>().ok(),
+            None,
+            parts[2],
+        ),
+        _ => (
+            parts[0].trim().parse::<i64>().ok(),
+            parts[1].trim().parse::<i64>().ok(),
+            parts[2].trim().parse::<f64>().ok(),
+            parts[3],
+        ),
+    };
+
+    let save_len = out.len();
+    out.push('(');
+    if let (Some(a), Some(b)) = (t1, t2) {
+        write_i64_ascii(out, a);
+        out.push(',');
+        write_i64_ascii(out, b);
+        out.push(',');
+    }
+    if let Some(acc) = accel {
+        write_num(out, acc);
+        out.push(',');
+    }
+    let mut inner_changed = false;
+    scan_override_block(tags_str, 0, |item| match item {
+        RawOverrideItem::Comment(c) => out.push_str(c),
+        RawOverrideItem::Tag { name, raw_args } => {
+            write_resampled_tag(out, name, raw_args, s, &mut inner_changed, depth + 1);
+        }
+    });
+    if inner_changed {
+        out.push(')');
+        *changed = true;
+    } else {
+        out.truncate(save_len);
+        out.push_str(raw_args);
+    }
+}
+
+#[inline]
+fn write_scaled_scalar(out: &mut String, raw: &str, factor: f64, changed: &mut bool) -> bool {
+    let Ok(val) = raw.trim().parse::<f64>() else {
+        return false;
+    };
+    if !val.is_finite() {
+        return false;
+    }
+    *changed = true;
+    write_num(out, val * factor);
+    true
+}
+
+#[inline]
+fn write_converted_override_colour(
+    out: &mut String,
+    raw: &str,
+    conv: YcbcrConverter,
+    changed: &mut bool,
+) -> bool {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let Some((_, b, g, r)) = parse_ass_hex_abgr(raw) else {
+        return false;
+    };
+    let (nr, ng, nb) = conv.rgb_to_rgb(r, g, b);
+    let buf = [
+        b'&',
+        b'H',
+        HEX[(nb >> 4) as usize],
+        HEX[(nb & 0x0F) as usize],
+        HEX[(ng >> 4) as usize],
+        HEX[(ng & 0x0F) as usize],
+        HEX[(nr >> 4) as usize],
+        HEX[(nr & 0x0F) as usize],
+        b'&',
+    ];
+    if raw.as_bytes() != buf {
+        *changed = true;
+    }
+    if let Ok(s) = std::str::from_utf8(&buf) {
+        out.push_str(s);
+    }
+    true
+}
+
+#[inline]
+fn strip_outer_parens(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    trimmed.strip_prefix('(')?.strip_suffix(')')
+}
+
+#[inline]
+fn parse_paren_f64_2(raw: &str) -> Option<(f64, f64)> {
+    let inner = strip_outer_parens(raw)?;
+    let (a, b) = inner.split_once(',')?;
+    if b.contains(',') {
+        return None;
+    }
+    let x = a.trim().parse::<f64>().ok()?;
+    let y = b.trim().parse::<f64>().ok()?;
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+#[inline]
+fn parse_csv_f64_4(inner: &str) -> Option<[f64; 4]> {
+    let mut vals = [0.0f64; 4];
+    let mut count = 0usize;
+    for part in inner.split(',') {
+        if count >= 4 {
+            return None;
+        }
+        let v = part.trim().parse::<f64>().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        vals[count] = v;
+        count += 1;
+    }
+    (count == 4).then_some(vals)
+}
+
+#[inline]
+fn parse_paren_f64_up_to_6(raw: &str) -> Option<([f64; 6], usize)> {
+    let inner = strip_outer_parens(raw)?;
+    let mut vals = [0.0f64; 6];
+    let mut count = 0usize;
+    for part in inner.split(',') {
+        if count >= 6 {
+            return None;
+        }
+        let v = part.trim().parse::<f64>().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        vals[count] = v;
+        count += 1;
+    }
+    Some((vals, count))
 }
 
 fn parse_ass_hex_abgr(raw: &str) -> Option<(u8, u8, u8, u8)> {
@@ -732,26 +886,6 @@ fn convert_ass_style_colour(raw: &str, conv: YcbcrConverter) -> Option<String> {
     Some(format!("&H{a:02X}{nb:02X}{ng:02X}{nr:02X}"))
 }
 
-fn convert_ass_override_colour(raw: &str, conv: YcbcrConverter) -> Option<String> {
-    let (_, b, g, r) = parse_ass_hex_abgr(raw)?;
-    let (nr, ng, nb) = conv.rgb_to_rgb(r, g, b);
-    Some(format!("&H{nb:02X}{ng:02X}{nr:02X}&"))
-}
-
-fn scale_scalar_tag(name: &str, raw: &str, s: ResampleState) -> Option<String> {
-    let factor = match name {
-        "fs" | "bord" | "ybord" | "shad" | "yshad" | "be" | "blur" | "pbo" => s.ry,
-        "fsp" | "xbord" | "xshad" => s.rx,
-        "fscx" if (s.ar - 1.0).abs() > 1e-6 => s.ar,
-        _ => return None,
-    };
-    let val = raw.trim().parse::<f64>().ok()?;
-    if !val.is_finite() {
-        return None;
-    }
-    Some(fmt_num(val * factor))
-}
-
 /// Scales `(x, y)` coordinate pairs inside an ASS vector drawing string (`m`, `n`, `l`, `b`, `s`, `p`, `c`),
 /// appending the result to `out`.
 fn scale_drawing_commands(
@@ -772,12 +906,16 @@ fn scale_drawing_commands(
         if idx > 0 {
             out.push(' ');
         }
-        if let Ok(v) = tok.parse::<f64>() {
+        let b0 = tok.as_bytes()[0];
+        if tok.len() == 1 && b0.is_ascii_alphabetic() {
+            // Drawing command letter resets x/y parity.
+            is_x = true;
+            out.push_str(tok);
+        } else if let Ok(v) = tok.parse::<f64>() {
             let scaled = if is_x { v * rx + sx } else { v * ry + sy };
             write_num(out, scaled);
             is_x = !is_x;
         } else {
-            // Drawing command letter resets x/y parity.
             is_x = true;
             out.push_str(tok);
         }
@@ -788,27 +926,81 @@ fn round_2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-fn fmt_num(v: f64) -> String {
-    let mut s = String::new();
-    write_num(&mut s, v);
-    s
+#[inline]
+fn write_i64_ascii(out: &mut String, val: i64) {
+    if val == 0 {
+        out.push('0');
+        return;
+    }
+    let mut abs = val.unsigned_abs();
+    let mut buf = [0u8; 22];
+    let mut pos = buf.len();
+    while abs > 0 {
+        pos -= 1;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            buf[pos] = b'0' + (abs % 10) as u8;
+        }
+        abs /= 10;
+    }
+    if val < 0 {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    if let Ok(s) = std::str::from_utf8(&buf[pos..]) {
+        out.push_str(s);
+    }
 }
 
 /// Appends `v` rounded to 2 decimals with trailing zeroes trimmed (integers print without a point).
+#[inline]
 fn write_num(out: &mut String, v: f64) {
-    let r = round_2(v);
-    if (r - r.round()).abs() < 1e-6 && r.abs() < 1e12 {
-        #[allow(clippy::cast_possible_truncation)]
-        let int_v = r.round() as i64;
-        let _ = write!(out, "{int_v}");
+    let scaled_f = (v * 100.0).round();
+    if !scaled_f.is_finite() || scaled_f.abs() >= 1e14 {
+        let r = round_2(v);
+        let _ = write!(out, "{r}");
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled = scaled_f as i64;
+    if scaled == 0 {
+        out.push('0');
+        return;
+    }
+    if scaled < 0 {
+        out.push('-');
+    }
+    let abs = scaled.unsigned_abs();
+    let whole = abs / 100;
+    let frac = abs % 100;
+    let mut buf = [0u8; 20];
+    let mut pos = buf.len();
+    if whole == 0 {
+        pos -= 1;
+        buf[pos] = b'0';
     } else {
-        let start = out.len();
-        let _ = write!(out, "{r:.2}");
-        while out.len() > start && out.ends_with('0') {
-            out.pop();
+        let mut w = whole;
+        while w > 0 {
+            pos -= 1;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                buf[pos] = b'0' + (w % 10) as u8;
+            }
+            w /= 10;
         }
-        if out.ends_with('.') {
-            out.pop();
+    }
+    if let Ok(s) = std::str::from_utf8(&buf[pos..]) {
+        out.push_str(s);
+    }
+    if frac != 0 {
+        out.push('.');
+        #[allow(clippy::cast_possible_truncation)]
+        let tens = (frac / 10) as u8;
+        #[allow(clippy::cast_possible_truncation)]
+        let ones = (frac % 10) as u8;
+        out.push(char::from(b'0' + tens));
+        if ones != 0 {
+            out.push(char::from(b'0' + ones));
         }
     }
 }

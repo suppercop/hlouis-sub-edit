@@ -102,14 +102,22 @@ pub fn select_lines(
         let raw_match = match opts.mode {
             MatchMode::Contains => {
                 if let Some(ref nl) = needle_lower {
-                    value.to_lowercase().contains(nl.as_str())
+                    if value.is_ascii() && nl.is_ascii() {
+                        contains_ascii_ignore_case(value.as_bytes(), nl.as_bytes())
+                    } else {
+                        value.to_lowercase().contains(nl.as_str())
+                    }
                 } else {
                     value.contains(opts.pattern)
                 }
             }
             MatchMode::Exact => {
                 if let Some(ref nl) = needle_lower {
-                    value.to_lowercase() == *nl
+                    if value.is_ascii() && nl.is_ascii() {
+                        value.eq_ignore_ascii_case(nl)
+                    } else {
+                        value.to_lowercase() == *nl
+                    }
                 } else {
                     value == opts.pattern
                 }
@@ -129,6 +137,27 @@ pub fn select_lines(
         SelectionAction::Intersect => current_selection.intersection(&matched).copied().collect(),
     };
     Ok(result)
+}
+
+#[inline]
+fn contains_ascii_ignore_case(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.len() > haystack.len() {
+        return false;
+    }
+    let first = needle_lower[0];
+    let nlen = needle_lower.len();
+    let end = haystack.len() - nlen;
+    for i in 0..=end {
+        if haystack[i].to_ascii_lowercase() == first
+            && haystack[i..i + nlen].eq_ignore_ascii_case(needle_lower)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
