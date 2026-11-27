@@ -1,0 +1,19 @@
+[package]
+name = "video-geometry"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+visual-tools = { path = "../visual-tools" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "video_geometry"
+harness = false
+
+[lints]
+workspace = true
