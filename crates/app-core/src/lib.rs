@@ -7,6 +7,7 @@
 #![allow(clippy::cast_precision_loss, clippy::missing_errors_doc)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod bench_scenarios;
 pub mod media;
 pub mod owner_defaults;
 

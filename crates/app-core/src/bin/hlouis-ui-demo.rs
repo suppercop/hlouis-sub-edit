@@ -409,9 +409,33 @@ fn run_bench_ui() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_bench_scenario_cli(scenario: &str, file_path: Option<&Path>) -> ExitCode {
+    let ceilings = app_core::bench_scenarios::resolve_ceilings(None);
+    let (results, all_ok) =
+        app_core::bench_scenarios::run_scenarios(scenario, file_path, &ceilings);
+    if results.is_empty() {
+        eprintln!(
+            "Unknown bench scenario '{scenario}'. Available: all, {}",
+            app_core::bench_scenarios::ALL_SCENARIOS.join(", ")
+        );
+        return ExitCode::FAILURE;
+    }
+    println!("{}", perf_metrics::format_scenario_table(&results));
+    if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("BENCH CEILING MISSED");
+        ExitCode::FAILURE
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--bench-ui") {
+    if let Some(pos) = args.iter().position(|a| a == "--bench-ui") {
+        if let Some(scenario) = args.get(pos + 1) {
+            let file_path = args.get(pos + 2).map(Path::new);
+            return run_bench_scenario_cli(scenario, file_path);
+        }
         return run_bench_ui();
     }
     if let Some(pos) = args.iter().position(|a| a == "--snapshots") {

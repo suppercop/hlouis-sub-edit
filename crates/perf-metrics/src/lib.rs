@@ -505,6 +505,74 @@ impl PerfMetrics {
     }
 }
 
+/// Per-scenario benchmark summary row with optional ceiling gating (`ci/bench-ceilings.json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScenarioResult {
+    pub name: String,
+    pub samples: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub worst_us: u64,
+    pub allocations: u64,
+    pub ceiling_p95_us: Option<u64>,
+    pub passed: bool,
+}
+
+/// Parses a flat JSON object `{ "scenario": ceiling_us, ... }` from `path` if it exists (zero
+/// external deps, never panics).
+#[must_use]
+pub fn load_ceilings_json(path: &std::path::Path) -> std::collections::BTreeMap<String, u64> {
+    let mut map = std::collections::BTreeMap::new();
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    let trimmed = raw.trim().trim_start_matches('{').trim_end_matches('}');
+    for entry in trimmed.split(',') {
+        let Some((k, v)) = entry.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().trim_matches('"').trim();
+        let val_str = v.trim().trim_matches('"').trim();
+        if !key.is_empty()
+            && let Ok(us) = val_str.parse::<u64>()
+        {
+            map.insert(key.to_owned(), us);
+        }
+    }
+    map
+}
+
+/// Formats benchmark scenario results into an aligned text table for stdout/CI logs.
+#[must_use]
+pub fn format_scenario_table(results: &[ScenarioResult]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(results.len() * 96 + 128);
+    let _ = writeln!(
+        out,
+        "{:<20} {:>8} {:>10} {:>10} {:>10} {:>8} {:>12} {:>6}",
+        "Scenario",
+        "Samples",
+        "p50 (us)",
+        "p95 (us)",
+        "Worst (us)",
+        "Allocs",
+        "Ceiling (us)",
+        "Status"
+    );
+    for r in results {
+        let ceil = r
+            .ceiling_p95_us
+            .map_or_else(|| "-".to_owned(), |c| c.to_string());
+        let status = if r.passed { "PASS" } else { "FAIL" };
+        let _ = writeln!(
+            out,
+            "{:<20} {:>8} {:>10} {:>10} {:>10} {:>8} {:>12} {:>6}",
+            r.name, r.samples, r.p50_us, r.p95_us, r.worst_us, r.allocations, ceil, status
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
