@@ -2,6 +2,18 @@
 resolver = "2"
 members = [
     "crates/app",
+    "crates/ass-core",
+    "crates/ass-tools",
+    "crates/mkv-subs",
+    "crates/keyframes",
+    "crates/fonts",
+    "crates/autosave",
+    "crates/project",
+    "crates/audio-peaks",
+    "crates/scene-detect",
+    "crates/edit-ops",
+    "crates/styles-catalog",
+    "crates/aegisub-config",
     "crates/i18n",
     "crates/libass-sys",
     "crates/ffms2-sys",

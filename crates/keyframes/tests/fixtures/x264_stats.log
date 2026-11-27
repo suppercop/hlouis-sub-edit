@@ -1,0 +1,6 @@
+#options: 1920x1080 fps=24000/1001 timebase=1001/24000
+in:0 out:0 type:I dur:2 cpbdur:2 q:18.00 aq:18.00 tex:12000 mv:0 misc:200
+in:1 out:2 type:P dur:2 cpbdur:2 q:20.00 aq:20.00 tex:4000 mv:800 misc:150
+in:2 out:1 type:B dur:2 cpbdur:2 q:22.00 aq:22.00 tex:1000 mv:400 misc:100
+in:3 out:3 type:K dur:2 cpbdur:2 q:17.50 aq:17.50 tex:15000 mv:0 misc:220
+in:4 out:4 type:i dur:2 cpbdur:2 q:19.00 aq:19.00 tex:9000 mv:0 misc:180
