@@ -191,9 +191,7 @@ pub fn check_fonts(script: &ScriptFile, provider: &dyn FontProvider) -> FontChec
     let mut missing_glyphs = Vec::new();
 
     for usage in &used_fonts {
-        if !provider.has_font(&usage.spec) {
-            missing_fonts.push(usage.clone());
-        } else {
+        if provider.has_font(&usage.spec) {
             let missing = provider.missing_glyphs(&usage.spec, &usage.glyphs);
             if !missing.is_empty() {
                 missing_glyphs.push(MissingGlyphReport {
@@ -202,6 +200,8 @@ pub fn check_fonts(script: &ScriptFile, provider: &dyn FontProvider) -> FontChec
                     lines: usage.lines.clone(),
                 });
             }
+        } else {
+            missing_fonts.push(usage.clone());
         }
     }
 

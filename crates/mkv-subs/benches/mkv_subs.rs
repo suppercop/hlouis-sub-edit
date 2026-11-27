@@ -8,9 +8,13 @@ use std::io::Cursor;
 
 fn encode_id(element_id: u32, out: &mut Vec<u8>) {
     if element_id <= 0xFF {
-        out.push(element_id as u8);
+        out.push(u8::try_from(element_id).expect("element_id <= 0xFF"));
     } else if element_id <= 0xFFFF {
-        out.extend_from_slice(&(element_id as u16).to_be_bytes());
+        out.extend_from_slice(
+            &u16::try_from(element_id)
+                .expect("element_id <= 0xFFFF")
+                .to_be_bytes(),
+        );
     } else if element_id <= 0x00FF_FFFF {
         let b = element_id.to_be_bytes();
         out.extend_from_slice(&b[1..]);
@@ -21,16 +25,16 @@ fn encode_id(element_id: u32, out: &mut Vec<u8>) {
 
 fn encode_vint(val: u64, out: &mut Vec<u8>) {
     if val < 0x7F {
-        out.push((val as u8) | 0x80);
+        out.push(u8::try_from(val).expect("val < 0x7F") | 0x80);
     } else if val < 0x3FFF {
-        let v = (val as u16) | 0x4000;
+        let v = u16::try_from(val).expect("val < 0x3FFF") | 0x4000;
         out.extend_from_slice(&v.to_be_bytes());
     } else if val < 0x001F_FFFF {
-        let v = (val as u32) | 0x0020_0000;
+        let v = u32::try_from(val).expect("val < 0x1F_FFFF") | 0x0020_0000;
         let b = v.to_be_bytes();
         out.extend_from_slice(&b[1..]);
     } else {
-        let v = (val as u32) | 0x1000_0000;
+        let v = u32::try_from(val).expect("val fits 4-byte VINT") | 0x1000_0000;
         out.extend_from_slice(&v.to_be_bytes());
     }
 }

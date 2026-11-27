@@ -1,4 +1,4 @@
-//! Synthetic 64-track MKV tests (ASS, SRT, WebVTT, zlib, header stripping, lacing,
+//! Synthetic 64-track MKV tests (ASS, SRT, `WebVTT`, zlib, header stripping, lacing,
 //! unknown-size clusters, Void/CRC, Cues preview, cancellation, explicit errors)
 //! plus the ignored `HLOUIS_MKV_MULTISUB` real-file integration test.
 
@@ -14,9 +14,13 @@ use std::sync::atomic::AtomicBool;
 
 fn encode_id(element_id: u32, out: &mut Vec<u8>) {
     if element_id <= 0xFF {
-        out.push(element_id as u8);
+        out.push(u8::try_from(element_id).expect("element_id <= 0xFF"));
     } else if element_id <= 0xFFFF {
-        out.extend_from_slice(&(element_id as u16).to_be_bytes());
+        out.extend_from_slice(
+            &u16::try_from(element_id)
+                .expect("element_id <= 0xFFFF")
+                .to_be_bytes(),
+        );
     } else if element_id <= 0x00FF_FFFF {
         let b = element_id.to_be_bytes();
         out.extend_from_slice(&b[1..]);
@@ -27,16 +31,16 @@ fn encode_id(element_id: u32, out: &mut Vec<u8>) {
 
 fn encode_vint(val: u64, out: &mut Vec<u8>) {
     if val < 0x7F {
-        out.push((val as u8) | 0x80);
+        out.push(u8::try_from(val).expect("val < 0x7F") | 0x80);
     } else if val < 0x3FFF {
-        let v = (val as u16) | 0x4000;
+        let v = u16::try_from(val).expect("val < 0x3FFF") | 0x4000;
         out.extend_from_slice(&v.to_be_bytes());
     } else if val < 0x001F_FFFF {
-        let v = (val as u32) | 0x0020_0000;
+        let v = u32::try_from(val).expect("val < 0x1F_FFFF") | 0x0020_0000;
         let b = v.to_be_bytes();
         out.extend_from_slice(&b[1..]);
     } else {
-        let v = (val as u32) | 0x1000_0000;
+        let v = u32::try_from(val).expect("val fits 4-byte VINT") | 0x1000_0000;
         out.extend_from_slice(&v.to_be_bytes());
     }
 }
@@ -84,14 +88,14 @@ fn build_block_payload(track_num: u64, rel_ts: i16, flags: u8, data: &[u8]) -> V
 
 fn build_xiph_laced(frames: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push((frames.len() - 1) as u8);
+    out.push(u8::try_from(frames.len() - 1).expect("frame count - 1 fits u8"));
     for f in &frames[..frames.len() - 1] {
         let mut rem = f.len();
         while rem >= 255 {
             out.push(255);
             rem -= 255;
         }
-        out.push(rem as u8);
+        out.push(u8::try_from(rem).expect("remainder < 255 fits u8"));
     }
     for f in frames {
         out.extend_from_slice(f);
@@ -101,14 +105,14 @@ fn build_xiph_laced(frames: &[&[u8]]) -> Vec<u8> {
 
 fn build_ebml_laced(frames: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push((frames.len() - 1) as u8);
+    out.push(u8::try_from(frames.len() - 1).expect("frame count - 1 fits u8"));
     encode_vint(frames[0].len() as u64, &mut out);
-    let mut prev = frames[0].len() as i64;
+    let mut prev = i64::try_from(frames[0].len()).expect("frame length fits i64");
     for f in &frames[1..frames.len() - 1] {
-        let cur = f.len() as i64;
+        let cur = i64::try_from(f.len()).expect("frame length fits i64");
         let diff = cur - prev;
         // 2-byte signed VINT (bias = 8191)
-        let biased = (diff + 8191) as u16;
+        let biased = u16::try_from(diff + 8191).expect("biased diff fits 2-byte signed VINT");
         let v = biased | 0x4000;
         out.extend_from_slice(&v.to_be_bytes());
         prev = cur;
@@ -134,11 +138,7 @@ Style: Default,Segoe UI,48,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,0,0,0,0,1
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 ";
 
-fn build_64_track_synthetic_mkv() -> Vec<u8> {
-    // Track 1: Video (dummy blocks to skip)
-    // Tracks 2..=65: 64 subtitle tracks (ASS, SRT, WebVTT, zlib, header-stripped, laced)
-    // Track 66: Unsupported S_HDMV/PGS image subtitle
-    // Track 67: Empty SRT subtitle track (0 blocks -> explicit EmptyTrack error)
+fn build_tracks_section(strip_prefix: &[u8]) -> Vec<u8> {
     let mut tracks_body = Vec::new();
 
     // Video track 1
@@ -149,8 +149,6 @@ fn build_64_track_synthetic_mkv() -> Vec<u8> {
         te.extend(elem_str(id::CODEC_ID, "V_MPEG4/ISO/AVC"));
         tracks_body.extend(elem(id::TRACK_ENTRY, &te));
     }
-
-    let strip_prefix = b"0,0,Default,,0,0,0,,";
 
     for idx in 0..64u64 {
         let track_num = idx + 2; // 2..=65
@@ -220,11 +218,10 @@ fn build_64_track_synthetic_mkv() -> Vec<u8> {
         tracks_body.extend(elem(id::TRACK_ENTRY, &te));
     }
 
-    let info_el = elem(id::INFO, &elem_uint(id::TIMESTAMP_SCALE, 1_000_000));
-    let tracks_el = elem(id::TRACKS, &tracks_body);
-    let void_el = elem(id::VOID, &[0u8; 32]);
-    let crc_el = elem(id::CRC32, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    elem(id::TRACKS, &tracks_body)
+}
 
+fn build_cluster1_element() -> Vec<u8> {
     // Cluster 1 (known size): Video block + blocks for tracks 2..=65.
     // Includes out-of-order ReadOrder on ASS track 2, Xiph lacing on SRT track 3, EBML lacing on track 7.
     let mut cluster1_body = Vec::new();
@@ -309,7 +306,20 @@ fn build_64_track_synthetic_mkv() -> Vec<u8> {
             }
         }
     }
-    let cluster1_el = elem(id::CLUSTER, &cluster1_body);
+    elem(id::CLUSTER, &cluster1_body)
+}
+
+fn build_64_track_synthetic_mkv() -> Vec<u8> {
+    // Track 1: Video (dummy blocks to skip)
+    // Tracks 2..=65: 64 subtitle tracks (ASS, SRT, WebVTT, zlib, header-stripped, laced)
+    // Track 66: Unsupported S_HDMV/PGS image subtitle
+    // Track 67: Empty SRT subtitle track (0 blocks -> explicit EmptyTrack error)
+    let strip_prefix = b"0,0,Default,,0,0,0,,";
+    let info_el = elem(id::INFO, &elem_uint(id::TIMESTAMP_SCALE, 1_000_000));
+    let tracks_el = build_tracks_section(strip_prefix);
+    let void_el = elem(id::VOID, &[0u8; 32]);
+    let crc_el = elem(id::CRC32, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    let cluster1_el = build_cluster1_element();
 
     // Cluster 2: UNKNOWN-SIZE cluster with an extra event on Track 2 (at 10,000 ms)
     let mut cluster2_body = Vec::new();
@@ -342,11 +352,8 @@ fn build_64_track_synthetic_mkv() -> Vec<u8> {
     let cues_pos_rel = seg_body.len() as u64;
     seg_body.extend(elem(id::CUES, &cues_body));
 
-    // Prepend SeekHead pointing to Cues (adjusting offsets cleanly by placing SeekHead after computing?
-    // Even simpler: Cues is at top-level; let's place a fixed-size SeekHead or let read_metadata find Cues via SeekHead!)
     // Build a SeekHead pointing to Cues with exact offset adjustment.
     let mut seek_entry = elem_uint(id::SEEK_ID, u64::from(id::CUES));
-    // We'll compute SeekHead length with 4-byte position padding by fixing position size:
     let mut seek_pos_placeholder = Vec::new();
     encode_id(id::SEEK_POSITION, &mut seek_pos_placeholder);
     encode_vint(4, &mut seek_pos_placeholder);
@@ -368,7 +375,11 @@ fn build_64_track_synthetic_mkv() -> Vec<u8> {
     let mut real_seek_entry = elem_uint(id::SEEK_ID, u64::from(id::CUES));
     encode_id(id::SEEK_POSITION, &mut real_seek_entry);
     encode_vint(4, &mut real_seek_entry);
-    real_seek_entry.extend_from_slice(&((cues_pos_rel + sh_len) as u32).to_be_bytes());
+    real_seek_entry.extend_from_slice(
+        &u32::try_from(cues_pos_rel + sh_len)
+            .expect("cues offset fits u32")
+            .to_be_bytes(),
+    );
     let real_seek_head = elem(id::SEEK_HEAD, &elem(id::SEEK, &real_seek_entry));
     assert_eq!(real_seek_head.len() as u64, sh_len);
 
@@ -445,9 +456,9 @@ fn lists_and_extracts_all_64_subtitle_tracks_with_compression_lacing_and_unknown
     assert_eq!(t5_evs[0].text(), "Stripped ASS T5");
 
     // Track 65 (> 32 track number!)
-    let t65_evs: Vec<_> = extracted[&65].script.events().collect();
-    assert_eq!(t65_evs.len(), 1);
-    assert_eq!(t65_evs[0].text(), "Stripped ASS T65");
+    let last_evs: Vec<_> = extracted[&65].script.events().collect();
+    assert_eq!(last_evs.len(), 1);
+    assert_eq!(last_evs[0].text(), "Stripped ASS T65");
 }
 
 #[test]
