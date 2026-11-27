@@ -2,10 +2,11 @@
 
 use ass_core::{AssEvent, AssTime, EventEntry, ScriptFile};
 use ass_tools::{
-    find_and_replace, join_lines, select_lines, shift_times, split_line, timing_post_process,
-    AdjacentLinkConfig, FindReplaceOptions, JoinMode, KeyframeSnapConfig, MatchMode, SearchField,
-    SearchScope, SelectField, SelectLinesOptions, SelectionAction, ShiftAffect, ShiftAmount,
-    ShiftDirection, ShiftOptions, ShiftTarget, SplitMode, TppOptions,
+    find_and_replace, join_lines, parse_karaoke_syllables, rebuild_karaoke_line,
+    resample_resolution, select_lines, shift_times, split_line, timing_post_process,
+    AdjacentLinkConfig, FindReplaceOptions, JoinMode, KeyframeSnapConfig, MatchMode,
+    ResampleOptions, SearchField, SearchScope, SelectField, SelectLinesOptions, SelectionAction,
+    ShiftAffect, ShiftAmount, ShiftDirection, ShiftOptions, ShiftTarget, SplitMode, TppOptions,
 };
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::collections::BTreeSet;
@@ -135,5 +136,44 @@ fn bench_ass_tools(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_ass_tools);
+fn bench_resample_and_karaoke(c: &mut Criterion) {
+    let mut resample_script = ScriptFile::new_default();
+    resample_script.ensure_events_section_mut().entries = (0..20_000u32)
+        .map(|i| {
+            let start = AssTime::from_cs(i * 150);
+            let end = start.saturating_add_cs(140);
+            let text = if i % 5 == 0 {
+                r"{\p1\pbo4}m 0 0 l 120 0 120 40 0 40{\p0}".to_owned()
+            } else {
+                format!(r"{{\pos(640,360)\fs40\bord2}}Line #{i}")
+            };
+            EventEntry::Event(AssEvent::dialogue(start, end, text))
+        })
+        .collect();
+
+    c.bench_function("resample_resolution_20k_tags_drawings", |b| {
+        let opts = ResampleOptions::new(1920, 1080);
+        b.iter(|| {
+            let mut copy = resample_script.clone();
+            let cmd = resample_resolution(&mut copy, black_box(&opts));
+            black_box(cmd).expect("resample")
+        });
+    });
+
+    let karaoke_lines: Vec<String> = (0..20_000u32)
+        .map(|i| format!(r"{{\k25}}Ka{{\kf35}}ra{{\K20}}o{{\ko30}}ke #{i}"))
+        .collect();
+    c.bench_function("karaoke_parse_rebuild_20k", |b| {
+        b.iter(|| {
+            let mut total_len = 0usize;
+            for line in &karaoke_lines {
+                let syls = parse_karaoke_syllables(black_box(line));
+                total_len += rebuild_karaoke_line(&syls).len();
+            }
+            black_box(total_len)
+        });
+    });
+}
+
+criterion_group!(benches, bench_ass_tools, bench_resample_and_karaoke);
 criterion_main!(benches);

@@ -12,10 +12,11 @@
 //!   - `ByHardNewline`: splits on `\N` segments, distributing duration proportionally by visible chars.
 //!   - `ByKaraoke`: splits at each `\k`/`\kf`/`\K`/`\ko` syllable using exact syllable centisecond timings.
 
+use crate::karaoke::parse_karaoke_syllables;
 use crate::ToolsError;
 use ass_core::{
     parse_text_blocks, serialize_text_blocks, AssEvent, AssTime, EditCommand, EscapeKind,
-    OverrideItem, ScriptFile, TagArgs, TextBlock,
+    ScriptFile, TextBlock,
 };
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -211,70 +212,19 @@ fn split_by_hard_newline(ev: &AssEvent) -> Vec<(AssTime, AssTime, String)> {
 }
 
 fn split_by_karaoke(ev: &AssEvent) -> Vec<(AssTime, AssTime, String)> {
-    let blocks = parse_text_blocks(ev.text());
-    let mut syllables: Vec<(u32, String)> = Vec::new();
-    let mut current_dur: Option<u32> = None;
-    let mut current_text = String::new();
-    let mut saw_karaoke = false;
-
-    for block in blocks {
-        match block {
-            TextBlock::Override { items, closed } => {
-                let mut non_k_items = Vec::new();
-                for item in items {
-                    if let OverrideItem::Tag(ref tag) = item {
-                        if let TagArgs::Karaoke { duration_cs, .. } = tag.args {
-                            saw_karaoke = true;
-                            if let Some(prev_dur) = current_dur.take() {
-                                syllables.push((prev_dur, std::mem::take(&mut current_text)));
-                            } else if !current_text.is_empty() {
-                                syllables.push((0, std::mem::take(&mut current_text)));
-                            }
-                            if !non_k_items.is_empty() {
-                                let prefix = serialize_text_blocks(&[TextBlock::Override {
-                                    items: std::mem::take(&mut non_k_items),
-                                    closed: true,
-                                }]);
-                                current_text.push_str(&prefix);
-                            }
-                            let dur_u32 = u32::try_from(duration_cs.max(0)).unwrap_or(u32::MAX);
-                            current_dur = Some(dur_u32);
-                            continue;
-                        }
-                    }
-                    non_k_items.push(item);
-                }
-                if !non_k_items.is_empty() {
-                    let s = serialize_text_blocks(&[TextBlock::Override {
-                        items: non_k_items,
-                        closed,
-                    }]);
-                    current_text.push_str(&s);
-                }
-            }
-            other => {
-                current_text.push_str(&serialize_text_blocks(&[other]));
-            }
-        }
-    }
-
-    if !saw_karaoke {
-        return Vec::new();
-    }
-    if let Some(dur) = current_dur {
-        syllables.push((dur, current_text));
-    } else if !current_text.is_empty() {
-        syllables.push((0, current_text));
-    }
-
-    if syllables.len() < 2 {
+    let syllables = parse_karaoke_syllables(ev.text());
+    let has_karaoke = syllables.iter().any(|s| s.kind.is_some());
+    if !has_karaoke || syllables.len() < 2 {
         return Vec::new();
     }
 
     let mut out = Vec::with_capacity(syllables.len());
     let mut cursor = ev.start();
-    for (dur_cs, text) in syllables {
-        let next = cursor.saturating_add_cs(dur_cs).min(ev.end());
+    for syl in syllables {
+        let next = cursor.saturating_add_cs(syl.duration_cs).min(ev.end());
+        let mut text = String::with_capacity(syl.tags.len() + syl.text.len());
+        text.push_str(&syl.tags);
+        text.push_str(&syl.text);
         out.push((cursor, next, text));
         cursor = next;
     }

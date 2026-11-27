@@ -8,6 +8,8 @@
 
 pub mod find_replace;
 pub mod join_split;
+pub mod karaoke;
+pub mod resample;
 pub mod select;
 pub mod shift;
 pub mod tpp;
@@ -16,6 +18,11 @@ use thiserror::Error;
 
 pub use find_replace::{find_and_replace, FindReplaceOptions, SearchField, SearchScope};
 pub use join_split::{join_lines, split_line, JoinMode, SplitMode};
+pub use karaoke::{
+    merge_syllables, parse_karaoke_syllables, rebuild_karaoke_line, set_syllable_duration,
+    split_syllable, KaraokeSyllable,
+};
+pub use resample::{resample_resolution, AspectRatioMode, ResampleOptions};
 pub use select::{select_lines, MatchMode, SelectField, SelectLinesOptions, SelectionAction};
 pub use shift::{shift_times, ShiftAffect, ShiftAmount, ShiftDirection, ShiftOptions, ShiftTarget};
 pub use tpp::{timing_post_process, AdjacentLinkConfig, KeyframeSnapConfig, TppOptions};
@@ -31,4 +38,6 @@ pub enum ToolsError {
     InsufficientLines,
     #[error("frame-time table cannot be empty when shifting by frames")]
     EmptyFrameTable,
+    #[error("invalid target resolution {0}x{1} (must be > 0)")]
+    InvalidResolution(u32, u32),
 }
