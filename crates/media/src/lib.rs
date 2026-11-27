@@ -198,7 +198,7 @@ mod ffi {
             }
 
             let threads = std::thread::available_parallelism()
-                .map_or(4, |n| c_int::try_from(n.get().min(8)).unwrap_or(4));
+                .map_or(4, |n| c_int::try_from(n.get().min(4)).unwrap_or(4));
 
             // SAFETY: `c_path` and `index.0` are valid; `FFMS_CreateVideoSource` copies needed
             // track data so `index` can be dropped afterward.
@@ -254,18 +254,20 @@ mod ffi {
             let frame = unsafe { &*frame_ptr };
             let src_ptr = frame.Data[0];
             let linesize = usize::try_from(frame.Linesize[0].max(0)).unwrap_or(0);
-            let row_bytes = (self.info.width as usize)
+            let width = self.info.width;
+            let height = self.info.height;
+            let row_bytes = (width as usize)
                 .checked_mul(4)
                 .ok_or(MediaError::InvalidMetadata)?;
-            let height = self.info.height as usize;
-            if src_ptr.is_null() || height == 0 || linesize < row_bytes {
+            let height_usize = height as usize;
+            if src_ptr.is_null() || height_usize == 0 || linesize < row_bytes {
                 return Err(MediaError::InvalidMetadata);
             }
 
             let total_bytes = row_bytes
-                .checked_mul(height)
+                .checked_mul(height_usize)
                 .ok_or(MediaError::InvalidMetadata)?;
-            let readable_bytes = (height - 1)
+            let readable_bytes = (height_usize - 1)
                 .checked_mul(linesize)
                 .and_then(|n| n.checked_add(row_bytes))
                 .ok_or(MediaError::InvalidMetadata)?;
@@ -274,21 +276,9 @@ mod ffi {
                 return Err(MediaError::InvalidMetadata);
             }
 
-            out_rgba.resize(total_bytes, 0);
-
-            if linesize == row_bytes {
-                // SAFETY: `src_ptr` is non-null and has `total_bytes == readable_bytes <= isize::MAX` readable bytes.
-                let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, total_bytes) };
-                out_rgba.copy_from_slice(src_slice);
-            } else {
-                // SAFETY: `src_ptr` is non-null and has at least `(height - 1) * linesize + row_bytes <= isize::MAX` readable bytes.
-                let src_all = unsafe { std::slice::from_raw_parts(src_ptr, readable_bytes) };
-                for y in 0..height {
-                    let src_row = &src_all[y * linesize..y * linesize + row_bytes];
-                    let dst_row = &mut out_rgba[y * row_bytes..(y + 1) * row_bytes];
-                    dst_row.copy_from_slice(src_row);
-                }
-            }
+            // SAFETY: `src_ptr` is non-null and has at least `(height - 1) * linesize + row_bytes <= isize::MAX` readable bytes.
+            let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, readable_bytes) };
+            super::copy_rgba_plane(src_slice, linesize, width, height, out_rgba)?;
 
             let pts_ms = self
                 .info
@@ -535,6 +525,46 @@ impl FfmsVideo {
     pub fn prev_keyframe(&self, current: usize) -> Option<usize> {
         self.inner.info().prev_keyframe(current)
     }
+}
+
+/// Copies a decoded RGBA8 plane (`src` with byte stride `linesize`) into a tightly packed
+/// `width * height * 4` buffer `out_rgba`, reusing `out_rgba`'s existing allocation when sized.
+pub fn copy_rgba_plane(
+    src: &[u8],
+    linesize: usize,
+    width: u32,
+    height: u32,
+    out_rgba: &mut Vec<u8>,
+) -> Result<(), MediaError> {
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or(MediaError::InvalidMetadata)?;
+    let height_usize = height as usize;
+    if row_bytes == 0 || height_usize == 0 || linesize < row_bytes {
+        return Err(MediaError::InvalidMetadata);
+    }
+    let total_bytes = row_bytes
+        .checked_mul(height_usize)
+        .ok_or(MediaError::InvalidMetadata)?;
+    let required_src = (height_usize - 1)
+        .checked_mul(linesize)
+        .and_then(|n| n.checked_add(row_bytes))
+        .ok_or(MediaError::InvalidMetadata)?;
+    if src.len() < required_src {
+        return Err(MediaError::InvalidMetadata);
+    }
+
+    out_rgba.resize(total_bytes, 0);
+    if linesize == row_bytes {
+        out_rgba.copy_from_slice(&src[..total_bytes]);
+    } else {
+        for y in 0..height_usize {
+            let src_row = &src[y * linesize..y * linesize + row_bytes];
+            let dst_row = &mut out_rgba[y * row_bytes..(y + 1) * row_bytes];
+            dst_row.copy_from_slice(src_row);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

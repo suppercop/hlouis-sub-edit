@@ -87,6 +87,7 @@ extern "C" {
     pub fn ass_set_font_scale(priv_: *mut ASS_Renderer, font_scale: c_double);
     pub fn ass_set_hinting(priv_: *mut ASS_Renderer, ht: c_int);
     pub fn ass_set_shaper(priv_: *mut ASS_Renderer, level: c_int);
+    pub fn ass_set_cache_limits(priv_: *mut ASS_Renderer, glyph_max: c_int, bitmap_max_size: c_int);
     pub fn ass_set_fonts(
         priv_: *mut ASS_Renderer,
         default_font: *const c_char,
