@@ -221,7 +221,9 @@ fn build_mkv(pts: &[i64], w: u32, h: u32) -> Vec<u8> {
 }
 
 fn write_clip(name: &str, pts: &[i64]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("frame_check_{}", std::process::id()));
+    // One directory per clip: tests run in parallel and each removes its own
+    // directory when done, so a shared directory raced (NotFound on write).
+    let dir = std::env::temp_dir().join(format!("frame_check_{}_{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, build_mkv(pts, 64, 48)).unwrap();
