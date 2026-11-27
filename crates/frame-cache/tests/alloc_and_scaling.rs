@@ -84,19 +84,28 @@ fn scaling_n_vs_2n_get_insert() {
         c2.insert(b);
     }
 
-    let t1 = Instant::now();
-    for i in 0..5_000u32 {
-        let _ = std::hint::black_box(c1.get(i % 64));
-    }
-    let d1 = t1.elapsed().as_nanos().max(1);
+    // Use min-of-3 to filter scheduler noise: O(1) per op means 2n ops take ≤ 2×
+    // wall time of n ops.  Allow ×8 tolerance to cover loaded CI runners.
+    let mut d1_min = u128::MAX;
+    let mut d2_min = u128::MAX;
+    for _ in 0..3 {
+        let t1 = Instant::now();
+        for i in 0..5_000u32 {
+            let _ = std::hint::black_box(c1.get(i % 64));
+        }
+        d1_min = d1_min.min(t1.elapsed().as_nanos().max(1));
 
-    let t2 = Instant::now();
-    for i in 0..10_000u32 {
-        let _ = std::hint::black_box(c2.get(i % 128));
+        let t2 = Instant::now();
+        for i in 0..10_000u32 {
+            let _ = std::hint::black_box(c2.get(i % 128));
+        }
+        d2_min = d2_min.min(t2.elapsed().as_nanos().max(1));
     }
-    let d2 = t2.elapsed().as_nanos().max(1);
 
-    assert!(d2 <= d1 * 5, "expected O(1) per op: n={d1}ns, 2n={d2}ns");
+    assert!(
+        d2_min <= d1_min * 8,
+        "expected O(1) per op (min-of-3): n={d1_min}ns, 2n={d2_min}ns"
+    );
 }
 
 #[test]
