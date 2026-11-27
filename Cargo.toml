@@ -38,6 +38,7 @@ members = [
     "crates/timing-controller",
     "crates/edit-box-ops",
     "crates/syntax-highlight",
+    "crates/document",
 ]
 
 [workspace.package]
