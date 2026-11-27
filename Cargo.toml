@@ -39,6 +39,7 @@ members = [
     "crates/edit-box-ops",
     "crates/syntax-highlight",
     "crates/fonts-dwrite",
+    "crates/win-colour-picker",
 ]
 
 [workspace.package]

@@ -4922,6 +4922,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "win-colour-picker"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "windows",
+]
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
