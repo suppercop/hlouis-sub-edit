@@ -24,7 +24,7 @@ Tài liệu cho **Claude đang giữ vai trò điều hành** dự án `hlouis-s
 
 ## Cách làm việc trên máy chủ dự án
 
-- Thư mục làm việc: `C:\Users\sakai\Downloads\Claude Code\` (repo clone ở `hlouis-sub-edit\`).
+- Thư mục làm việc: `%USERPROFILE%\Downloads\Claude Code\` (repo clone ở `hlouis-sub-edit\`).
 - Agent Gemini chạy bằng `agy`. Model:
   - `gemini-4-hydrogen-xhigh` cho thiết kế và việc khó;
   - `gemini-4-hydrogen-high` cho việc lặt vặt (rebase, sửa CI, docs).

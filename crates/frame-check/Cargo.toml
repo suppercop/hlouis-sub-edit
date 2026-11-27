@@ -1,0 +1,24 @@
+[package]
+name = "frame-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Frame-accuracy self-check: compares our event timing with what libass really renders"
+
+[dependencies]
+ass-core = { path = "../ass-core" }
+keyframes = { path = "../keyframes" }
+media = { path = "../media" }
+mkv-subs = { path = "../mkv-subs" }
+render = { path = "../render" }
+thiserror.workspace = true
+
+[lib]
+bench = false
+
+[[bin]]
+name = "frame-check"
+path = "src/main.rs"
+
+[lints]
+workspace = true

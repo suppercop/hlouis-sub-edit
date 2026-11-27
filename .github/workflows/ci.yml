@@ -1,10 +1,19 @@
 name: Windows CI
 
+# Windows runners on a private repo cost 2x minutes: run once per PR update
+# (not also on branch pushes), skip docs-only changes, and cancel superseded runs.
 on:
   push:
-    branches: [main, "phase-*", "perf-*"]
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md", "licenses/**"]
   pull_request:
-    branches: [main, "phase-*"]
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md", "licenses/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

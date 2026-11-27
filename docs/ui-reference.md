@@ -34,7 +34,7 @@ Source: owner's Aegisub 3.5.1 `config.json` / `hotkey.json`, tuned to look like 
 - Autosave every 60 s and after each change, backups on, 50 undo levels.
 
 ## Panel layout (from owner's screenshot)
-![Owner's Aegisub layout](screenshots/aegisub-owner-layout.png)
+(The reference screenshot was removed before the repo went public because it contained a frame from a commercial episode; the layout is described below.)
 
 - **Menu bar** (File, Edit, Subtitle, Timing, Video, Audio, Automation, View, Help) and **one row of 16 px toolbar icons** under it.
 - **Top-left: video**, about half the window width, with the **visual tools as a vertical toolbar on its left edge**. Under the video: seek slider (with keyframe ticks), play / play line / pause / auto-scroll buttons, current time + frame box (`0:18:14.468 - 26241`), offset-to-line box (`+2068ms; -32ms`), zoom dropdown (`37.5%`).

@@ -66,36 +66,59 @@ impl ProjectLinks {
 }
 
 /// Reads `[Aegisub Project Garbage]` from `script` without touching `[Events]`.
+///
+/// Values that are present but unparseable are dropped; use
+/// [`read_project_links_with_warnings`] to learn which ones (the UI must show them).
 #[must_use]
 pub fn read_project_links(script: &ScriptFile) -> ProjectLinks {
+    read_project_links_with_warnings(script).0
+}
+
+/// Like [`read_project_links`] but also returns one human-readable warning per key whose value
+/// was present but could not be parsed (so a saved video position / zoom is not lost silently).
+#[must_use]
+pub fn read_project_links_with_warnings(script: &ScriptFile) -> (ProjectLinks, Vec<String>) {
+    let mut warnings = Vec::new();
     let Some(sec) = script.aegisub_garbage() else {
-        return ProjectLinks::default();
+        return (ProjectLinks::default(), warnings);
     };
-    ProjectLinks {
+    let typed = |key: &str| -> Option<String> { sec.get(key).map(|v| v.trim().to_owned()) };
+    let raw_mode = typed(keys::VIDEO_AR_MODE);
+    let raw_value = typed(keys::VIDEO_AR_VALUE);
+    let raw_zoom = typed(keys::VIDEO_ZOOM_PERCENT);
+    let raw_scroll = typed(keys::SCROLL_POSITION);
+    let raw_active = typed(keys::ACTIVE_LINE);
+    let raw_pos = typed(keys::VIDEO_POSITION);
+    let links = ProjectLinks {
         audio_file: sec.get(keys::AUDIO_FILE).map(str::to_owned),
         video_file: sec.get(keys::VIDEO_FILE).map(str::to_owned),
         timecodes_file: sec.get(keys::TIMECODES_FILE).map(str::to_owned),
         keyframes_file: sec.get(keys::KEYFRAMES_FILE).map(str::to_owned),
-        video_ar_mode: sec
-            .get(keys::VIDEO_AR_MODE)
-            .and_then(|v| v.trim().parse().ok()),
-        video_ar_value: sec
-            .get(keys::VIDEO_AR_VALUE)
-            .and_then(|v| v.trim().parse().ok()),
-        video_zoom_percent: sec
-            .get(keys::VIDEO_ZOOM_PERCENT)
-            .and_then(|v| v.trim().parse().ok()),
-        scroll_position: sec
-            .get(keys::SCROLL_POSITION)
-            .and_then(|v| v.trim().parse().ok()),
-        active_line: sec
-            .get(keys::ACTIVE_LINE)
-            .and_then(|v| v.trim().parse().ok()),
-        video_position: sec
-            .get(keys::VIDEO_POSITION)
-            .and_then(|v| v.trim().parse().ok()),
+        video_ar_mode: parse_or_warn(keys::VIDEO_AR_MODE, raw_mode, &mut warnings),
+        video_ar_value: parse_or_warn(keys::VIDEO_AR_VALUE, raw_value, &mut warnings),
+        video_zoom_percent: parse_or_warn(keys::VIDEO_ZOOM_PERCENT, raw_zoom, &mut warnings),
+        scroll_position: parse_or_warn(keys::SCROLL_POSITION, raw_scroll, &mut warnings),
+        active_line: parse_or_warn(keys::ACTIVE_LINE, raw_active, &mut warnings),
+        video_position: parse_or_warn(keys::VIDEO_POSITION, raw_pos, &mut warnings),
         automation_scripts: sec.get(keys::AUTOMATION_SCRIPTS).map(str::to_owned),
         export_filters: sec.get(keys::EXPORT_FILTERS).map(str::to_owned),
+    };
+    (links, warnings)
+}
+
+fn parse_or_warn<T: std::str::FromStr>(
+    key: &str,
+    raw: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<T> {
+    let raw = raw?;
+    if let Ok(v) = raw.parse::<T>() {
+        Some(v)
+    } else {
+        warnings.push(format!(
+            "project key `{key}` has invalid value `{raw}`; it was ignored"
+        ));
+        None
     }
 }
 
@@ -399,5 +422,23 @@ mod tests {
             r"D:\Fansub\Ep01\video.mkv"
         );
         assert_eq!(resolve_project_path(r"D:\Subs", "?audio"), "?audio");
+    }
+
+    #[test]
+    fn unparseable_project_values_are_reported() {
+        let raw = "[Script Info]
+ScriptType: v4.00+
+
+[Aegisub Project Garbage]
+Video Position: abc
+Active Line: 7
+Video Zoom Percent: 1,5
+";
+        let script = parse_ass(raw).value;
+        let (links, warnings) = read_project_links_with_warnings(&script);
+        assert_eq!(links.active_line, Some(7));
+        assert_eq!(links.video_position, None);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("Video Position")));
     }
 }

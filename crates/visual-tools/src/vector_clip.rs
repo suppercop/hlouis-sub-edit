@@ -294,8 +294,121 @@ impl VectorClipPath {
                 }
                 false
             }
+            VectorVertexKind::Spline => self.convert_spline_to_bezier_at(index),
             _ => false,
         }
+    }
+
+    /// Converts a cubic Bezier segment (`b c1 c2 end`, whose endpoint is at `index`) into an
+    /// equivalent uniform cubic B-spline segment (`s s1 s2 s3` starting from `Move`/`prev` = `s0`),
+    /// matching Aegisub `src/visual_tool_vector_clip.cpp` / `src/spline.cpp`.
+    ///
+    /// Uses the exact inverse of the uniform cubic B-spline basis matrix:
+    /// - `S0 = 6*B0 - 7*B1 + 2*B2`
+    /// - `S1 = 2*B1 - B2`
+    /// - `S2 = -B1 + 2*B2`
+    /// - `S3 = 2*B1 - 7*B2 + 6*B3`
+    pub fn convert_bezier_to_spline_at(&mut self, index: usize) -> bool {
+        if index < 3 || index >= self.vertices.len() {
+            return false;
+        }
+        if self.vertices[index].kind != VectorVertexKind::BezierEnd
+            || self.vertices[index - 1].kind != VectorVertexKind::BezierCtrl2
+            || self.vertices[index - 2].kind != VectorVertexKind::BezierCtrl1
+        {
+            return false;
+        }
+        let b0 = self.vertices[index - 3].pos;
+        let b1 = self.vertices[index - 2].pos;
+        let b2 = self.vertices[index - 1].pos;
+        let b3 = self.vertices[index].pos;
+
+        let s0 = Vec2::new(
+            6.0 * b0.x - 7.0 * b1.x + 2.0 * b2.x,
+            6.0 * b0.y - 7.0 * b1.y + 2.0 * b2.y,
+        );
+        let s1 = Vec2::new(2.0 * b1.x - b2.x, 2.0 * b1.y - b2.y);
+        let s2 = Vec2::new(-b1.x + 2.0 * b2.x, -b1.y + 2.0 * b2.y);
+        let s3 = Vec2::new(
+            2.0 * b1.x - 7.0 * b2.x + 6.0 * b3.x,
+            2.0 * b1.y - 7.0 * b2.y + 6.0 * b3.y,
+        );
+
+        self.vertices[index - 3].pos = s0;
+        self.vertices[index - 2] = VectorVertex {
+            kind: VectorVertexKind::Spline,
+            pos: s1,
+        };
+        self.vertices[index - 1] = VectorVertex {
+            kind: VectorVertexKind::Spline,
+            pos: s2,
+        };
+        self.vertices[index] = VectorVertex {
+            kind: VectorVertexKind::Spline,
+            pos: s3,
+        };
+        self.raw_original = None;
+        true
+    }
+
+    /// Converts a uniform cubic B-spline segment (`s s1 s2 s3` following `s0`) into an equivalent
+    /// cubic Bezier segment (`b b1 b2 b3` starting at `b0`), matching Aegisub `src/spline.cpp`.
+    ///
+    /// `index` may point to any of the three `Spline` control vertices (`s1`, `s2`, `s3`) of the
+    /// segment; the segment's 4 control points `(s0, s1, s2, s3)` are converted via:
+    /// - `B0 = (S0 + 4*S1 + S2) / 6`
+    /// - `B1 = (2*S1 + S2) / 3`
+    /// - `B2 = (S1 + 2*S2) / 3`
+    /// - `B3 = (S1 + 4*S2 + S3) / 6`
+    pub fn convert_spline_to_bezier_at(&mut self, index: usize) -> bool {
+        if index >= self.vertices.len() || self.vertices[index].kind != VectorVertexKind::Spline {
+            return false;
+        }
+        // Locate the start of the contiguous `Spline` run containing `index`.
+        let mut run_start = index;
+        while run_start > 0 && self.vertices[run_start - 1].kind == VectorVertexKind::Spline {
+            run_start -= 1;
+        }
+        if run_start == 0 || run_start + 2 >= self.vertices.len() {
+            return false;
+        }
+        if self.vertices[run_start + 1].kind != VectorVertexKind::Spline
+            || self.vertices[run_start + 2].kind != VectorVertexKind::Spline
+        {
+            return false;
+        }
+
+        let s0 = self.vertices[run_start - 1].pos;
+        let s1 = self.vertices[run_start].pos;
+        let s2 = self.vertices[run_start + 1].pos;
+        let s3 = self.vertices[run_start + 2].pos;
+
+        let b0 = Vec2::new(
+            (s0.x + 4.0 * s1.x + s2.x) / 6.0,
+            (s0.y + 4.0 * s1.y + s2.y) / 6.0,
+        );
+        let b1 = Vec2::new((2.0 * s1.x + s2.x) / 3.0, (2.0 * s1.y + s2.y) / 3.0);
+        let b2 = Vec2::new((s1.x + 2.0 * s2.x) / 3.0, (s1.y + 2.0 * s2.y) / 3.0);
+        let b3 = Vec2::new(
+            (s1.x + 4.0 * s2.x + s3.x) / 6.0,
+            (s1.y + 4.0 * s2.y + s3.y) / 6.0,
+        );
+
+        self.vertices[run_start - 1].pos = b0;
+        self.vertices[run_start] = VectorVertex {
+            kind: VectorVertexKind::BezierCtrl1,
+            pos: b1,
+        };
+        self.vertices[run_start + 1] = VectorVertex {
+            kind: VectorVertexKind::BezierCtrl2,
+            pos: b2,
+        };
+        self.vertices[run_start + 2] = VectorVertex {
+            kind: VectorVertexKind::BezierEnd,
+            pos: b3,
+        };
+        self.raw_original = None;
+        true
     }
 
     /// Inserts a new `Line` vertex on the nearest segment to `pos`.
@@ -542,5 +655,38 @@ fn rdp_simplify(pts: &[Vec2], eps: f64) -> Vec<Vec2> {
         left
     } else {
         vec![a, b]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_bezier_to_bspline_and_back_losslessly() {
+        let mut path = VectorClipPath::parse("m 10 20 b 40 80 120 90 180 30", false);
+        let orig: Vec<Vec2> = path.vertices.iter().map(|v| v.pos).collect();
+
+        assert!(path.convert_bezier_to_spline_at(3));
+        assert_eq!(path.vertices[1].kind, VectorVertexKind::Spline);
+        assert_eq!(path.vertices[2].kind, VectorVertexKind::Spline);
+        assert_eq!(path.vertices[3].kind, VectorVertexKind::Spline);
+
+        let mut tag = String::new();
+        path.write_tag_into(&mut tag);
+        assert!(tag.contains(" s "), "expected s command in {tag}");
+
+        assert!(path.convert_spline_to_bezier_at(2));
+        assert_eq!(path.vertices[1].kind, VectorVertexKind::BezierCtrl1);
+        assert_eq!(path.vertices[2].kind, VectorVertexKind::BezierCtrl2);
+        assert_eq!(path.vertices[3].kind, VectorVertexKind::BezierEnd);
+
+        for (i, want) in orig.iter().enumerate() {
+            let got = path.vertices[i].pos;
+            assert!(
+                (got.x - want.x).abs() < 1e-6 && (got.y - want.y).abs() < 1e-6,
+                "vertex {i} mismatch: got {got:?}, want {want:?}"
+            );
+        }
     }
 }
