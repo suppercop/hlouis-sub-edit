@@ -61,11 +61,11 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            ui_size: 13.0,
-            grid_size: 13.0,
-            edit_box_size: 14.0,
-            small_size: 11.0,
-            heading_size: 15.0,
+            ui_size: 12.0,
+            grid_size: 12.0,
+            edit_box_size: 13.0,
+            small_size: 10.5,
+            heading_size: 14.0,
             proportional_paths: default_windows_ui_font_candidates(),
             monospace_paths: default_windows_mono_font_candidates(),
             fallback_paths: default_cjk_vi_fallback_candidates(),
@@ -321,12 +321,12 @@ pub fn build_style(pal: &Palette, dark: bool, fonts: &FontConfig) -> Style {
     };
 
     // Classic Aegisub 3.2.2 compact spacing & density.
-    style.spacing.item_spacing = Vec2::new(4.0, 3.0);
-    style.spacing.button_padding = Vec2::new(6.0, 2.0);
+    style.spacing.item_spacing = Vec2::new(3.0, 2.0);
+    style.spacing.button_padding = Vec2::new(4.0, 1.5);
     style.spacing.window_margin = Margin::same(6);
     style.spacing.menu_margin = Margin::same(4);
-    style.spacing.indent = 14.0;
-    style.spacing.interact_size = Vec2::new(32.0, 18.0);
+    style.spacing.indent = 12.0;
+    style.spacing.interact_size = Vec2::new(24.0, 17.0);
     style.spacing.scroll.bar_width = 10.0;
 
     style

@@ -4,9 +4,9 @@
 //! Usage:
 //! - Default (no args): opens an interactive DPI-aware `eframe`/`wgpu` window showing the full
 //!   classic Aegisub 3.2.2 `AppShell` layout with 20,000 demo lines, solid-colour video with live
-//!   frame counter, and synthetic audio waveform/spectrum.
-//! - `--snapshots <dir>`: renders main views and dialogs across Light, Dark, and Eye Comfort
-//!   themes via `egui_kittest` and saves PNGs into `<dir>`.
+//!   frame counter, synthetic audio waveform/spectrum, and 68 demo MKV tracks.
+//! - `--snapshots <dir>`: renders main views (at 100% and 200% DPI) and all filled dialogs across
+//!   Light, Dark, and Eye Comfort themes via `egui_kittest` and saves PNGs into `<dir>`.
 //! - `--bench-ui`: runs the 200,000-line headless scripted benchmark (220 keystrokes + 120 seeks
 //!   + 120 frames) and prints `perf-metrics` p50/p95/p99/worst.
 
@@ -23,8 +23,11 @@ use audio_peaks::PeakBucket;
 use audio_view::TimelineMarkerIndex;
 use egui::{Event, ImeEvent, Pos2, RawInput, Rect, Vec2};
 use egui_kittest::Harness;
+use hlouis_tools::build_style_counts;
 use keyframes::Timecodes;
 use layout::ViewMode;
+use mkv_import::TrackPickerModel;
+use mkv_subs::{SubtitleCodec, TrackInfo, TrackType};
 use playback::Clock;
 use std::cell::RefCell;
 use std::fs::{self, File};
@@ -32,9 +35,11 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
+use template_doctor::lint_script;
 use theme::{BaseTheme, ThemeSpec};
 use ui_audio::AudioColumnProvider;
 use ui_dialogs::ActiveDialog;
+use ui_mkv_import::MkvImportDialogState;
 use ui_shell::AppShell;
 use ui_video::{RgbaFrameRef, VideoFrameSupplier};
 
@@ -190,7 +195,6 @@ struct InteractiveVideoSupplier {
 
 impl InteractiveVideoSupplier {
     fn new(width: u32, height: u32, total_frames: u32) -> Self {
-        // Pre-render 240 distinct numbered frames (0..240) so frame_rgba borrows cleanly with 0 alloc.
         let count = 240usize;
         let mut frames = Vec::with_capacity(count);
         let helper = DemoVideoSupplier::new(width, height);
@@ -257,6 +261,61 @@ impl AudioColumnProvider for DummyAudioProvider {
     }
 }
 
+fn build_demo_mkv_dialog() -> MkvImportDialogState {
+    let langs = [
+        ("vie", "Vietnamese (HLouis Fansub)"),
+        ("eng", "English (Official)"),
+        ("jpn", "Japanese (Closed Captions)"),
+        ("fre", "French"),
+        ("ger", "German"),
+        ("spa", "Spanish (Latin America)"),
+        ("chi", "Chinese (Simplified)"),
+        ("kor", "Korean"),
+    ];
+    let mut tracks = Vec::with_capacity(68);
+    for idx in 0..68u64 {
+        let (lang, base_name) = langs[(idx as usize) % langs.len()];
+        let is_bitmap = idx % 17 == 16;
+        let (codec_id, codec) = if is_bitmap {
+            (
+                "S_HDMV/PGS".to_owned(),
+                SubtitleCodec::UnsupportedImage("S_HDMV/PGS".to_owned()),
+            )
+        } else if idx % 3 == 2 {
+            ("S_TEXT/UTF8".to_owned(), SubtitleCodec::Srt)
+        } else {
+            ("S_TEXT/ASS".to_owned(), SubtitleCodec::Ass)
+        };
+        tracks.push(TrackInfo {
+            number: idx + 3,
+            track_type: TrackType::Subtitle,
+            codec_id,
+            subtitle_codec: codec,
+            language: Some(lang.to_owned()),
+            language_bcp47: None,
+            name: Some(format!("{base_name} #{}", idx + 1)),
+            is_default: idx == 0,
+            is_forced: idx % 11 == 0 && idx > 0,
+            codec_private: None,
+            encodings: Vec::new(),
+        });
+    }
+    let mut picker = TrackPickerModel::from_tracks(&tracks);
+    for row in picker.rows_mut() {
+        row.event_count = Some(if row.selectable { 420 } else { 0 });
+        if row.selectable {
+            row.preview_lines = vec![
+                "0:00:01.20 -> 0:00:03.80  Opening scene title".to_owned(),
+                "0:00:04.10 -> 0:00:06.50  Xin chào mọi người — HLouis Fansub!".to_owned(),
+                "0:00:07.00 -> 0:00:09.90  {\\an8}Chapter 1: Awakening".to_owned(),
+                "0:00:10.40 -> 0:00:13.10  Let's move forward together.".to_owned(),
+                "0:00:13.80 -> 0:00:16.20  End of preview sample.".to_owned(),
+            ];
+        }
+    }
+    MkvImportDialogState::from_picker(picker)
+}
+
 fn generate_demo_script(line_count: usize) -> ScriptFile {
     let header = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\nStyle: Sign,Arial,42,&H00FFE080,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1\nStyle: Romaji,Arial,44,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,8,10,10,10,1\nStyle: Translation,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
     let mut script = parse_ass(header).value;
@@ -296,7 +355,7 @@ fn generate_demo_script(line_count: usize) -> ScriptFile {
             _ => AssEvent::dialogue(
                 AssTime::from_cs(s),
                 AssTime::from_cs(s + 120),
-                r"{\i1}Sample subtitle dialogue line — Phụ đề tiếng Việt{\i0}",
+                r"{\i1}Sample subtitle dialogue line — Phụ đề tiếng Việt",
             ),
         };
         if i % 10 == 3 {
@@ -319,6 +378,18 @@ fn build_demo_shell(line_count: usize) -> AppShell {
         (0..2_000).map(|i| i * 500).collect(),
     );
     shell.attach_audio(1_000_000, markers);
+    shell.mkv_dialog = build_demo_mkv_dialog();
+    shell.dialogs.hlouis_styles = build_style_counts(shell.doc.script());
+    shell.dialogs.template_diags = lint_script(shell.doc.script());
+    shell.dialogs.log_lines = vec![
+        "[00:00.012] INFO  hlouis-sub-edit started (Aegisub 3.2.2 layout)".to_owned(),
+        "[00:00.045] INFO  Loaded demo script (styles=4, video=24000f, audio=1000s)".to_owned(),
+        "[00:00.088] INFO  MKV track scanner ready (68 demo tracks populated)".to_owned(),
+    ];
+    shell.dialogs.recovery_files = vec![
+        "episode_01_autosave_2026-11-27_14-20.ass".to_owned(),
+        "op_karaoke_template_autosave.ass".to_owned(),
+    ];
     shell
 }
 
@@ -366,8 +437,6 @@ fn run_interactive_window() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Renders a simple software raster fallback PNG (palette-tinted layout wireframe + header bar)
-/// when `wgpu` has no GPU/software adapter in a headless CI container.
 fn write_rgba_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
     let file = File::create(path).map_err(|e| e.to_string())?;
     let w = BufWriter::new(file);
@@ -383,7 +452,6 @@ fn render_fallback_png(
     width: u32,
     height: u32,
     shell: &AppShell,
-    shapes_count: usize,
 ) -> Result<(), String> {
     let pal = shell.theme.palette();
     let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
@@ -393,7 +461,9 @@ fn render_fallback_png(
         px[2] = pal.window_bg.b;
         px[3] = 255;
     }
-    let comp = shell.layout_state.compute(width as f32, height as f32, 1.0);
+    let comp = shell
+        .layout_state
+        .compute_logical(width as f32, height as f32);
     let mut fill_rect = |r: layout::Rect, c: theme::Rgba8| {
         if !r.is_visible() {
             return;
@@ -422,7 +492,6 @@ fn render_fallback_png(
     }
     fill_rect(comp.edit_box, pal.dialog_bg);
     fill_rect(comp.grid, pal.panel_bg);
-    let _ = shapes_count;
     write_rgba_png(path, width, height, &rgba)
 }
 
@@ -443,57 +512,126 @@ fn run_snapshots(out_dir: &Path) -> ExitCode {
             },
         ),
     ];
-    let views: &[(&str, ViewMode, Option<ActiveDialog>)] = &[
-        ("view_full", ViewMode::Full, None),
-        ("view_video_subs", ViewMode::VideoAndSubs, None),
-        ("view_audio_subs", ViewMode::AudioAndSubs, None),
-        ("view_subs_only", ViewMode::SubsOnly, None),
+    let views: &[(&str, ViewMode, Option<ActiveDialog>, Vec2, f32)] = &[
+        (
+            "view_full_100dpi",
+            ViewMode::Full,
+            None,
+            Vec2::new(1280.0, 800.0),
+            1.0,
+        ),
+        (
+            "view_full_200dpi",
+            ViewMode::Full,
+            None,
+            Vec2::new(1440.0, 900.0),
+            2.0,
+        ),
+        (
+            "view_video_subs",
+            ViewMode::VideoAndSubs,
+            None,
+            Vec2::new(1280.0, 800.0),
+            1.0,
+        ),
+        (
+            "view_audio_subs",
+            ViewMode::AudioAndSubs,
+            None,
+            Vec2::new(1280.0, 800.0),
+            1.0,
+        ),
+        (
+            "view_subs_only",
+            ViewMode::SubsOnly,
+            None,
+            Vec2::new(1280.0, 800.0),
+            1.0,
+        ),
         (
             "dialog_preferences",
             ViewMode::Full,
             Some(ActiveDialog::Preferences),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
         (
             "dialog_shift_times",
             ViewMode::Full,
             Some(ActiveDialog::ShiftTimes),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
         (
             "dialog_tpp",
             ViewMode::Full,
             Some(ActiveDialog::TimingPostProcessor),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
         (
             "dialog_find_replace",
             ViewMode::Full,
             Some(ActiveDialog::FindReplace),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
         (
             "dialog_style_manager",
             ViewMode::Full,
             Some(ActiveDialog::StyleManager),
+            Vec2::new(1280.0, 800.0),
+            1.0,
+        ),
+        (
+            "dialog_style_editor",
+            ViewMode::Full,
+            Some(ActiveDialog::StyleEditor),
+            Vec2::new(1280.0, 800.0),
+            1.0,
+        ),
+        (
+            "dialog_kara_templater",
+            ViewMode::Full,
+            Some(ActiveDialog::KaraokeTemplater),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
         (
             "dialog_hlouis_select",
             ViewMode::Full,
             Some(ActiveDialog::HlouisSelectByStyle),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
         (
             "dialog_hlouis_clean",
             ViewMode::Full,
             Some(ActiveDialog::HlouisCleanWhitespace),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
         (
             "dialog_template_doctor",
             ViewMode::Full,
             Some(ActiveDialog::TemplateDoctor),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
         (
             "dialog_mkv_import",
             ViewMode::Full,
             Some(ActiveDialog::MkvImport),
+            Vec2::new(1280.0, 800.0),
+            1.0,
         ),
-        ("dialog_about", ViewMode::Full, Some(ActiveDialog::About)),
+        (
+            "dialog_about",
+            ViewMode::Full,
+            Some(ActiveDialog::About),
+            Vec2::new(1280.0, 800.0),
+            1.0,
+        ),
     ];
 
     let vid = BenchVideoSupplier::new(320, 180, 24_000);
@@ -504,7 +642,7 @@ fn run_snapshots(out_dir: &Path) -> ExitCode {
     let mut saved = 0usize;
 
     for (t_name, spec) in themes {
-        for &(v_name, mode, dlg) in views {
+        for &(v_name, mode, dlg, size, ppp) in views {
             let mut shell = build_demo_shell(200);
             shell.set_theme(spec);
             shell.layout_state.mode = mode;
@@ -512,24 +650,24 @@ fn run_snapshots(out_dir: &Path) -> ExitCode {
 
             let filename = format!("{v_name}_{t_name}.png");
             let path = out_dir.join(&filename);
-            let mut shapes_count = 0usize;
 
-            // Run through egui_kittest Harness so full egui layout & widgets execute.
             let rendered = {
                 let builder = Harness::builder()
-                    .with_size(Vec2::new(1280.0, 800.0))
+                    .with_size(size)
+                    .with_pixels_per_point(ppp)
                     .with_accessibility_check(false);
                 let mut harness = builder.build_ui(|ui| {
                     shell.show(ui, Some(&vid), Some(&aud), &clock);
                 });
                 harness.run();
-                shapes_count += 1;
                 harness.render()
             };
 
             let write_res = match rendered {
                 Ok(img) => img.save(&path).map_err(|e| e.to_string()),
-                Err(_) => render_fallback_png(&path, 1280, 800, &shell, shapes_count),
+                Err(_) => {
+                    render_fallback_png(&path, (size.x * ppp) as u32, (size.y * ppp) as u32, &shell)
+                }
             };
             if let Err(e) = write_res {
                 eprintln!("failed to save {}: {e}", path.display());
@@ -564,9 +702,10 @@ fn run_bench_ui() -> ExitCode {
     let warmup_text = "Tiếng Việt có dấu — ăn uống, đường phố, phụ đề anime 0123456789";
     let _ = shell.doc.amend_text(0, "warmup", warmup_text);
     for _ in 0..10 {
-        let _ = ctx.run_ui(base_raw.clone(), |ui| {
+        let mut out = ctx.run_ui(base_raw.clone(), |ui| {
             shell.show(ui, Some(&vid), Some(&aud), &clock);
         });
+        out.textures_delta.clear();
     }
 
     // Phase 1: 220 keystrokes (ASCII + Vietnamese Telex-composed + IME preedit/commit).
@@ -580,9 +719,10 @@ fn run_bench_ui() -> ExitCode {
     shell.grid.model.click(active_row);
     shell.grid.scroll_to_active();
     shell.doc.set_selection(Some(active_row), &[active_row]);
-    let _ = ctx.run_ui(base_raw.clone(), |ui| {
+    let mut out = ctx.run_ui(base_raw.clone(), |ui| {
         shell.show(ui, Some(&vid), Some(&aud), &clock);
     });
+    out.textures_delta.clear();
 
     for k in 0..220usize {
         let chunk = telex_chunks[k % telex_chunks.len()];
@@ -616,9 +756,10 @@ fn run_bench_ui() -> ExitCode {
             updated.set_text(&typed_buf);
             shell.grid.sync_row(active_row, &updated);
         }
-        let _ = ctx.run_ui(raw, |ui| {
+        let mut out = ctx.run_ui(raw, |ui| {
             shell.show(ui, Some(&vid), Some(&aud), &clock);
         });
+        out.textures_delta.clear();
         let elapsed_us = t0.elapsed().as_micros() as u64;
         shell
             .metrics
@@ -670,9 +811,10 @@ fn run_bench_ui() -> ExitCode {
                 }
             }
         }
-        let _ = ctx.run_ui(base_raw.clone(), |ui| {
+        let mut out = ctx.run_ui(base_raw.clone(), |ui| {
             shell.show(ui, Some(&vid), Some(&aud), &clock);
         });
+        out.textures_delta.clear();
         let elapsed_us = t0.elapsed().as_micros() as u64;
         shell.metrics.seek_latency.histogram.record(elapsed_us);
         shell.metrics.record_frame_us(elapsed_us, clock.now_ns());
@@ -691,9 +833,10 @@ fn run_bench_ui() -> ExitCode {
             shell.audio.active_selection.end_ms = 3_000 + delta;
         }
         let t0 = Instant::now();
-        let _ = ctx.run_ui(base_raw.clone(), |ui| {
+        let mut out = ctx.run_ui(base_raw.clone(), |ui| {
             shell.show(ui, Some(&vid), Some(&aud), &clock);
         });
+        out.textures_delta.clear();
         let elapsed_us = t0.elapsed().as_micros() as u64;
         shell.metrics.record_frame_us(elapsed_us, clock.now_ns());
     }

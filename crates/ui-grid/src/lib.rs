@@ -68,8 +68,11 @@ impl Default for SubtitleGridState {
     fn default() -> Self {
         Self {
             model: GridModel::new(),
-            display_cfg: GridDisplayConfig::default(),
-            row_height: 20.0,
+            display_cfg: GridDisplayConfig {
+                simplify_marker: '☀',
+                ..GridDisplayConfig::default()
+            },
+            row_height: 17.0,
             column_order: vec![
                 GridColumn::LineNumber,
                 GridColumn::Layer,
@@ -333,8 +336,8 @@ pub fn show_subtitle_grid(
         .map_or(0, ass_core::EventsSection::event_count);
     let ppp = ui.ctx().pixels_per_point();
     let border_stroke = one_px_stroke(palette.border, ppp);
-    let font_body = FontId::proportional(13.0);
-    let font_mono = FontId::monospace(12.0);
+    let font_body = FontId::proportional(12.0);
+    let font_mono = FontId::monospace(11.5);
 
     // 1. Keyboard navigation when grid has focus or no text edit owns focus.
     if !ui.ctx().egui_wants_keyboard_input() && total_rows > 0 {
@@ -678,6 +681,14 @@ pub fn show_subtitle_grid(
                     }
                 }
                 cx += w;
+                let sx = snap_px(cx, ppp);
+                p.line_segment(
+                    [
+                        Pos2::new(sx, row_rect.top()),
+                        Pos2::new(sx, row_rect.bottom()),
+                    ],
+                    Stroke::new(1.0 / ppp.max(0.5), rgba(palette.border)),
+                );
             }
 
             // Crisp 1-px row divider.

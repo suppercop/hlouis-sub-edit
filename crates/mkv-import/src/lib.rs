@@ -139,6 +139,12 @@ impl TrackPickerModel {
         &self.rows
     }
 
+    /// Mutable access to subtitle rows (for populating previews/counts).
+    #[inline]
+    pub fn rows_mut(&mut self) -> &mut [TrackPickerRow] {
+        &mut self.rows
+    }
+
     /// Returns `true` if `track_number` is currently selected (0 allocations).
     #[inline]
     #[must_use]

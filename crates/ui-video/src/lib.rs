@@ -5,10 +5,10 @@
 //! - Displays RGBA frames from a [`VideoFrameSupplier`] trait (zero native/FFI deps; video frames
 //!   are ALWAYS rendered in true colour, exempt from Eye Comfort warming).
 //! - Zoom / AR / pan via [`video_geometry::VideoDisplayState`].
-//! - All 7 visual tools (`Cross`, `Drag`, `RotateZ`, `RotateXY`, `Scale`, `Clip`, `VectorClip`)
-//!   and full vector-clip sub-toolbar (`Drag`, `Line`, `Bicubic`, `Convert`, `Insert`, `Remove`,
-//!   `Freehand`, `FreehandSmooth`).
-//! - Seek bar, frame/time/keyframe status, and playback controls driving [`playback::PlaybackController`].
+//! - All 7 visual tools painted as crisp 16×16 vector icons on the left (`Cross`, `Drag`,
+//!   `RotateZ`, `RotateXY`, `Scale`, `RectClip`, `VectorClip`) plus vector-clip sub-toolbar.
+//! - Full-width seek bar, compact vector playback buttons, frame/time box, offset box
+//!   (`+0ms; -0ms`), and Zoom combo below the seek bar.
 //! - Bench target: overlay frame with a 500-point vector clip `< 0.3 ms` CPU.
 
 #![forbid(unsafe_code)]
@@ -16,10 +16,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use egui::{
-    Color32, ColorImage, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
+    Color32, ColorImage, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Ui,
+    Vec2,
 };
 use i18n_catalog::Catalog;
 use playback::{Clock, PlaybackController};
+use std::f32::consts::TAU;
 use theme::Palette;
 use ui_theme::{rgba, snap_px};
 use video_geometry::VideoDisplayState;
@@ -79,6 +81,9 @@ pub struct VideoPanelState {
     pub drag_pos: [f64; 2],
     pub dragging_vertex: Option<usize>,
     pub show_overscan: bool,
+    pub zoom_percent: u16,
+    pub active_line_start_ms: i64,
+    pub active_line_end_ms: i64,
     // Cached GPU texture + revision key (0 re-upload when unchanged).
     texture: Option<TextureHandle>,
     uploaded_key: Option<(u32, u64)>,
@@ -111,6 +116,9 @@ impl VideoPanelState {
             drag_pos: [960.0, 540.0],
             dragging_vertex: None,
             show_overscan: false,
+            zoom_percent: 50,
+            active_line_start_ms: 0,
+            active_line_end_ms: 2_000,
             texture: None,
             uploaded_key: None,
             texture_uploads: 0,
@@ -149,6 +157,144 @@ impl VideoPanelState {
             f64::from((p.y - video_rect.top()) / video_rect.height().max(1.0)) * f64::from(video_h);
         visual_tools::Vec2::new(vx, vy)
     }
+}
+
+/// Paints a crisp 16×16 vector icon for one of the 7 Aegisub visual typesetting tools.
+#[allow(clippy::too_many_lines)]
+fn visual_tool_icon_button(
+    ui: &mut Ui,
+    tool: ActiveVisualTool,
+    selected: bool,
+    pal: &Palette,
+    tooltip: &str,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+    let p = ui.painter();
+    let bg = if selected {
+        rgba(pal.selection_bg)
+    } else if resp.hovered() {
+        rgba(pal.hover)
+    } else {
+        rgba(pal.toolbar_bg)
+    };
+    let fg = if selected {
+        rgba(pal.selection_text)
+    } else {
+        rgba(pal.text_primary)
+    };
+    p.rect_filled(rect, 2.0, bg);
+    p.rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(
+            1.0,
+            if selected {
+                rgba(pal.focus_ring)
+            } else {
+                rgba(pal.border)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let c = rect.center();
+    let st = Stroke::new(1.3, fg);
+    match tool {
+        ActiveVisualTool::Cross => {
+            // Standard pointer arrow.
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(c.x - 4.0, c.y - 6.0),
+                    Pos2::new(c.x - 4.0, c.y + 5.0),
+                    Pos2::new(c.x - 1.0, c.y + 2.5),
+                    Pos2::new(c.x + 3.5, c.y + 3.0),
+                ],
+                fg,
+                Stroke::NONE,
+            ));
+        }
+        ActiveVisualTool::Drag => {
+            // 4-way drag arrows.
+            p.line_segment([Pos2::new(c.x - 6.0, c.y), Pos2::new(c.x + 6.0, c.y)], st);
+            p.line_segment([Pos2::new(c.x, c.y - 6.0), Pos2::new(c.x, c.y + 6.0)], st);
+            for (dx, dy) in [(-6.0, 0.0), (6.0, 0.0), (0.0, -6.0), (0.0, 6.0)] {
+                p.circle_filled(Pos2::new(c.x + dx, c.y + dy), 1.6, fg);
+            }
+        }
+        ActiveVisualTool::RotateZ => {
+            // Circular rotation arc + arrowhead.
+            let r = 5.5;
+            let pts: Vec<Pos2> = (0..=12)
+                .map(|i| {
+                    let a = (i as f32 / 12.0) * TAU * 0.78 - 0.5;
+                    Pos2::new(c.x + a.cos() * r, c.y + a.sin() * r)
+                })
+                .collect();
+            p.add(egui::Shape::line(pts, st));
+            p.circle_filled(c, 1.5, fg);
+        }
+        ActiveVisualTool::RotateXY => {
+            // 3D orbit ellipse + tilted axis.
+            let pts: Vec<Pos2> = (0..=16)
+                .map(|i| {
+                    let a = (i as f32 / 16.0) * TAU;
+                    Pos2::new(c.x + a.cos() * 6.0, c.y + a.sin() * 3.0)
+                })
+                .collect();
+            p.add(egui::Shape::closed_line(pts, st));
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 2.0, c.y - 6.0),
+                    Pos2::new(c.x + 2.0, c.y + 6.0),
+                ],
+                st,
+            );
+        }
+        ActiveVisualTool::Scale => {
+            // Box + diagonal resize arrow.
+            let b = Rect::from_min_max(
+                Pos2::new(c.x - 5.5, c.y - 5.5),
+                Pos2::new(c.x + 1.5, c.y + 1.5),
+            );
+            p.rect_stroke(b, 0.0, st, egui::StrokeKind::Inside);
+            p.line_segment(
+                [
+                    Pos2::new(c.x + 1.0, c.y + 1.0),
+                    Pos2::new(c.x + 6.0, c.y + 6.0),
+                ],
+                st,
+            );
+            p.rect_filled(
+                Rect::from_center_size(Pos2::new(c.x + 5.5, c.y + 5.5), Vec2::splat(3.0)),
+                0.0,
+                fg,
+            );
+        }
+        ActiveVisualTool::RectClip => {
+            // Rectangle with 4 corner handles.
+            let b = Rect::from_center_size(c, Vec2::new(11.0, 9.0));
+            p.rect_stroke(b, 0.0, st, egui::StrokeKind::Inside);
+            for corner in [
+                b.left_top(),
+                b.right_top(),
+                b.left_bottom(),
+                b.right_bottom(),
+            ] {
+                p.rect_filled(Rect::from_center_size(corner, Vec2::splat(3.0)), 0.0, fg);
+            }
+        }
+        ActiveVisualTool::VectorClip => {
+            // Polygon path with vertex nodes.
+            let v0 = Pos2::new(c.x - 5.5, c.y + 4.5);
+            let v1 = Pos2::new(c.x - 2.0, c.y - 5.0);
+            let v2 = Pos2::new(c.x + 5.5, c.y - 1.5);
+            let v3 = Pos2::new(c.x + 2.5, c.y + 5.0);
+            p.add(egui::Shape::closed_line(vec![v0, v1, v2, v3], st));
+            for v in [v0, v1, v2, v3] {
+                p.rect_filled(Rect::from_center_size(v, Vec2::splat(3.0)), 0.0, fg);
+            }
+        }
+    }
+    resp.on_hover_text(tooltip).clicked()
 }
 
 /// Paints the active visual tool overlay onto `painter` inside `video_rect` (0 allocations in
@@ -254,8 +400,20 @@ pub fn paint_visual_overlay(
     }
 }
 
-/// Renders the complete Aegisub video panel (left visual tool strip, true-colour video canvas,
-/// vector-clip sub-toolbar, seek bar, playback controls, and frame/time/keyframe status).
+fn format_video_time_ms(ms: i64) -> String {
+    let clamped = ms.max(0);
+    let millis = clamped % 1_000;
+    let total_s = clamped / 1_000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{h}:{m:02}:{s:02}.{millis:03}")
+}
+
+/// Renders the complete Aegisub 3.2.2 video panel (7 vector visual tool icons on the left,
+/// true-colour video canvas, vector-clip sub-toolbar, full-width seek bar, playback buttons,
+/// frame/time readout box, offset box, and zoom combo).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn show_video_panel(
     ui: &mut Ui,
@@ -271,25 +429,32 @@ pub fn show_video_panel(
     let frame = pb.current_frame();
     let total = supplier.total_frames().max(1);
 
-    let canvas_h = (ui.available_height() - 56.0).clamp(120.0, 480.0);
-    let canvas_w = (ui.available_width() - 34.0).max(160.0);
+    let extra_vclip_h = if state.active_tool == ActiveVisualTool::VectorClip {
+        22.0
+    } else {
+        0.0
+    };
+    let bottom_bars_h = 46.0 + extra_vclip_h;
+    let canvas_h = (ui.available_height() - bottom_bars_h).max(72.0);
+    let canvas_w = (ui.available_width() - 28.0).max(120.0);
 
     ui.horizontal(|ui| {
-        // Left vertical visual tool toolbar (7 Aegisub tools).
+        // Left vertical visual tool toolbar (7 crisp 16×16 vector-painted Aegisub icons).
         ui.vertical(|ui| {
-            for (tool, lbl) in [
-                (ActiveVisualTool::Cross, "+"),
-                (ActiveVisualTool::Drag, "M"),
-                (ActiveVisualTool::RotateZ, "Rz"),
-                (ActiveVisualTool::RotateXY, "Rxy"),
-                (ActiveVisualTool::Scale, "Sc"),
-                (ActiveVisualTool::RectClip, "[]"),
-                (ActiveVisualTool::VectorClip, "Vc"),
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (tool, tip) in [
+                (ActiveVisualTool::Cross, "Standard mode"),
+                (ActiveVisualTool::Drag, "Drag subtitles (\\pos)"),
+                (ActiveVisualTool::RotateZ, "Rotate on Z axis (\\frz)"),
+                (
+                    ActiveVisualTool::RotateXY,
+                    "Rotate on X/Y axes (\\frx/\\fry)",
+                ),
+                (ActiveVisualTool::Scale, "Scale subtitles (\\fscx/\\fscy)"),
+                (ActiveVisualTool::RectClip, "Rectangular clip (\\clip)"),
+                (ActiveVisualTool::VectorClip, "Vector clip (\\clip)"),
             ] {
-                if ui
-                    .selectable_label(state.active_tool == tool, lbl)
-                    .clicked()
-                {
+                if visual_tool_icon_button(ui, tool, state.active_tool == tool, palette, tip) {
                     state.active_tool = tool;
                 }
             }
@@ -420,32 +585,11 @@ pub fn show_video_panel(
         });
     }
 
-    // Seek bar + playback controls + frame/time/keyframe status.
+    // Row 1 below video: full-width seek bar.
     ui.horizontal(|ui| {
-        if ui
-            .button(if pb.is_playing() { "Pause" } else { "Play" })
-            .clicked()
-        {
-            pb.toggle_play(clock);
-            action = Some(VideoPanelAction::PlayToggle);
-        }
-        if ui.button("<").clicked() {
-            pb.step_frame(-1);
-            action = Some(VideoPanelAction::StepFrame(-1));
-        }
-        if ui.button(">").clicked() {
-            pb.step_frame(1);
-            action = Some(VideoPanelAction::StepFrame(1));
-        }
-        if ui.button("|<").clicked() {
-            let _ = pb.seek_keyframe(false);
-            action = Some(VideoPanelAction::SeekKeyframe(false));
-        }
-        if ui.button(">|").clicked() {
-            let _ = pb.seek_keyframe(true);
-            action = Some(VideoPanelAction::SeekKeyframe(true));
-        }
         let mut seek_f = frame;
+        let slider_w = (ui.available_width() - 8.0).max(80.0);
+        ui.spacing_mut().slider_width = slider_w;
         if ui
             .add(egui::Slider::new(&mut seek_f, 0..=total.saturating_sub(1)).show_value(false))
             .changed()
@@ -453,15 +597,87 @@ pub fn show_video_panel(
             pb.scrub_to_frame(seek_f);
             action = Some(VideoPanelAction::SeekFrame(seek_f));
         }
+    });
+
+    // Row 2 below seek bar: playback buttons | frame/time box | offset box (+0ms; -0ms) | Zoom combo.
+    ui.horizontal(|ui| {
+        if ui
+            .small_button(if pb.is_playing() { "⏸" } else { "▶" })
+            .on_hover_text("Play / Pause video")
+            .clicked()
+        {
+            pb.toggle_play(clock);
+            action = Some(VideoPanelAction::PlayToggle);
+        }
+        if ui
+            .small_button("▶|")
+            .on_hover_text("Play current line")
+            .clicked()
+        {
+            action = Some(VideoPanelAction::PlayLine);
+        }
+        if ui
+            .small_button("◀")
+            .on_hover_text("Previous frame")
+            .clicked()
+        {
+            pb.step_frame(-1);
+            action = Some(VideoPanelAction::StepFrame(-1));
+        }
+        if ui.small_button("▶").on_hover_text("Next frame").clicked() {
+            pb.step_frame(1);
+            action = Some(VideoPanelAction::StepFrame(1));
+        }
+        if ui
+            .small_button("|◀")
+            .on_hover_text("Previous keyframe")
+            .clicked()
+        {
+            let _ = pb.seek_keyframe(false);
+            action = Some(VideoPanelAction::SeekKeyframe(false));
+        }
+        if ui
+            .small_button("▶|")
+            .on_hover_text("Next keyframe")
+            .clicked()
+        {
+            let _ = pb.seek_keyframe(true);
+            action = Some(VideoPanelAction::SeekKeyframe(true));
+        }
+
+        let cur_ms = pb.current_time_ms();
         let kf_tag = if supplier.is_keyframe(frame) {
             catalog.get("panel-video-keyframe").unwrap_or("KF")
         } else {
             ""
         };
-        ui.label(format!(
-            "{frame}/{total} ({} ms) {kf_tag}",
-            pb.current_time_ms()
-        ));
+        let mut frame_time_txt = format!("{} - {frame} {kf_tag}", format_video_time_ms(cur_ms));
+        ui.add_enabled(
+            false,
+            egui::TextEdit::singleline(&mut frame_time_txt)
+                .font(egui::FontId::monospace(11.0))
+                .desired_width(126.0),
+        );
+
+        let from_start = cur_ms - state.active_line_start_ms;
+        let to_end = cur_ms - state.active_line_end_ms;
+        let mut offset_txt = format!("{from_start:+}ms; {to_end:+}ms");
+        ui.add_enabled(
+            false,
+            egui::TextEdit::singleline(&mut offset_txt)
+                .font(egui::FontId::monospace(11.0))
+                .desired_width(104.0),
+        )
+        .on_hover_text("Offset from active line start / end");
+
+        egui::ComboBox::from_id_salt("video_zoom_combo")
+            .width(54.0)
+            .selected_text(RichText::new(format!("{}%", state.zoom_percent)).small())
+            .show_ui(ui, |ui| {
+                for pct in [25u16, 50, 75, 100, 150, 200] {
+                    ui.selectable_value(&mut state.zoom_percent, pct, format!("{pct}%"));
+                }
+            });
     });
 
     action

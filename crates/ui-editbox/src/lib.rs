@@ -1,10 +1,16 @@
 //! Subtitle Edit Box widget (`egui 0.37`) mirroring Aegisub 3.2.2 / 3.5.1 `src/subs_edit_box.cpp`.
 //!
+//! Layout matches classic Aegisub 3.2.2's 3-row header + syntax-highlighted multiline editor:
+//! - Row 1: `Comment` checkbox (separate from Layer), `Style` combo + `Edit` button, `Actor`,
+//!   `Effect`, and character / CPS counter.
+//! - Row 2: `Layer` spinner, `Start`, `End`, `Duration`, `Margin L`, `Margin R`, `Margin V`.
+//! - Row 3: Compact formatting buttons (`B`, `I`, `U`, `S`, `fn`), 4 colour swatches
+//!   (`1c`/`2c`/`3c`/`4c`), green commit checkmark, `Time` / `Frame` radio toggle, and
+//!   `Show Original` checkbox.
+//! - Row 4: Optional read-only Original line + syntax-highlighted multiline `TextEdit` filling
+//!   the remaining pane height.
+//!
 //! Features:
-//! - Metadata row: Comment, Layer, Start, End, Duration (Time vs Frame mode), Style, Actor,
-//!   Effect (with autocomplete), Margins L/R/V.
-//! - Formatting toolbar: Bold, Italic, Underline, Strikeout, Alignment, `\h`, Shift+Enter mode
-//!   backed by [`edit_box_ops`].
 //! - Syntax-highlighted multiline `TextEdit` via [`syntax_highlight::IncrementalTokenizer`] +
 //!   `egui::text::LayoutJob` using strictly [`theme::Palette`] token colours.
 //! - Per-row `id_salt(("edit_box", line_idx))` so cursor/undo state never bleeds between rows.
@@ -18,12 +24,11 @@
 use ass_core::{AssTime, EditCommand, EventKind};
 use document::{CommitType, DocumentController};
 use edit_box_ops::{
-    ShiftEnterMode, TextSelection, autocomplete_actors, autocomplete_effects, autocomplete_styles,
-    insert_hard_space, set_alignment, toggle_bold, toggle_italic, toggle_strikeout,
-    toggle_underline,
+    ShiftEnterMode, TextSelection, autocomplete_actors, autocomplete_effects, insert_hard_space,
+    toggle_bold, toggle_italic, toggle_strikeout, toggle_underline,
 };
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, Key, TextEdit, Ui};
+use egui::{Color32, FontId, Key, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
 use i18n_catalog::Catalog;
 use keyframes::{TimeType, Timecodes};
 use std::fmt::Write as _;
@@ -50,6 +55,10 @@ pub struct EditBoxState {
     pub last_cursor_byte: usize,
     pub cps_warn_threshold: u32,
     pub cps_error_threshold: u32,
+    /// Set to `true` when the user clicks the `Edit` button beside the Style combo.
+    pub edit_style_requested: bool,
+    /// 4 active ASS colour swatches (Primary, Secondary, Outline, Shadow) for quick insertion.
+    pub colour_swatches: [Color32; 4],
 }
 
 impl Default for EditBoxState {
@@ -71,6 +80,13 @@ impl Default for EditBoxState {
             last_cursor_byte: 0,
             cps_warn_threshold: 18,
             cps_error_threshold: 25,
+            edit_style_requested: false,
+            colour_swatches: [
+                Color32::from_rgb(255, 255, 255),
+                Color32::from_rgb(255, 210, 60),
+                Color32::from_rgb(20, 24, 32),
+                Color32::from_rgb(0, 0, 0),
+            ],
         }
     }
 }
@@ -232,7 +248,20 @@ pub fn count_visible_chars_and_cps(text: &str, dur_cs: u32) -> (usize, u32) {
     (chars, cps)
 }
 
-/// Renders the full Aegisub-style Edit Box panel into `ui`.
+fn paint_colour_swatch(ui: &mut Ui, color: Color32, border: Color32, tooltip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(15.0, 15.0), Sense::click());
+    let p = ui.painter();
+    p.rect_filled(rect.shrink(1.0), 1.5, color);
+    p.rect_stroke(
+        rect,
+        1.5,
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    resp.on_hover_text(tooltip).clicked()
+}
+
+/// Renders the full Aegisub 3.2.2 Edit Box panel into `ui`.
 /// Returns `true` if the active line was modified on this frame.
 #[allow(clippy::too_many_lines)]
 pub fn show_edit_box(
@@ -264,7 +293,18 @@ pub fn show_edit_box(
     let mut mr = ev_snapshot.margin_r();
     let mut mv = ev_snapshot.margin_v();
 
-    // Row 1: Comment, Layer, Start, End, Duration, Time/Frame toggle, Show Original toggle.
+    let dur_cs = ev_snapshot
+        .end()
+        .as_cs()
+        .saturating_sub(ev_snapshot.start().as_cs());
+    let (vis_chars, cps) = count_visible_chars_and_cps(&state.text_buf, dur_cs);
+    let sel = TextSelection::clamped(
+        state.last_cursor_byte,
+        state.last_cursor_byte,
+        &state.text_buf,
+    );
+
+    // ── Row 1 (Aegisub 3.2.2): Comment checkbox | Style combo + Edit | Actor | Effect | Chars/CPS
     ui.horizontal(|ui| {
         if ui
             .checkbox(
@@ -290,8 +330,91 @@ pub fn show_edit_box(
             );
             changed = true;
         }
-        ui.label("L:");
-        if ui.add(egui::DragValue::new(&mut layer).speed(1)).changed() {
+
+        // Style selector ComboBox populated from script styles + Edit button.
+        let style_names: Vec<String> = doc
+            .script()
+            .styles()
+            .map(|st| st.name().to_owned())
+            .collect();
+        let prev_style = state.style_buf.clone();
+        egui::ComboBox::from_id_salt(("edit_style_combo", line_idx))
+            .width(86.0)
+            .selected_text(&state.style_buf)
+            .show_ui(ui, |ui| {
+                if style_names.is_empty() {
+                    ui.selectable_value(&mut state.style_buf, "Default".to_owned(), "Default");
+                } else {
+                    for name in &style_names {
+                        ui.selectable_value(&mut state.style_buf, name.clone(), name);
+                    }
+                }
+            });
+        if state.style_buf != prev_style {
+            let mut after = ev_snapshot.clone();
+            after.set_style(state.style_buf.clone());
+            let _ = doc.commit(
+                "change style",
+                EditCommand::ModifyEvent {
+                    index: line_idx,
+                    before: Box::new(ev_snapshot.clone()),
+                    after: Box::new(after),
+                },
+                CommitType::TEXT,
+            );
+            changed = true;
+        }
+        if ui
+            .small_button(catalog.get("btn-edit").unwrap_or("Edit"))
+            .on_hover_text("Edit active style")
+            .clicked()
+        {
+            state.edit_style_requested = true;
+        }
+
+        let actor_resp = ui.add(
+            TextEdit::singleline(&mut state.actor_buf)
+                .desired_width(68.0)
+                .hint_text(catalog.get("grid-col-actor").unwrap_or("Actor"))
+                .id_salt(("edit_actor", line_idx)),
+        );
+        if actor_resp.has_focus() {
+            let _ = autocomplete_actors(doc.script(), &state.actor_buf, 6);
+        }
+
+        let eff_resp = ui.add(
+            TextEdit::singleline(&mut state.effect_buf)
+                .desired_width(68.0)
+                .hint_text(catalog.get("grid-col-effect").unwrap_or("Effect"))
+                .id_salt(("edit_effect", line_idx)),
+        );
+        if eff_resp.has_focus() {
+            let _ = autocomplete_effects(doc.script(), &state.effect_buf, 6);
+        }
+
+        let cps_col = if cps >= state.cps_error_threshold {
+            rgba(palette.grid_cps_error)
+        } else if cps >= state.cps_warn_threshold {
+            rgba(palette.grid_cps_warn)
+        } else {
+            rgba(palette.grid_cps_ok)
+        };
+        ui.label(RichText::new(format!("{vis_chars}")).small());
+        ui.colored_label(cps_col, RichText::new(format!("{cps} CPS")).small());
+    });
+
+    // ── Row 2 (Aegisub 3.2.2): Layer spinner | Start | End | Duration | Margin L / R / V
+    ui.horizontal(|ui| {
+        if ui
+            .add(
+                egui::DragValue::new(&mut layer)
+                    .speed(1)
+                    .prefix("L:")
+                    .range(0..=9999),
+            )
+            .on_hover_text(catalog.get("grid-col-layer").unwrap_or("Layer"))
+            .changed()
+        {
             let mut after = ev_snapshot.clone();
             after.set_layer(layer);
             let _ = doc.commit(
@@ -307,23 +430,139 @@ pub fn show_edit_box(
         }
         ui.add(
             TextEdit::singleline(&mut state.start_buf)
-                .desired_width(76.0)
+                .desired_width(72.0)
                 .id_salt(("edit_start", line_idx)),
-        );
+        )
+        .on_hover_text(catalog.get("grid-col-start").unwrap_or("Start"));
         ui.add(
             TextEdit::singleline(&mut state.end_buf)
-                .desired_width(76.0)
+                .desired_width(72.0)
                 .id_salt(("edit_end", line_idx)),
-        );
+        )
+        .on_hover_text(catalog.get("grid-col-end").unwrap_or("End"));
         ui.add_enabled(
             false,
-            TextEdit::singleline(&mut state.dur_buf).desired_width(68.0),
-        );
+            TextEdit::singleline(&mut state.dur_buf).desired_width(64.0),
+        )
+        .on_hover_text("Duration");
+
+        let mut margins_changed = false;
+        margins_changed |= ui
+            .add(egui::DragValue::new(&mut ml).prefix("L:").range(0..=9999))
+            .on_hover_text("Left margin")
+            .changed();
+        margins_changed |= ui
+            .add(egui::DragValue::new(&mut mr).prefix("R:").range(0..=9999))
+            .on_hover_text("Right margin")
+            .changed();
+        margins_changed |= ui
+            .add(egui::DragValue::new(&mut mv).prefix("V:").range(0..=9999))
+            .on_hover_text("Vertical margin")
+            .changed();
+        if margins_changed {
+            let mut after = ev_snapshot.clone();
+            after.set_margin_l(ml);
+            after.set_margin_r(mr);
+            after.set_margin_v(mv);
+            let _ = doc.commit(
+                "change margins",
+                EditCommand::ModifyEvent {
+                    index: line_idx,
+                    before: Box::new(ev_snapshot.clone()),
+                    after: Box::new(after),
+                },
+                CommitType::TEXT,
+            );
+            changed = true;
+        }
+    });
+
+    // ── Row 3 (Aegisub 3.2.2): B I U S fn | 4 colour swatches | Commit ✓ | Time/Frame | Original
+    ui.horizontal(|ui| {
         if ui
-            .selectable_label(state.frame_mode, if state.frame_mode { "F" } else { "T" })
+            .small_button(RichText::new("B").strong())
+            .on_hover_text("Bold (\\b1)")
             .clicked()
         {
-            state.frame_mode = !state.frame_mode;
+            let res = toggle_bold(&state.text_buf, sel, ev_snapshot.style(), &[]);
+            state.text_buf = res.text;
+            let _ = doc.amend_text(line_idx, "bold", &state.text_buf);
+            changed = true;
+        }
+        if ui
+            .small_button(RichText::new("I").italics())
+            .on_hover_text("Italic (\\i1)")
+            .clicked()
+        {
+            let res = toggle_italic(&state.text_buf, sel, ev_snapshot.style(), &[]);
+            state.text_buf = res.text;
+            let _ = doc.amend_text(line_idx, "italic", &state.text_buf);
+            changed = true;
+        }
+        if ui
+            .small_button(RichText::new("U").underline())
+            .on_hover_text("Underline (\\u1)")
+            .clicked()
+        {
+            let res = toggle_underline(&state.text_buf, sel, ev_snapshot.style(), &[]);
+            state.text_buf = res.text;
+            let _ = doc.amend_text(line_idx, "underline", &state.text_buf);
+            changed = true;
+        }
+        if ui
+            .small_button(RichText::new("S").strikethrough())
+            .on_hover_text("Strikeout (\\s1)")
+            .clicked()
+        {
+            let res = toggle_strikeout(&state.text_buf, sel, ev_snapshot.style(), &[]);
+            state.text_buf = res.text;
+            let _ = doc.amend_text(line_idx, "strikeout", &state.text_buf);
+            changed = true;
+        }
+        if ui
+            .small_button("fn")
+            .on_hover_text("Insert font override (\\fn)")
+            .clicked()
+        {
+            let pos = state.last_cursor_byte.min(state.text_buf.len());
+            state.text_buf.insert_str(pos, r"{\fnArial}");
+            let _ = doc.amend_text(line_idx, "font", &state.text_buf);
+            changed = true;
+        }
+
+        ui.separator();
+        let border = rgba(palette.border);
+        let swatch_tags = [
+            (0usize, r"{\1c&HFFFFFF&}", "Primary colour (\\1c)"),
+            (1usize, r"{\2c&H3CD2FF&}", "Secondary colour (\\2c)"),
+            (2usize, r"{\3c&H201814&}", "Outline colour (\\3c)"),
+            (3usize, r"{\4c&H000000&}", "Shadow colour (\\4c)"),
+        ];
+        for (idx, tag, tip) in swatch_tags {
+            if paint_colour_swatch(ui, state.colour_swatches[idx], border, tip) {
+                let pos = state.last_cursor_byte.min(state.text_buf.len());
+                state.text_buf.insert_str(pos, tag);
+                let _ = doc.amend_text(line_idx, "colour", &state.text_buf);
+                changed = true;
+            }
+        }
+
+        // Green commit checkmark button.
+        let commit_col = Color32::from_rgb(46, 170, 92);
+        if ui
+            .small_button(RichText::new("✓").color(commit_col).strong())
+            .on_hover_text("Commit changes (Enter)")
+            .clicked()
+        {
+            let _ = doc.amend_text(line_idx, "commit", &state.text_buf);
+            changed = true;
+        }
+
+        ui.separator();
+        let prev_frame_mode = state.frame_mode;
+        ui.radio_value(&mut state.frame_mode, false, "Time");
+        ui.radio_value(&mut state.frame_mode, true, "Frame");
+        if state.frame_mode != prev_frame_mode {
             format_time_field(
                 ev_snapshot.start(),
                 state.frame_mode,
@@ -337,120 +576,9 @@ pub fn show_edit_box(
                 &mut state.end_buf,
             );
         }
-        ui.checkbox(&mut state.show_original, "Orig");
-    });
 
-    // Row 2: Style, Actor, Effect (with autocomplete), Margins L/R/V.
-    ui.horizontal(|ui| {
-        ui.label(catalog.get("grid-col-style").unwrap_or("Style"));
-        let style_resp = ui.add(
-            TextEdit::singleline(&mut state.style_buf)
-                .desired_width(96.0)
-                .id_salt(("edit_style", line_idx)),
-        );
-        if style_resp.lost_focus() && state.style_buf != ev_snapshot.style() {
-            let mut after = ev_snapshot.clone();
-            after.set_style(state.style_buf.clone());
-            let _ = doc.commit(
-                "change style",
-                EditCommand::ModifyEvent {
-                    index: line_idx,
-                    before: Box::new(ev_snapshot.clone()),
-                    after: Box::new(after),
-                },
-                CommitType::TEXT,
-            );
-            changed = true;
-        }
-        if style_resp.has_focus() {
-            let _suggestions = autocomplete_styles(doc.script(), &state.style_buf, 6);
-        }
-
-        ui.label(catalog.get("grid-col-actor").unwrap_or("Actor"));
-        let actor_resp = ui.add(
-            TextEdit::singleline(&mut state.actor_buf)
-                .desired_width(80.0)
-                .id_salt(("edit_actor", line_idx)),
-        );
-        if actor_resp.has_focus() {
-            let _ = autocomplete_actors(doc.script(), &state.actor_buf, 6);
-        }
-
-        ui.label(catalog.get("grid-col-effect").unwrap_or("Effect"));
-        let eff_resp = ui.add(
-            TextEdit::singleline(&mut state.effect_buf)
-                .desired_width(80.0)
-                .id_salt(("edit_effect", line_idx)),
-        );
-        if eff_resp.has_focus() {
-            let _ = autocomplete_effects(doc.script(), &state.effect_buf, 6);
-        }
-
-        ui.add(egui::DragValue::new(&mut ml).prefix("L:").range(0..=9999));
-        ui.add(egui::DragValue::new(&mut mr).prefix("R:").range(0..=9999));
-        ui.add(egui::DragValue::new(&mut mv).prefix("V:").range(0..=9999));
-    });
-
-    // Row 3: Formatting toolbar (B/I/U/S/Align/\h) + char count + CPS badge.
-    let dur_cs = ev_snapshot
-        .end()
-        .as_cs()
-        .saturating_sub(ev_snapshot.start().as_cs());
-    let (vis_chars, cps) = count_visible_chars_and_cps(&state.text_buf, dur_cs);
-    let sel = TextSelection::clamped(
-        state.last_cursor_byte,
-        state.last_cursor_byte,
-        &state.text_buf,
-    );
-
-    ui.horizontal(|ui| {
-        if ui.button("B").clicked() {
-            let res = toggle_bold(&state.text_buf, sel, ev_snapshot.style(), &[]);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "bold", &state.text_buf);
-            changed = true;
-        }
-        if ui.button("I").clicked() {
-            let res = toggle_italic(&state.text_buf, sel, ev_snapshot.style(), &[]);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "italic", &state.text_buf);
-            changed = true;
-        }
-        if ui.button("U").clicked() {
-            let res = toggle_underline(&state.text_buf, sel, ev_snapshot.style(), &[]);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "underline", &state.text_buf);
-            changed = true;
-        }
-        if ui.button("S").clicked() {
-            let res = toggle_strikeout(&state.text_buf, sel, ev_snapshot.style(), &[]);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "strikeout", &state.text_buf);
-            changed = true;
-        }
-        if ui.button("\\an8").clicked()
-            && let Ok(res) = set_alignment(&state.text_buf, sel, 8)
-        {
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "align", &state.text_buf);
-            changed = true;
-        }
-        if ui.button("\\h").clicked() {
-            let res = insert_hard_space(&state.text_buf, sel);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "hard space", &state.text_buf);
-            changed = true;
-        }
-        ui.separator();
-        let cps_col = if cps >= state.cps_error_threshold {
-            rgba(palette.grid_cps_error)
-        } else if cps >= state.cps_warn_threshold {
-            rgba(palette.grid_cps_warn)
-        } else {
-            rgba(palette.grid_cps_ok)
-        };
-        ui.label(format!("{vis_chars} ch"));
-        ui.colored_label(cps_col, format!("{cps} CPS"));
+        ui.checkbox(&mut state.show_original, "Orig")
+            .on_hover_text("Show Original text");
     });
 
     // Optional "Show Original" read-only preview.
@@ -463,9 +591,9 @@ pub fn show_edit_box(
         );
     }
 
-    // Main syntax-highlighted multiline TextEdit (per-row id_salt, IME-safe).
+    // ── Row 4: Main syntax-highlighted multiline TextEdit filling remaining height.
     let pal_clone = palette.clone();
-    let font_mono = FontId::monospace(14.0);
+    let font_mono = FontId::monospace(13.0);
     let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
         let s = text.as_str();
         let spans = syntax_highlight::tokenize(s);
@@ -473,9 +601,11 @@ pub fn show_edit_box(
         ui.fonts_mut(|f| f.layout_job(job))
     };
 
+    let rem_h = ui.available_height().max(38.0);
+    let rem_w = ui.available_width().max(80.0);
     let output = TextEdit::multiline(&mut state.text_buf)
         .id_salt(("edit_box", line_idx))
-        .desired_rows(3)
+        .min_size(Vec2::new(rem_w, rem_h))
         .desired_width(f32::INFINITY)
         .layouter(&mut layouter)
         .show(ui);

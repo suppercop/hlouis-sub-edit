@@ -20,6 +20,8 @@ hlouis-tools = { path = "../hlouis-tools" }
 i18n-catalog = { path = "../i18n-catalog" }
 keyframes = { path = "../keyframes" }
 layout = { path = "../layout" }
+mkv-import = { path = "../mkv-import" }
+mkv-subs = { path = "../mkv-subs" }
 perf-metrics = { path = "../perf-metrics" }
 playback = { path = "../playback" }
 png = "0.17"
@@ -30,6 +32,8 @@ ui-audio = { path = "../ui-audio" }
 ui-dialogs = { path = "../ui-dialogs" }
 ui-editbox = { path = "../ui-editbox" }
 ui-grid = { path = "../ui-grid" }
+ui-mkv-import = { path = "../ui-mkv-import" }
+ui-preferences = { path = "../ui-preferences" }
 ui-theme = { path = "../ui-theme" }
 ui-video = { path = "../ui-video" }
 

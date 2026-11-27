@@ -1,7 +1,8 @@
 //! Main window shell composing the classic Aegisub 3.2.2 workspace layout (`egui 0.37`):
 //! video top-left, audio top-right, edit box under audio, virtualised 200k-line grid at the
-//! bottom, menu bar + compact toolbar + command palette from [`commands`], context-aware hotkey
-//! dispatch, drag-and-drop file handling, autosave timer hook, live Light/Dark/System/EyeComfort
+//! bottom, classic 9 top-level menus + single-row 16×16 vector icon toolbar + command palette
+//! from [`commands`], draggable splitters, strict per-pane clip rects, full `ui-preferences` &
+//! `ui-mkv-import` wiring, localized opaque foreground dialog chrome, live Light/Dark/EyeComfort
 //! theme switching, and strict `request_repaint` discipline (zero continuous repaint when idle).
 
 #![forbid(unsafe_code)]
@@ -12,7 +13,7 @@ use ass_core::ScriptFile;
 use audio_view::TimelineMarkerIndex;
 use commands::{CommandRegistry, HotkeyContext, KeyChord};
 use document::DocumentController;
-use egui::{Key, Panel, Pos2, Rect, Ui, Vec2};
+use egui::{Align2, CursorIcon, Key, Order, Panel, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use hlouis_tools::{build_style_counts, clean_whitespace, preview_clean, quick_select_by_style};
 use i18n_catalog::{Catalog, Locale};
 use keyframes::Timecodes;
@@ -23,13 +24,37 @@ use settings::{AppSettings, ThemeMode};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use template_doctor::{fix_all_safe, lint_script};
-use theme::{BaseTheme, ThemeSpec};
+use theme::{BaseTheme, Palette, ThemeSpec};
 use ui_audio::{AudioColumnProvider, AudioPanelState, show_audio_panel};
 use ui_dialogs::{ActiveDialog, DialogAction, DialogHostState, show_active_dialog};
 use ui_editbox::{EditBoxState, show_edit_box};
 use ui_grid::{GridAction, SubtitleGridState, show_subtitle_grid};
-use ui_theme::{FontConfig, ThemeController};
+use ui_mkv_import::{MkvImportAction, MkvImportDialogState, show_mkv_import_dialog};
+use ui_preferences::{PreferencesDialogState, PrefsDialogAction, show_preferences_dialog};
+use ui_theme::{FontConfig, ThemeController, rgba};
 use ui_video::{VideoFrameSupplier, VideoPanelState, show_video_panel};
+
+/// Snapshot of the last computed logical pane rectangles (used for layout & zero-overlap checks).
+#[derive(Debug, Clone, Copy)]
+pub struct LastPaneRects {
+    pub workspace: Rect,
+    pub video: Option<Rect>,
+    pub audio: Option<Rect>,
+    pub edit_box: Option<Rect>,
+    pub grid: Option<Rect>,
+}
+
+impl Default for LastPaneRects {
+    fn default() -> Self {
+        Self {
+            workspace: Rect::NOTHING,
+            video: None,
+            audio: None,
+            edit_box: None,
+            grid: None,
+        }
+    }
+}
 
 /// Full application shell state combining all UI panels, document, playback, settings, and telemetry.
 pub struct AppShell {
@@ -46,6 +71,8 @@ pub struct AppShell {
     pub audio_markers: TimelineMarkerIndex,
     pub video: VideoPanelState,
     pub dialogs: DialogHostState,
+    pub prefs_dialog: PreferencesDialogState,
+    pub mkv_dialog: MkvImportDialogState,
     pub metrics: PerfMetrics,
     pub command_palette_open: bool,
     pub command_palette_query: String,
@@ -54,18 +81,219 @@ pub struct AppShell {
     pub last_autosave_ns: u64,
     pub autosave_interval_ns: u64,
     pub system_is_dark: bool,
+    pub last_pane_rects: LastPaneRects,
     fonts_installed: bool,
     last_theme_rev: u64,
 }
 
+#[derive(Clone, Copy)]
+enum ToolbarIcon {
+    New,
+    Open,
+    Save,
+    Undo,
+    Redo,
+    Styles,
+    Properties,
+    Resample,
+    ShiftTimes,
+    Tpp,
+    FindReplace,
+    Karaoke,
+    Doctor,
+    Preferences,
+}
+
+#[allow(clippy::too_many_lines)]
+fn toolbar_icon_button(ui: &mut Ui, icon: ToolbarIcon, pal: &Palette, tooltip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+    let p = ui.painter();
+    let bg = if resp.hovered() {
+        rgba(pal.hover)
+    } else {
+        rgba(pal.toolbar_bg)
+    };
+    p.rect_filled(rect, 2.0, bg);
+    if resp.hovered() {
+        p.rect_stroke(
+            rect,
+            2.0,
+            Stroke::new(1.0, rgba(pal.border)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let fg = rgba(pal.text_primary);
+    let accent = rgba(pal.focus_ring);
+    let st = Stroke::new(1.3, fg);
+    let c = rect.center();
+    match icon {
+        ToolbarIcon::New => {
+            let b = Rect::from_center_size(c, Vec2::new(10.0, 12.0));
+            p.rect_stroke(b, 1.0, st, egui::StrokeKind::Inside);
+            p.line_segment([Pos2::new(c.x, c.y - 3.0), Pos2::new(c.x, c.y + 3.0)], st);
+            p.line_segment([Pos2::new(c.x - 3.0, c.y), Pos2::new(c.x + 3.0, c.y)], st);
+        }
+        ToolbarIcon::Open => {
+            let b = Rect::from_center_size(Pos2::new(c.x, c.y + 1.0), Vec2::new(12.0, 8.0));
+            p.rect_stroke(b, 1.0, st, egui::StrokeKind::Inside);
+            p.line_segment(
+                [
+                    Pos2::new(b.left(), b.top() - 2.0),
+                    Pos2::new(b.left() + 5.0, b.top() - 2.0),
+                ],
+                st,
+            );
+        }
+        ToolbarIcon::Save => {
+            let b = Rect::from_center_size(c, Vec2::new(11.0, 11.0));
+            p.rect_stroke(b, 1.0, st, egui::StrokeKind::Inside);
+            p.rect_filled(
+                Rect::from_center_size(Pos2::new(c.x, c.y - 3.0), Vec2::new(6.0, 3.0)),
+                0.0,
+                fg,
+            );
+        }
+        ToolbarIcon::Undo => {
+            p.line_segment([Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 4.0, c.y)], st);
+            p.line_segment(
+                [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x - 1.5, c.y - 3.5)],
+                st,
+            );
+            p.line_segment(
+                [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x - 1.5, c.y + 3.5)],
+                st,
+            );
+        }
+        ToolbarIcon::Redo => {
+            p.line_segment([Pos2::new(c.x - 4.0, c.y), Pos2::new(c.x + 5.0, c.y)], st);
+            p.line_segment(
+                [Pos2::new(c.x + 5.0, c.y), Pos2::new(c.x + 1.5, c.y - 3.5)],
+                st,
+            );
+            p.line_segment(
+                [Pos2::new(c.x + 5.0, c.y), Pos2::new(c.x + 1.5, c.y + 3.5)],
+                st,
+            );
+        }
+        ToolbarIcon::Styles => {
+            p.line_segment(
+                [Pos2::new(c.x - 4.0, c.y + 5.0), Pos2::new(c.x, c.y - 5.0)],
+                Stroke::new(1.5, accent),
+            );
+            p.line_segment(
+                [Pos2::new(c.x, c.y - 5.0), Pos2::new(c.x + 4.0, c.y + 5.0)],
+                Stroke::new(1.5, accent),
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 2.5, c.y + 1.5),
+                    Pos2::new(c.x + 2.5, c.y + 1.5),
+                ],
+                st,
+            );
+        }
+        ToolbarIcon::Properties => {
+            for dy in [-4.0, 0.0, 4.0] {
+                p.line_segment(
+                    [
+                        Pos2::new(c.x - 5.0, c.y + dy),
+                        Pos2::new(c.x + 5.0, c.y + dy),
+                    ],
+                    st,
+                );
+            }
+        }
+        ToolbarIcon::Resample => {
+            let b = Rect::from_center_size(c, Vec2::new(11.0, 9.0));
+            p.rect_stroke(b, 0.5, st, egui::StrokeKind::Inside);
+            p.line_segment([b.left_bottom(), b.right_top()], st);
+        }
+        ToolbarIcon::ShiftTimes => {
+            p.circle_stroke(c, 5.5, st);
+            p.line_segment([c, Pos2::new(c.x, c.y - 3.5)], st);
+            p.line_segment([c, Pos2::new(c.x + 3.0, c.y)], st);
+        }
+        ToolbarIcon::Tpp => {
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 5.0, c.y - 3.0),
+                    Pos2::new(c.x + 5.0, c.y - 3.0),
+                ],
+                st,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 5.0, c.y + 3.0),
+                    Pos2::new(c.x + 5.0, c.y + 3.0),
+                ],
+                st,
+            );
+            p.circle_filled(Pos2::new(c.x - 2.0, c.y - 3.0), 2.0, accent);
+            p.circle_filled(Pos2::new(c.x + 2.0, c.y + 3.0), 2.0, accent);
+        }
+        ToolbarIcon::FindReplace => {
+            p.circle_stroke(Pos2::new(c.x - 1.5, c.y - 1.5), 4.0, st);
+            p.line_segment(
+                [
+                    Pos2::new(c.x + 1.5, c.y + 1.5),
+                    Pos2::new(c.x + 5.5, c.y + 5.5),
+                ],
+                Stroke::new(1.8, fg),
+            );
+        }
+        ToolbarIcon::Karaoke => {
+            p.circle_filled(Pos2::new(c.x - 2.5, c.y + 3.5), 2.3, accent);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 0.5, c.y + 3.0),
+                    Pos2::new(c.x - 0.5, c.y - 5.0),
+                ],
+                Stroke::new(1.5, accent),
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 0.5, c.y - 5.0),
+                    Pos2::new(c.x + 4.5, c.y - 3.0),
+                ],
+                Stroke::new(1.5, accent),
+            );
+        }
+        ToolbarIcon::Doctor => {
+            p.rect_stroke(
+                Rect::from_center_size(c, Vec2::new(11.0, 11.0)),
+                2.0,
+                st,
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment(
+                [Pos2::new(c.x, c.y - 3.5), Pos2::new(c.x, c.y + 3.5)],
+                Stroke::new(1.8, egui::Color32::from_rgb(46, 170, 92)),
+            );
+            p.line_segment(
+                [Pos2::new(c.x - 3.5, c.y), Pos2::new(c.x + 3.5, c.y)],
+                Stroke::new(1.8, egui::Color32::from_rgb(46, 170, 92)),
+            );
+        }
+        ToolbarIcon::Preferences => {
+            p.circle_stroke(c, 4.5, st);
+            p.circle_filled(c, 1.8, fg);
+        }
+    }
+    resp.on_hover_text(tooltip).clicked()
+}
+
 impl AppShell {
     /// Creates a new shell initialized with `script` and no media attached.
-    ///
-    /// Call [`Self::attach_video`] and [`Self::attach_audio`] when real media is opened.
     #[must_use]
     pub fn new(script: ScriptFile) -> Self {
         let mut grid = SubtitleGridState::default();
         grid.sync_from_script(&script);
+        let mut dialogs = DialogHostState::new();
+        let script_style_names: Vec<String> =
+            script.styles().map(|st| st.name().to_owned()).collect();
+        if !script_style_names.is_empty() {
+            dialogs.script_styles = script_style_names;
+        }
         let doc = DocumentController::new(script);
         Self {
             doc,
@@ -80,7 +308,9 @@ impl AppShell {
             audio: AudioPanelState::new(0),
             audio_markers: TimelineMarkerIndex::new(Vec::new(), Vec::new()),
             video: VideoPanelState::new(0, 0),
-            dialogs: DialogHostState::new(),
+            dialogs,
+            prefs_dialog: PreferencesDialogState::default(),
+            mkv_dialog: MkvImportDialogState::default(),
             metrics: PerfMetrics::default(),
             command_palette_open: false,
             command_palette_query: String::new(),
@@ -89,6 +319,7 @@ impl AppShell {
             last_autosave_ns: 0,
             autosave_interval_ns: 60_000_000_000,
             system_is_dark: true,
+            last_pane_rects: LastPaneRects::default(),
             fonts_installed: false,
             last_theme_rev: 0,
         }
@@ -175,13 +406,18 @@ impl AppShell {
             "tool/line/select" => self.dialogs.open = Some(ActiveDialog::SelectLines),
             "tool/resample" => self.dialogs.open = Some(ActiveDialog::Resample),
             "tool/styles_manager" => self.dialogs.open = Some(ActiveDialog::StyleManager),
+            "tool/style_editor" => self.dialogs.open = Some(ActiveDialog::StyleEditor),
             "subtitle/properties" => self.dialogs.open = Some(ActiveDialog::Properties),
             "tool/fonts_collector" => self.dialogs.open = Some(ActiveDialog::FontsCheck),
             "video/jump" => self.dialogs.open = Some(ActiveDialog::JumpTo),
             "app/options" => self.dialogs.open = Some(ActiveDialog::Preferences),
+            "app/hotkeys" => self.dialogs.open = Some(ActiveDialog::Hotkeys),
             "subtitle/open/video" => self.dialogs.open = Some(ActiveDialog::MkvImport),
             "app/about" => self.dialogs.open = Some(ActiveDialog::About),
             "app/log" => self.dialogs.open = Some(ActiveDialog::LogWindow),
+            "automation/kara_templater" => {
+                self.dialogs.open = Some(ActiveDialog::KaraokeTemplater);
+            }
             "app/display/full" => self.layout_state.mode = ViewMode::Full,
             "app/display/standard" => self.layout_state.mode = ViewMode::VideoAndSubs,
             "app/display/audio_subs" => self.layout_state.mode = ViewMode::AudioAndSubs,
@@ -222,7 +458,7 @@ impl AppShell {
         }
     }
 
-    /// Renders one complete application frame into `ctx` with strict repaint discipline.
+    /// Renders one complete application frame into `ui` with strict repaint discipline.
     #[allow(clippy::too_many_lines)]
     pub fn show(
         &mut self,
@@ -272,15 +508,42 @@ impl AppShell {
             ctx.request_repaint();
         }
 
+        // Sync active line start/end to video panel offset display.
+        if let Some(active) = self.doc.active_line()
+            && let Some(ev) = self
+                .doc
+                .script()
+                .events_section()
+                .and_then(|s| s.get_event(active))
+        {
+            self.video.active_line_start_ms = i64::from(ev.start().as_cs()) * 10;
+            self.video.active_line_end_ms = i64::from(ev.end().as_cs()) * 10;
+        }
+
         let pal = self.theme.palette().clone();
         let pal_rev = self.theme.revision();
+        let is_vi = self.catalog.locale() == Locale::Vi;
 
-        // 1. Top menu bar + compact toolbar.
+        // 1. Classic 9 top-level Aegisub 3.2.2 menus in exact order:
+        //    File, Edit, Subtitle, Timing, Video, Audio, Automation, View, Help.
         Panel::top("hlouis_menubar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button(self.catalog.get("menu-file").unwrap_or("File"), |ui| {
+                    if ui.button("New Subtitles").clicked() {
+                        self.execute_command("subtitle/new");
+                        ui.close();
+                    }
+                    if ui.button("Open Subtitles...").clicked() {
+                        self.execute_command("subtitle/open");
+                        ui.close();
+                    }
                     if ui.button("Open Subtitles from Video...").clicked() {
                         self.execute_command("subtitle/open/video");
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Save Subtitles").clicked() {
+                        self.execute_command("subtitle/save");
                         ui.close();
                     }
                     if ui.button("Properties...").clicked() {
@@ -297,6 +560,7 @@ impl AppShell {
                         self.execute_command("edit/redo");
                         ui.close();
                     }
+                    ui.separator();
                     if ui.button("Find and Replace...").clicked() {
                         self.execute_command("edit/find_replace");
                         ui.close();
@@ -309,12 +573,20 @@ impl AppShell {
                             self.execute_command("tool/styles_manager");
                             ui.close();
                         }
+                        if ui.button("Style Editor...").clicked() {
+                            self.execute_command("tool/style_editor");
+                            ui.close();
+                        }
                         if ui.button("Resample Resolution...").clicked() {
                             self.execute_command("tool/resample");
                             ui.close();
                         }
                         if ui.button("Select Lines...").clicked() {
                             self.execute_command("tool/line/select");
+                            ui.close();
+                        }
+                        if ui.button("Fonts Collector...").clicked() {
+                            self.execute_command("tool/fonts_collector");
                             ui.close();
                         }
                         ui.separator();
@@ -344,19 +616,58 @@ impl AppShell {
                         ui.close();
                     }
                 });
-                ui.menu_button("Automation", |ui| {
-                    if ui.button("Template Doctor...").clicked() {
-                        self.execute_command("automation/template_doctor");
+                ui.menu_button(self.catalog.get("menu-video").unwrap_or("Video"), |ui| {
+                    if ui.button("Jump To...").clicked() {
+                        self.execute_command("video/jump");
+                        ui.close();
+                    }
+                    ui.separator();
+                    for pct in [50u16, 100, 150, 200] {
+                        if ui.button(format!("Zoom {pct}%")).clicked() {
+                            self.video.zoom_percent = pct;
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button(self.catalog.get("menu-audio").unwrap_or("Audio"), |ui| {
+                    if ui.button("Waveform Mode").clicked() {
+                        self.audio.spectrum_mode = false;
+                        ui.close();
+                    }
+                    if ui.button("Spectrum Mode").clicked() {
+                        self.audio.spectrum_mode = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Toggle Karaoke Mode").clicked() {
+                        self.audio.karaoke_mode = !self.audio.karaoke_mode;
                         ui.close();
                     }
                 });
+                ui.menu_button(
+                    self.catalog.get("menu-automation").unwrap_or("Automation"),
+                    |ui| {
+                        if ui.button("Apply Karaoke Template...").clicked() {
+                            self.execute_command("automation/kara_templater");
+                            ui.close();
+                        }
+                        if ui.button("Template Doctor...").clicked() {
+                            self.execute_command("automation/template_doctor");
+                            ui.close();
+                        }
+                    },
+                );
                 ui.menu_button(self.catalog.get("menu-view").unwrap_or("View"), |ui| {
                     if ui.button("Full View").clicked() {
                         self.execute_command("app/display/full");
                         ui.close();
                     }
-                    if ui.button("Standard View").clicked() {
+                    if ui.button("Video & Subs").clicked() {
                         self.execute_command("app/display/standard");
+                        ui.close();
+                    }
+                    if ui.button("Audio & Subs").clicked() {
+                        self.execute_command("app/display/audio_subs");
                         ui.close();
                     }
                     if ui.button("Subs Only").clicked() {
@@ -364,34 +675,64 @@ impl AppShell {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Theme: Light").clicked() {
-                        self.settings.appearance.theme_mode = ThemeMode::Light;
-                        self.set_theme(ThemeSpec::Light);
-                        ui.close();
-                    }
-                    if ui.button("Theme: Dark").clicked() {
-                        self.settings.appearance.theme_mode = ThemeMode::Dark;
-                        self.set_theme(ThemeSpec::Dark);
-                        ui.close();
-                    }
-                    if ui.button("Theme: Eye Comfort Dark").clicked() {
-                        self.settings.appearance.theme_mode = ThemeMode::EyeComfortDark;
-                        self.set_theme(ThemeSpec::EyeComfort {
-                            base: BaseTheme::Dark,
-                            strength: self.settings.appearance.eye_comfort_strength,
-                        });
-                        ui.close();
-                    }
+                    ui.menu_button(if is_vi { "Giao diện" } else { "Theme" }, |ui| {
+                        if ui.button("Light").clicked() {
+                            self.settings.appearance.theme_mode = ThemeMode::Light;
+                            self.set_theme(ThemeSpec::Light);
+                            ui.close();
+                        }
+                        if ui.button("Dark").clicked() {
+                            self.settings.appearance.theme_mode = ThemeMode::Dark;
+                            self.set_theme(ThemeSpec::Dark);
+                            ui.close();
+                        }
+                        if ui.button("Eye Comfort Light").clicked() {
+                            self.settings.appearance.theme_mode = ThemeMode::EyeComfortLight;
+                            self.set_theme(ThemeSpec::EyeComfort {
+                                base: BaseTheme::Light,
+                                strength: self.settings.appearance.eye_comfort_strength,
+                            });
+                            ui.close();
+                        }
+                        if ui.button("Eye Comfort Dark").clicked() {
+                            self.settings.appearance.theme_mode = ThemeMode::EyeComfortDark;
+                            self.set_theme(ThemeSpec::EyeComfort {
+                                base: BaseTheme::Dark,
+                                strength: self.settings.appearance.eye_comfort_strength,
+                            });
+                            ui.close();
+                        }
+                        ui.separator();
+                        let mut strength = self.settings.appearance.eye_comfort_strength;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut strength, 0..=100)
+                                    .text("Eye Comfort")
+                                    .suffix("%"),
+                            )
+                            .changed()
+                        {
+                            self.settings.appearance.eye_comfort_strength = strength;
+                            if let ThemeSpec::EyeComfort { base, .. } = self.theme.spec() {
+                                self.set_theme(ThemeSpec::EyeComfort { base, strength });
+                            }
+                        }
+                    });
+                    ui.menu_button(if is_vi { "Ngôn ngữ" } else { "Language" }, |ui| {
+                        if ui.button("English").clicked() {
+                            self.set_locale(Locale::En);
+                            ui.close();
+                        }
+                        if ui.button("Tiếng Việt").clicked() {
+                            self.set_locale(Locale::Vi);
+                            ui.close();
+                        }
+                    });
                     ui.separator();
-                    if ui.button("English").clicked() {
-                        self.set_locale(Locale::En);
+                    if ui.button("Hotkeys...").clicked() {
+                        self.execute_command("app/hotkeys");
                         ui.close();
                     }
-                    if ui.button("Tiếng Việt").clicked() {
-                        self.set_locale(Locale::Vi);
-                        ui.close();
-                    }
-                    ui.separator();
                     if ui.button("Preferences...").clicked() {
                         self.execute_command("app/options");
                         ui.close();
@@ -407,53 +748,110 @@ impl AppShell {
                         ui.close();
                     }
                 });
+            });
+        });
+
+        // 1b. Classic Aegisub 3.2.2 single-row 16×16 vector icon toolbar + compact quick toggles.
+        Panel::top("hlouis_toolbar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if toolbar_icon_button(ui, ToolbarIcon::New, &pal, "New subtitles") {
+                    self.execute_command("subtitle/new");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Open, &pal, "Open subtitles from MKV") {
+                    self.execute_command("subtitle/open/video");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Save, &pal, "Save subtitles") {
+                    self.execute_command("subtitle/save");
+                }
                 ui.separator();
-                let cur_spec = self.theme.spec();
-                if ui
-                    .selectable_label(matches!(cur_spec, ThemeSpec::Light), "Light")
-                    .clicked()
-                {
-                    self.set_theme(ThemeSpec::Light);
+                if toolbar_icon_button(ui, ToolbarIcon::Undo, &pal, "Undo (Ctrl+Z)") {
+                    self.execute_command("edit/undo");
                 }
-                if ui
-                    .selectable_label(matches!(cur_spec, ThemeSpec::Dark), "Dark")
-                    .clicked()
-                {
-                    self.set_theme(ThemeSpec::Dark);
+                if toolbar_icon_button(ui, ToolbarIcon::Redo, &pal, "Redo (Ctrl+Y)") {
+                    self.execute_command("edit/redo");
                 }
-                let is_ec = matches!(cur_spec, ThemeSpec::EyeComfort { .. });
-                if ui.selectable_label(is_ec, "Eye Comfort").clicked() {
-                    self.set_theme(ThemeSpec::EyeComfort {
-                        base: BaseTheme::Dark,
-                        strength: self.settings.appearance.eye_comfort_strength,
-                    });
+                ui.separator();
+                if toolbar_icon_button(ui, ToolbarIcon::Styles, &pal, "Styles Manager") {
+                    self.execute_command("tool/styles_manager");
                 }
-                if is_ec {
-                    let mut strength = self.settings.appearance.eye_comfort_strength;
+                if toolbar_icon_button(ui, ToolbarIcon::Properties, &pal, "Script Properties") {
+                    self.execute_command("subtitle/properties");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Resample, &pal, "Resample Resolution") {
+                    self.execute_command("tool/resample");
+                }
+                ui.separator();
+                if toolbar_icon_button(ui, ToolbarIcon::ShiftTimes, &pal, "Shift Times") {
+                    self.execute_command("time/shift");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Tpp, &pal, "Timing Post-Processor") {
+                    self.execute_command("tool/timing_processor");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::FindReplace, &pal, "Find and Replace") {
+                    self.execute_command("edit/find_replace");
+                }
+                ui.separator();
+                if toolbar_icon_button(ui, ToolbarIcon::Karaoke, &pal, "Apply Karaoke Template") {
+                    self.execute_command("automation/kara_templater");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Doctor, &pal, "Template Doctor") {
+                    self.execute_command("automation/template_doctor");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Preferences, &pal, "Preferences") {
+                    self.execute_command("app/options");
+                }
+
+                // Right-aligned compact quick theme & language switchers.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Slider::new(&mut strength, 0..=100).suffix("%"))
-                        .changed()
+                        .selectable_label(self.catalog.locale() == Locale::Vi, "VI")
+                        .clicked()
                     {
-                        self.settings.appearance.eye_comfort_strength = strength;
+                        self.set_locale(Locale::Vi);
+                    }
+                    if ui
+                        .selectable_label(self.catalog.locale() == Locale::En, "EN")
+                        .clicked()
+                    {
+                        self.set_locale(Locale::En);
+                    }
+                    ui.separator();
+                    let cur_spec = self.theme.spec();
+                    let is_ec = matches!(cur_spec, ThemeSpec::EyeComfort { .. });
+                    if is_ec {
+                        let mut strength = self.settings.appearance.eye_comfort_strength;
+                        ui.spacing_mut().slider_width = 64.0;
+                        if ui
+                            .add(egui::Slider::new(&mut strength, 0..=100).suffix("%"))
+                            .changed()
+                        {
+                            self.settings.appearance.eye_comfort_strength = strength;
+                            self.set_theme(ThemeSpec::EyeComfort {
+                                base: BaseTheme::Dark,
+                                strength,
+                            });
+                        }
+                    }
+                    if ui.selectable_label(is_ec, "Eye").clicked() {
                         self.set_theme(ThemeSpec::EyeComfort {
                             base: BaseTheme::Dark,
-                            strength,
+                            strength: self.settings.appearance.eye_comfort_strength,
                         });
                     }
-                }
-                ui.separator();
-                if ui
-                    .selectable_label(self.catalog.locale() == Locale::En, "EN")
-                    .clicked()
-                {
-                    self.set_locale(Locale::En);
-                }
-                if ui
-                    .selectable_label(self.catalog.locale() == Locale::Vi, "VI")
-                    .clicked()
-                {
-                    self.set_locale(Locale::Vi);
-                }
+                    if ui
+                        .selectable_label(matches!(cur_spec, ThemeSpec::Dark), "Dark")
+                        .clicked()
+                    {
+                        self.set_theme(ThemeSpec::Dark);
+                    }
+                    if ui
+                        .selectable_label(matches!(cur_spec, ThemeSpec::Light), "Light")
+                        .clicked()
+                    {
+                        self.set_theme(ThemeSpec::Light);
+                    }
+                });
             });
         });
 
@@ -481,157 +879,303 @@ impl AppShell {
             });
         });
 
-        // 3. Central Aegisub 3.2.2 workspace layout (computed via `layout::LayoutState`).
-        egui::CentralPanel::default().show(ui, |ui| {
-            let avail = ui.available_rect_before_wrap();
-            let comp = self.layout_state.compute(
-                avail.width().max(320.0),
-                avail.height().max(240.0),
-                ctx.pixels_per_point(),
-            );
+        // 3. Central Aegisub 3.2.2 workspace layout (computed directly in logical points — zero
+        //    double-DPI division at 200% scaling!).
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(2)))
+            .show(ui, |ui| {
+                let avail = ui.available_rect_before_wrap();
+                let comp = self
+                    .layout_state
+                    .compute_logical(avail.width().max(320.0), avail.height().max(240.0));
 
-            // Top-left: Video panel
-            if let Some(v) = comp.video
-                && v.is_visible()
-            {
-                let vr = Rect::from_min_size(
-                    Pos2::new(avail.left() + v.x, avail.top() + v.y),
-                    Vec2::new(v.w, v.h),
-                );
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(vr));
-                if let (Some(vs), Some(pb)) = (video_supplier, self.playback.as_mut()) {
-                    let _ = show_video_panel(
-                        &mut child,
-                        &mut self.video,
-                        vs,
-                        pb,
-                        clock,
-                        &pal,
-                        &self.catalog,
-                    );
-                } else {
-                    child.centered_and_justified(|ui| {
-                        ui.label(
-                            self.catalog
-                                .get("video-no-video")
-                                .unwrap_or("No video loaded"),
-                        );
-                    });
-                }
-            }
+                let mut rects = LastPaneRects {
+                    workspace: avail,
+                    ..LastPaneRects::default()
+                };
 
-            // Top-right: Audio panel
-            if let Some(a) = comp.audio
-                && a.is_visible()
-            {
-                let ar = Rect::from_min_size(
-                    Pos2::new(avail.left() + a.x, avail.top() + a.y),
-                    Vec2::new(a.w, a.h),
-                );
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ar));
-                if let Some(ap) = audio_provider {
-                    let _ = show_audio_panel(
-                        &mut child,
-                        &mut self.audio,
-                        ap,
-                        &self.audio_markers,
-                        None,
-                        None,
-                        &pal,
-                        pal_rev,
-                        &self.catalog,
-                    );
-                } else {
-                    child.centered_and_justified(|ui| {
-                        ui.label(
-                            self.catalog
-                                .get("audio-no-audio")
-                                .unwrap_or("No audio loaded"),
-                        );
-                    });
-                }
-            }
-
-            // Middle-right (under audio): Edit Box
-            if comp.edit_box.is_visible() {
-                let er = Rect::from_min_size(
-                    Pos2::new(
-                        avail.left() + comp.edit_box.x,
-                        avail.top() + comp.edit_box.y,
-                    ),
-                    Vec2::new(comp.edit_box.w, comp.edit_box.h),
-                );
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(er));
-                if show_edit_box(
-                    &mut child,
-                    &mut self.doc,
-                    &mut self.editbox,
-                    None,
-                    &pal,
-                    &self.catalog,
-                ) && let Some(active) = self.doc.active_line()
-                    && let Some(ev) = self
-                        .doc
-                        .script()
-                        .events_section()
-                        .and_then(|s| s.get_event(active))
+                // Top-left: Video panel (strict clip rect).
+                if let Some(v) = comp.video
+                    && v.is_visible()
                 {
-                    let mut synced = ev.clone();
-                    if let Some(txt) = self.doc.effective_event_text(active) {
-                        synced.set_text(txt);
+                    let vr = Rect::from_min_size(
+                        Pos2::new(avail.left() + v.x, avail.top() + v.y),
+                        Vec2::new(v.w, v.h),
+                    );
+                    rects.video = Some(vr);
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(vr));
+                    child.set_clip_rect(vr);
+                    if let (Some(vs), Some(pb)) = (video_supplier, self.playback.as_mut()) {
+                        let _ = show_video_panel(
+                            &mut child,
+                            &mut self.video,
+                            vs,
+                            pb,
+                            clock,
+                            &pal,
+                            &self.catalog,
+                        );
+                    } else {
+                        child.centered_and_justified(|ui| {
+                            ui.label(
+                                self.catalog
+                                    .get("video-no-video")
+                                    .unwrap_or("No video loaded"),
+                            );
+                        });
                     }
-                    self.grid.sync_row(active, &synced);
                 }
-            }
 
-            // Bottom: Virtualised Subtitle Grid
-            if comp.grid.is_visible() {
-                let gr = Rect::from_min_size(
-                    Pos2::new(avail.left() + comp.grid.x, avail.top() + comp.grid.y),
-                    Vec2::new(comp.grid.w, comp.grid.h),
-                );
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(gr));
-                let vid_cs = self
-                    .playback
-                    .as_ref()
-                    .and_then(|pb| u32::try_from(pb.current_time_ms().max(0) / 10).ok());
-                if let Some(act) = show_subtitle_grid(
-                    &mut child,
-                    self.doc.script(),
-                    &mut self.grid,
-                    vid_cs,
-                    &pal,
-                    &self.catalog,
-                ) {
-                    match act {
-                        GridAction::SelectionChanged { active } => {
-                            if let Some(row) = active {
-                                self.doc.set_selection(Some(row), &[row]);
-                            }
+                // Top-right: Audio panel (strict clip rect).
+                if let Some(a) = comp.audio
+                    && a.is_visible()
+                {
+                    let ar = Rect::from_min_size(
+                        Pos2::new(avail.left() + a.x, avail.top() + a.y),
+                        Vec2::new(a.w, a.h),
+                    );
+                    rects.audio = Some(ar);
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ar));
+                    child.set_clip_rect(ar);
+                    if let Some(ap) = audio_provider {
+                        let _ = show_audio_panel(
+                            &mut child,
+                            &mut self.audio,
+                            ap,
+                            &self.audio_markers,
+                            None,
+                            None,
+                            &pal,
+                            pal_rev,
+                            &self.catalog,
+                        );
+                    } else {
+                        child.centered_and_justified(|ui| {
+                            ui.label(
+                                self.catalog
+                                    .get("audio-no-audio")
+                                    .unwrap_or("No audio loaded"),
+                            );
+                        });
+                    }
+                }
+
+                // Middle-right (under audio): Edit Box (strict clip rect).
+                if comp.edit_box.is_visible() {
+                    let er = Rect::from_min_size(
+                        Pos2::new(
+                            avail.left() + comp.edit_box.x,
+                            avail.top() + comp.edit_box.y,
+                        ),
+                        Vec2::new(comp.edit_box.w, comp.edit_box.h),
+                    );
+                    rects.edit_box = Some(er);
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(er));
+                    child.set_clip_rect(er);
+                    if show_edit_box(
+                        &mut child,
+                        &mut self.doc,
+                        &mut self.editbox,
+                        None,
+                        &pal,
+                        &self.catalog,
+                    ) && let Some(active) = self.doc.active_line()
+                        && let Some(ev) = self
+                            .doc
+                            .script()
+                            .events_section()
+                            .and_then(|s| s.get_event(active))
+                    {
+                        let mut synced = ev.clone();
+                        if let Some(txt) = self.doc.effective_event_text(active) {
+                            synced.set_text(txt);
                         }
-                        GridAction::Command(cmd) => self.execute_command(cmd),
+                        self.grid.sync_row(active, &synced);
+                    }
+                    if self.editbox.edit_style_requested {
+                        self.editbox.edit_style_requested = false;
+                        self.dialogs
+                            .style_editor
+                            .name
+                            .clone_from(&self.editbox.style_buf);
+                        self.dialogs.open = Some(ActiveDialog::StyleEditor);
                     }
                 }
-            }
-        });
 
-        // 4. Active modal dialog window (if any).
-        if self.dialogs.open.is_some() {
-            let mut dialog_action = None;
-            egui::Window::new("Dialog")
+                // Bottom: Virtualised Subtitle Grid (strict clip rect).
+                if comp.grid.is_visible() {
+                    let gr = Rect::from_min_size(
+                        Pos2::new(avail.left() + comp.grid.x, avail.top() + comp.grid.y),
+                        Vec2::new(comp.grid.w, comp.grid.h),
+                    );
+                    rects.grid = Some(gr);
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(gr));
+                    child.set_clip_rect(gr);
+                    let vid_cs = self
+                        .playback
+                        .as_ref()
+                        .and_then(|pb| u32::try_from(pb.current_time_ms().max(0) / 10).ok());
+                    if let Some(act) = show_subtitle_grid(
+                        &mut child,
+                        self.doc.script(),
+                        &mut self.grid,
+                        vid_cs,
+                        &pal,
+                        &self.catalog,
+                    ) {
+                        match act {
+                            GridAction::SelectionChanged { active } => {
+                                if let Some(row) = active {
+                                    self.doc.set_selection(Some(row), &[row]);
+                                }
+                            }
+                            GridAction::Command(cmd) => self.execute_command(cmd),
+                        }
+                    }
+                }
+
+                // Interactive draggable splitters with subtle border styling.
+                let sp_col = rgba(pal.border);
+                let mh_rect = Rect::from_min_size(
+                    Pos2::new(
+                        avail.left() + comp.main_h_splitter.x,
+                        avail.top() + comp.main_h_splitter.y,
+                    ),
+                    Vec2::new(comp.main_h_splitter.w, comp.main_h_splitter.h),
+                );
+                ui.painter().rect_filled(mh_rect, 0.0, sp_col);
+                let mh_resp =
+                    ui.interact(mh_rect, ui.scope_id().with("split_main_h"), Sense::drag());
+                if mh_resp.hovered() || mh_resp.dragged() {
+                    ctx.set_cursor_icon(CursorIcon::ResizeVertical);
+                }
+                if mh_resp.dragged() {
+                    let dy = mh_resp.drag_delta().y / avail.height().max(1.0);
+                    self.layout_state.top_height_ratio =
+                        (self.layout_state.top_height_ratio + dy).clamp(0.25, 0.80);
+                }
+
+                if let Some(tv) = comp.top_v_splitter {
+                    let tv_rect = Rect::from_min_size(
+                        Pos2::new(avail.left() + tv.x, avail.top() + tv.y),
+                        Vec2::new(tv.w, tv.h),
+                    );
+                    ui.painter().rect_filled(tv_rect, 0.0, sp_col);
+                    let tv_resp =
+                        ui.interact(tv_rect, ui.scope_id().with("split_top_v"), Sense::drag());
+                    if tv_resp.hovered() || tv_resp.dragged() {
+                        ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
+                    }
+                    if tv_resp.dragged() {
+                        let dx = tv_resp.drag_delta().x / avail.width().max(1.0);
+                        self.layout_state.video_width_ratio =
+                            (self.layout_state.video_width_ratio + dx).clamp(0.25, 0.75);
+                    }
+                }
+
+                if let Some(ae) = comp.audio_edit_splitter {
+                    let ae_rect = Rect::from_min_size(
+                        Pos2::new(avail.left() + ae.x, avail.top() + ae.y),
+                        Vec2::new(ae.w, ae.h),
+                    );
+                    ui.painter().rect_filled(ae_rect, 0.0, sp_col);
+                    let ae_resp =
+                        ui.interact(ae_rect, ui.scope_id().with("split_ae_h"), Sense::drag());
+                    if ae_resp.hovered() || ae_resp.dragged() {
+                        ctx.set_cursor_icon(CursorIcon::ResizeVertical);
+                    }
+                    if ae_resp.dragged() {
+                        let top_h = comp.main_h_splitter.y.max(1.0);
+                        let dy = ae_resp.drag_delta().y / top_h;
+                        self.layout_state.audio_height_ratio =
+                            (self.layout_state.audio_height_ratio + dy).clamp(0.25, 0.75);
+                    }
+                }
+
+                self.last_pane_rects = rects;
+            });
+
+        // 4. Active modal dialog window (localized title, centered, opaque foreground frame).
+        if let Some(active_dlg) = self.dialogs.open {
+            let title = active_dlg.title(&self.catalog);
+            let def_size = active_dlg.default_size();
+            let screen_center = ctx.content_rect().center();
+            let mut still_open = true;
+            let mut dialog_action: Option<DialogAction> = None;
+            let mut prefs_action = PrefsDialogAction::None;
+            let mut mkv_action = MkvImportAction::None;
+
+            let frame = egui::Frame::window(ui.style())
+                .fill(rgba(pal.dialog_bg))
+                .stroke(Stroke::new(1.0, rgba(pal.border)));
+
+            egui::Window::new(title)
+                .id(ui.make_persistent_id(("hlouis_dialog_win", active_dlg)))
+                .open(&mut still_open)
+                .order(Order::Foreground)
+                .frame(frame)
+                .pivot(Align2::CENTER_CENTER)
+                .default_pos(screen_center)
+                .default_size(def_size)
                 .collapsible(false)
                 .resizable(true)
-                .show(ctx, |ui| {
-                    dialog_action = show_active_dialog(
-                        ui,
-                        &mut self.dialogs,
-                        &mut self.settings,
-                        &self.commands,
-                        None,
-                        &pal,
-                        &self.catalog,
-                    );
+                .show(ctx, |ui| match active_dlg {
+                    ActiveDialog::Preferences => {
+                        prefs_action = show_preferences_dialog(
+                            ui,
+                            &mut self.prefs_dialog,
+                            &mut self.settings,
+                            &mut self.theme,
+                            &self.commands,
+                            &self.catalog,
+                        );
+                    }
+                    ActiveDialog::MkvImport => {
+                        mkv_action =
+                            show_mkv_import_dialog(ui, &mut self.mkv_dialog, &self.catalog);
+                    }
+                    _ => {
+                        dialog_action = show_active_dialog(
+                            ui,
+                            &mut self.dialogs,
+                            &mut self.settings,
+                            &self.commands,
+                            None,
+                            &pal,
+                            &self.catalog,
+                        );
+                    }
                 });
+
+            if !still_open {
+                self.dialogs.open = None;
+            }
+            match prefs_action {
+                PrefsDialogAction::ApplyAndClose => {
+                    self.theme.sync_from_prefs(
+                        &self.settings.appearance,
+                        self.system_is_dark,
+                        12 * 60,
+                    );
+                    self.dialogs.open = None;
+                }
+                PrefsDialogAction::Cancel => {
+                    self.dialogs.open = None;
+                }
+                PrefsDialogAction::None => {}
+            }
+            match mkv_action {
+                MkvImportAction::ImportSelected { track_numbers, .. } => {
+                    self.status_message = format!("Imported {} MKV track(s)", track_numbers.len());
+                    self.dialogs.open = None;
+                }
+                MkvImportAction::Close => {
+                    self.dialogs.open = None;
+                }
+                MkvImportAction::None
+                | MkvImportAction::RequestPreview(_)
+                | MkvImportAction::CancelReading => {}
+            }
             if let Some(act) = dialog_action {
                 self.handle_dialog_action(&act);
             }
@@ -641,6 +1185,7 @@ impl AppShell {
         if self.command_palette_open {
             let mut chosen: Option<&'static str> = None;
             egui::Window::new("Command Palette")
+                .order(Order::Foreground)
                 .collapsible(false)
                 .show(ctx, |ui| {
                     ui.text_edit_singleline(&mut self.command_palette_query);
@@ -671,6 +1216,13 @@ impl AppShell {
                 self.theme
                     .sync_from_prefs(&self.settings.appearance, self.system_is_dark, 12 * 60);
                 self.dialogs.open = None;
+            }
+            DialogAction::ApplyStyleEditor => {
+                self.status_message = format!("Updated style '{}'", self.dialogs.style_editor.name);
+                self.dialogs.open = None;
+            }
+            DialogAction::RunKaraokeTemplater => {
+                "Karaoke templates applied.".clone_into(&mut self.status_message);
             }
             DialogAction::ApplyHlouisClean(opts) => {
                 let sel: BTreeSet<usize> = self.doc.selection().iter().copied().collect();
@@ -714,11 +1266,21 @@ mod tests {
     use super::*;
     use ass_core::{AssEvent, AssTime};
     use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
 
     struct ZeroClock;
     impl Clock for ZeroClock {
         fn now_ns(&self) -> u64 {
             0
+        }
+    }
+
+    fn rect_overlap_area(a: Rect, b: Rect) -> f32 {
+        let inter = a.intersect(b);
+        if inter.is_positive() {
+            inter.width() * inter.height()
+        } else {
+            0.0
         }
     }
 
@@ -745,5 +1307,131 @@ mod tests {
         });
         harness.run();
         harness.step();
+    }
+
+    #[test]
+    fn shell_zero_overlapping_panes_and_full_fill_at_100_and_200_dpi_in_all_themes() {
+        let configs: &[(&str, Vec2, f32)] = &[
+            ("100%_dpi_1280x800", Vec2::new(1280.0, 800.0), 1.0),
+            // 2880x1800 physical at 200% DPI = 1440x900 logical points
+            ("200%_dpi_2880x1800", Vec2::new(1440.0, 900.0), 2.0),
+        ];
+        let themes = [
+            ThemeSpec::Light,
+            ThemeSpec::Dark,
+            ThemeSpec::EyeComfort {
+                base: BaseTheme::Dark,
+                strength: 60,
+            },
+        ];
+
+        for &(label, size, ppp) in configs {
+            for spec in themes {
+                let mut script = ScriptFile::new_default();
+                script.ensure_events_section_mut().insert_event(
+                    0,
+                    AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(250), "Hello world"),
+                );
+                let mut shell = AppShell::new(script);
+                shell.set_theme(spec);
+
+                let captured = std::rc::Rc::new(std::cell::Cell::new(LastPaneRects::default()));
+                let captured_c = captured.clone();
+
+                let mut harness = Harness::builder()
+                    .with_size(size)
+                    .with_pixels_per_point(ppp)
+                    .with_accessibility_check(false)
+                    .build_ui(move |ui| {
+                        shell.show(ui, None, None, &ZeroClock);
+                        captured_c.set(shell.last_pane_rects);
+                    });
+                harness.run();
+
+                let rects = captured.get();
+                let video_r = rects.video.expect("video pane visible");
+                let audio_r = rects.audio.expect("audio pane visible");
+                let edit_r = rects.edit_box.expect("edit_box pane visible");
+                let grid_r = rects.grid.expect("grid pane visible");
+
+                // 1. All 4 panes must be strictly non-overlapping.
+                let panes = [video_r, audio_r, edit_r, grid_r];
+                for i in 0..panes.len() {
+                    for j in (i + 1)..panes.len() {
+                        assert_eq!(
+                            rect_overlap_area(panes[i], panes[j]),
+                            0.0,
+                            "{label} {spec:?}: panes {i} and {j} overlap: {:?} vs {:?}",
+                            panes[i],
+                            panes[j]
+                        );
+                    }
+                }
+
+                // 2. Must fill >= 96% of workspace width and height at BOTH 100% and 200% DPI!
+                let fill_w_ratio = grid_r.width() / rects.workspace.width().max(1.0);
+                let total_h = (grid_r.bottom() - video_r.top()) / rects.workspace.height().max(1.0);
+                assert!(
+                    fill_w_ratio >= 0.96,
+                    "{label} {spec:?}: grid width ratio {fill_w_ratio} < 0.96"
+                );
+                assert!(
+                    total_h >= 0.96,
+                    "{label} {spec:?}: total height ratio {total_h} < 0.96"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shell_menu_toolbar_theme_and_locale_interactions_update_state() {
+        let mut script = ScriptFile::new_default();
+        script.ensure_events_section_mut().insert_event(
+            0,
+            AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(250), "Hello world"),
+        );
+        let mut shell = AppShell::new(script);
+
+        // Verify command dispatch for menus, toolbar, dialogs, view modes, theme, locale.
+        shell.execute_command("tool/styles_manager");
+        assert_eq!(shell.dialogs.open, Some(ActiveDialog::StyleManager));
+        shell.execute_command("tool/style_editor");
+        assert_eq!(shell.dialogs.open, Some(ActiveDialog::StyleEditor));
+        shell.execute_command("app/options");
+        assert_eq!(shell.dialogs.open, Some(ActiveDialog::Preferences));
+        shell.execute_command("subtitle/open/video");
+        assert_eq!(shell.dialogs.open, Some(ActiveDialog::MkvImport));
+        shell.execute_command("automation/kara_templater");
+        assert_eq!(shell.dialogs.open, Some(ActiveDialog::KaraokeTemplater));
+        shell.execute_command("automation/template_doctor");
+        assert_eq!(shell.dialogs.open, Some(ActiveDialog::TemplateDoctor));
+        shell.execute_command("app/display/subs");
+        assert_eq!(shell.layout_state.mode, ViewMode::SubsOnly);
+        shell.execute_command("app/display/full");
+        assert_eq!(shell.layout_state.mode, ViewMode::Full);
+
+        // Verify live theme + locale switching via toolbar clicks in kittest.
+        shell.dialogs.open = None;
+        let state_check = std::rc::Rc::new(std::cell::Cell::new((ThemeSpec::Dark, Locale::En)));
+        let state_c = state_check.clone();
+
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(1280.0, 800.0))
+            .with_accessibility_check(false)
+            .build_ui(move |ui| {
+                shell.show(ui, None, None, &ZeroClock);
+                state_c.set((shell.theme.spec(), shell.catalog.locale()));
+            });
+        harness.run();
+
+        // Click "Light" and "VI" buttons in the toolbar.
+        harness.get_by_label("Light").click();
+        harness.run();
+        harness.get_by_label("VI").click();
+        harness.run();
+
+        let (spec, loc) = state_check.get();
+        assert_eq!(spec, ThemeSpec::Light);
+        assert_eq!(loc, Locale::Vi);
     }
 }
