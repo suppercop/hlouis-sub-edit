@@ -26,14 +26,36 @@ impl IndexStore {
         Self { dir, max_bytes }
     }
 
-    /// `%LOCALAPPDATA%\hlouis-sub-edit\bsindex` with the default limit.
+    /// `%LOCALAPPDATA%\hlouis-sub-edit\bsindex` (with `%USERPROFILE%\AppData\Local` fallback)
+    /// with the default limit.
     #[must_use]
     pub fn default_location() -> Option<Self> {
-        let base = std::env::var_os("LOCALAPPDATA")?;
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|p| PathBuf::from(p).join("AppData").join("Local"))
+            })?;
         Some(Self::new(
-            PathBuf::from(base).join("hlouis-sub-edit").join("bsindex"),
+            base.join("hlouis-sub-edit").join("bsindex"),
             Self::DEFAULT_MAX_BYTES,
         ))
+    }
+
+    /// Configured maximum cache size in bytes.
+    #[must_use]
+    pub const fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// Updates the maximum cache size in bytes.
+    pub fn set_max_bytes(&mut self, max_bytes: u64) {
+        self.max_bytes = max_bytes;
+    }
+
+    /// Current total size in bytes of `.bsindex` files in this store.
+    pub fn total_bytes(&self) -> io::Result<u64> {
+        Ok(self.list()?.iter().map(|(_, len, _)| *len).sum())
     }
 
     #[must_use]
@@ -101,9 +123,28 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Deletes all cached `.bsindex` files belonging to `video` (e.g., before rebuilding after
+    /// detecting corruption). Returns the number of files deleted.
+    pub fn remove_entries_for(&self, video: &Path) -> io::Result<usize> {
+        let mut removed = 0;
+        for p in self.entries_for(video)? {
+            if fs::remove_file(&p).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Deletes least recently used entries until the store fits in its limit.
     /// Returns the number of bytes removed.
     pub fn enforce_limit(&self) -> io::Result<u64> {
+        self.enforce_limit_preserving(None)
+    }
+
+    /// Deletes least recently used entries until the store fits in `max_bytes`, keeping `keep`'s
+    /// entries out of eviction when non-`None`. Returns the number of bytes removed.
+    pub fn enforce_limit_preserving(&self, keep: Option<&Path>) -> io::Result<u64> {
+        let keep_key = keep.and_then(|v| Self::key_for(v).ok());
         let mut entries = self.list()?;
         let mut total: u64 = entries.iter().map(|(_, len, _)| len).sum();
         entries.sort_by_key(|(_, _, t)| *t);
@@ -112,8 +153,16 @@ impl IndexStore {
             if total <= self.max_bytes {
                 break;
             }
+            let protected = keep_key.as_deref().is_some_and(|key| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(key))
+            });
+            if protected {
+                continue;
+            }
             if fs::remove_file(&p).is_ok() {
-                total -= len;
+                total = total.saturating_sub(len);
                 removed += len;
             }
         }
@@ -182,16 +231,86 @@ mod tests {
     }
 
     #[test]
-    fn key_changes_with_content_and_is_stable() {
+    fn key_changes_with_path_size_mtime_and_header_bytes() {
         let d = tmp("key");
         let f = d.join("a.mkv");
         fs::write(&f, vec![1u8; 200_000]).unwrap();
         let k1 = IndexStore::key_for(&f).unwrap();
         assert_eq!(k1, IndexStore::key_for(&f).unwrap());
+
+        // 1. Header/content byte change (with restored mtime so content hash itself is tested).
+        let orig_mtime = fs::metadata(&f).unwrap().modified().unwrap();
         let mut data = vec![1u8; 200_000];
-        data[100_000] = 2;
-        fs::write(&f, data).unwrap();
-        assert_ne!(k1, IndexStore::key_for(&f).unwrap());
+        data[16] = 2;
+        fs::write(&f, &data).unwrap();
+        File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(orig_mtime)
+            .unwrap();
+        let k_hdr = IndexStore::key_for(&f).unwrap();
+        assert_ne!(k1, k_hdr);
+
+        // 2. Mtime change alone.
+        File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(orig_mtime - std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_ne!(k_hdr, IndexStore::key_for(&f).unwrap());
+
+        // 3. Size change.
+        data.push(1);
+        fs::write(&f, &data).unwrap();
+        let k_size = IndexStore::key_for(&f).unwrap();
+        assert_ne!(k_hdr, k_size);
+
+        // 4. Path change (identical bytes & mtime at sibling path).
+        let f2 = d.join("b.mkv");
+        fs::write(&f2, &data).unwrap();
+        let m2 = fs::metadata(&f).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&f2)
+            .unwrap()
+            .set_modified(m2)
+            .unwrap();
+        assert_ne!(k_size, IndexStore::key_for(&f2).unwrap());
+    }
+
+    #[test]
+    fn lru_cleanup_preserves_active_video_when_requested() {
+        let d = tmp("lru_preserve");
+        let store = IndexStore::new(d.clone(), 150);
+        let active = d.join("active.mkv");
+        fs::write(&active, vec![7u8; 1024]).unwrap();
+        let active_key = IndexStore::key_for(&active).unwrap();
+        let active_idx = d.join(format!("{active_key}.0.bsindex"));
+        let other_idx = d.join("other.0.bsindex");
+        fs::write(&active_idx, vec![0u8; 100]).unwrap();
+        fs::write(&other_idx, vec![0u8; 100]).unwrap();
+        let now = SystemTime::now();
+        File::options()
+            .write(true)
+            .open(&active_idx)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(500))
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&other_idx)
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
+
+        // Even though active_idx is older, preserving `active` evicts `other` instead.
+        assert_eq!(store.enforce_limit_preserving(Some(&active)).unwrap(), 100);
+        assert!(active_idx.exists());
+        assert!(!other_idx.exists());
+        assert!(store.remove_entries_for(&active).unwrap() >= 1);
+        assert!(!active_idx.exists());
     }
 
     #[test]

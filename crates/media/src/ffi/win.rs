@@ -1,6 +1,9 @@
 //! Small Win32 helpers: thread priority for background indexing, process CPU time for benches.
 
 use windows_sys::Win32::Foundation::FILETIME;
+use windows_sys::Win32::System::ProcessStatus::{
+    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, GetProcessTimes, SetThreadPriority,
     THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_IDLE,
@@ -55,4 +58,22 @@ pub fn process_cpu_time() -> std::time::Duration {
         return std::time::Duration::ZERO;
     }
     std::time::Duration::from_nanos((filetime_100ns(k) + filetime_100ns(u)) * 100)
+}
+
+/// Current private commit bytes and OS-reported peak commit bytes for this process.
+#[must_use]
+pub fn process_memory_bytes() -> Option<(u64, u64)> {
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+    let cb = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>()).ok()?;
+    let ptr: *mut PROCESS_MEMORY_COUNTERS = (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>();
+    // SAFETY: `GetCurrentProcess` returns a valid pseudo-handle and `counters` is a live
+    // `PROCESS_MEMORY_COUNTERS_EX` struct whose `cb` size matches.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), ptr, cb) };
+    if ok == 0 {
+        return None;
+    }
+    Some((
+        u64::try_from(counters.PrivateUsage).unwrap_or(0),
+        u64::try_from(counters.PeakPagefileUsage).unwrap_or(0),
+    ))
 }

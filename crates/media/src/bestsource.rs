@@ -1,6 +1,6 @@
 //! `BestSource` video/audio providers (safe layer over `ffi::bestsource`).
 
-use crate::ffi::bestsource::{self as raw, OpenArgs, RawBsAudio, RawBsVideo};
+use crate::ffi::bestsource::{self as raw, OpenArgs, PartialIndex, RawBsAudio, RawBsVideo};
 use crate::provider::{AudioInfo, AudioProvider, ProviderKind, VideoProvider};
 use crate::{pts_to_ms_rounded, MediaError, VideoInfo};
 use std::path::{Path, PathBuf};
@@ -100,6 +100,18 @@ impl BestSourceProvider {
         path: &Path,
         opts: &BestSourceOptions,
         cancel: &AtomicBool,
+        on_progress: impl FnMut(i64, i64),
+    ) -> Result<Self, MediaError> {
+        Self::open_with_partial_and_progress(path, opts, None, cancel, on_progress)
+    }
+
+    /// Indexes (or loads the cached index of) the selected video track while streaming frame PTS
+    /// and keyframe flags into `partial` as frames are indexed.
+    pub fn open_with_partial_and_progress(
+        path: &Path,
+        opts: &BestSourceOptions,
+        partial: Option<&PartialIndex>,
+        cancel: &AtomicBool,
         mut on_progress: impl FnMut(i64, i64),
     ) -> Result<Self, MediaError> {
         let (cache_mode, cache_path) = opts.cache.mode_and_path();
@@ -110,7 +122,31 @@ impl BestSourceProvider {
             cache_mode,
             cache_path,
         };
-        let mut raw = RawBsVideo::open(&args, cancel, &mut on_progress)?;
+        let raw = RawBsVideo::open(&args, partial, cancel, &mut on_progress)?;
+        Self::from_raw(raw)
+    }
+
+    /// Opens the selected video track strictly from an existing valid on-disk index cache.
+    /// Fails immediately without indexing if the cache is missing, stale, or corrupted.
+    pub fn open_cached_only(path: &Path, opts: &BestSourceOptions) -> Result<Self, MediaError> {
+        let (cache_mode, cache_path) = opts.cache.mode_and_path();
+        let args = OpenArgs {
+            path,
+            track: opts.track,
+            threads: opts.threads,
+            cache_mode,
+            cache_path,
+        };
+        let raw = RawBsVideo::open_cached(&args)?;
+        Self::from_raw(raw)
+    }
+
+    /// Caps `BestSource`'s internal decoded-frame cache and open decoder instance count.
+    pub fn set_limits(&mut self, max_cache_bytes: usize, max_decoders: i32) {
+        self.raw.set_limits(max_cache_bytes, max_decoders);
+    }
+
+    fn from_raw(mut raw: RawBsVideo) -> Result<Self, MediaError> {
         let flag = Arc::new(AtomicBool::new(false));
         raw.set_cancel(Arc::clone(&flag));
         let p = raw.props();
@@ -289,7 +325,25 @@ impl BestSourceAudio {
             cache_mode,
             cache_path,
         };
-        let mut raw = RawBsAudio::open(&args, cancel, &mut on_progress)?;
+        let raw = RawBsAudio::open(&args, cancel, &mut on_progress)?;
+        Self::from_raw(raw)
+    }
+
+    /// Opens the selected audio track strictly from an existing valid on-disk index cache.
+    pub fn open_cached_only(path: &Path, opts: &BestSourceOptions) -> Result<Self, MediaError> {
+        let (cache_mode, cache_path) = opts.cache.mode_and_path();
+        let args = OpenArgs {
+            path,
+            track: opts.track,
+            threads: opts.threads,
+            cache_mode,
+            cache_path,
+        };
+        let raw = RawBsAudio::open_cached(&args)?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(mut raw: RawBsAudio) -> Result<Self, MediaError> {
         let flag = Arc::new(AtomicBool::new(false));
         raw.set_cancel(Arc::clone(&flag));
         let p = raw.props();

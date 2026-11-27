@@ -1,24 +1,39 @@
 //! Index-free video for an instant first frame (plain libavformat/libavcodec through
-//! `BestSource`'s decoder). Frame numbers assume constant frame rate, so seeks are approximate
-//! and there is no keyframe list; [`VideoProvider::is_frame_exact`] is `false`.
+//! `BestSource`'s decoder), with progressive frame-exact seeking as the shared partial index
+//! grows in the background.
 
-use crate::ffi::bestsource::RawBsQuick;
+use crate::ffi::bestsource::{PartialIndex, RawBsQuick};
 use crate::provider::{ProviderKind, VideoProvider};
 use crate::{pts_to_ms_rounded, MediaError, VideoInfo};
 use std::path::Path;
 
-/// Approximate, index-free video provider.
+/// Approximate, index-free video provider that upgrades frame-by-frame to exact seeking as a
+/// shared [`PartialIndex`] fills.
 pub struct QuickVideo {
     raw: RawBsQuick,
     info: VideoInfo,
     tb_num_ms: i64,
     tb_den: i64,
+    partial: Option<PartialIndex>,
 }
 
 impl QuickVideo {
     /// Opens `path` and decodes frame 0 (no indexing). `track < 0` = n-th video track.
     pub fn open(path: &Path, track: i32, threads: i32) -> Result<Self, MediaError> {
-        let raw = RawBsQuick::open(path, track, threads)?;
+        Self::open_with_partial(path, track, threads, None)
+    }
+
+    /// Opens `path` attached to a shared [`PartialIndex`] for progressive exact seeking.
+    pub fn open_with_partial(
+        path: &Path,
+        track: i32,
+        threads: i32,
+        partial: Option<PartialIndex>,
+    ) -> Result<Self, MediaError> {
+        let mut raw = RawBsQuick::open(path, track, threads)?;
+        if let Some(p) = partial.as_ref() {
+            raw.set_partial_index(Some(p));
+        }
         let p = raw.props();
         let width = u32::try_from(p.width).map_err(|_| MediaError::InvalidMetadata)?;
         let height = u32::try_from(p.height).map_err(|_| MediaError::InvalidMetadata)?;
@@ -71,7 +86,20 @@ impl QuickVideo {
             },
             tb_num_ms,
             tb_den,
+            partial,
         })
+    }
+
+    /// Replaces or detaches the shared [`PartialIndex`].
+    pub fn set_partial_index(&mut self, partial: Option<PartialIndex>) {
+        self.raw.set_partial_index(partial.as_ref());
+        self.partial = partial;
+    }
+
+    /// Number of frames indexed so far in the attached partial index (0 when detached).
+    #[must_use]
+    pub fn indexed_frames(&self) -> usize {
+        self.partial.as_ref().map_or(0, PartialIndex::len)
     }
 }
 
@@ -82,6 +110,14 @@ impl VideoProvider for QuickVideo {
 
     fn is_frame_exact(&self) -> bool {
         false
+    }
+
+    fn is_frame_exact_at(&self, frame_index: usize) -> bool {
+        frame_index < self.info.num_frames
+            && self
+                .partial
+                .as_ref()
+                .is_some_and(|p| p.is_exact_at(frame_index))
     }
 
     fn info(&self) -> &VideoInfo {
@@ -109,5 +145,19 @@ impl VideoProvider for QuickVideo {
             .raw
             .frame_rgba(n, out_rgba, self.info.width, self.info.height)?;
         Ok(pts_to_ms_rounded(pts, self.tb_num_ms, self.tb_den))
+    }
+
+    fn next_keyframe(&self, current: usize) -> Option<usize> {
+        self.partial
+            .as_ref()
+            .and_then(|p| p.next_keyframe(current))
+            .filter(|&kf| kf < self.info.num_frames)
+    }
+
+    fn prev_keyframe(&self, current: usize) -> Option<usize> {
+        self.partial
+            .as_ref()
+            .and_then(|p| p.prev_keyframe(current))
+            .filter(|&kf| kf < self.info.num_frames)
     }
 }

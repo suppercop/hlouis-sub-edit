@@ -9,6 +9,7 @@ use thiserror::Error;
 
 mod bestsource;
 mod index_store;
+mod preindex;
 mod provider;
 mod quick;
 
@@ -16,11 +17,16 @@ pub use bestsource::{
     track_types, BestSourceAudio, BestSourceOptions, BestSourceProvider, IndexCache, PlanarFormat,
     PlanarFrame,
 };
-pub use ffi::win::{process_cpu_time, set_current_thread_priority, ThreadPriority};
+pub use ffi::bestsource::PartialIndex;
+pub use ffi::win::{
+    process_cpu_time, process_memory_bytes, set_current_thread_priority, ThreadPriority,
+};
 pub use index_store::IndexStore;
+pub use preindex::{list_sibling_videos, PreindexHandle, PreindexProgress};
 pub use provider::{
-    background_decode_threads, open_video, AudioInfo, AudioProvider, FastOpen, HybridOptions,
-    HybridVideo, IndexProgress, ProviderKind, UpgradeStatus, VideoProvider,
+    background_decode_threads, open_video, AudioInfo, AudioProvider, AudioUpgradeStatus, FastOpen,
+    HybridOptions, HybridVideo, IndexPhase, IndexProgress, ProviderKind, UpgradeStatus,
+    VideoProvider,
 };
 pub use quick::QuickVideo;
 

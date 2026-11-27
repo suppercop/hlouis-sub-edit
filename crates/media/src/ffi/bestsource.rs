@@ -77,6 +77,83 @@ pub(crate) struct OpenArgs<'a> {
     pub cache_path: Option<&'a Path>,
 }
 
+struct RawPartialIndex(NonNull<sys::bs_partial_index>);
+
+// SAFETY: the C++ `bs_partial_index` guards all mutable state (`Pts` and `Keyframes`) with an
+// internal `std::mutex`, so sharing and querying across threads is data-race free.
+unsafe impl Send for RawPartialIndex {}
+// SAFETY: same internal mutex protection for shared `&` queries.
+unsafe impl Sync for RawPartialIndex {}
+
+impl Drop for RawPartialIndex {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was allocated by `bs_partial_index_create` and is uniquely owned by the
+        // `Arc<RawPartialIndex>`.
+        unsafe { sys::bs_partial_index_free(self.0.as_ptr()) };
+    }
+}
+
+/// Thread-safe handle to a progressively populated video frame index.
+#[derive(Clone)]
+pub struct PartialIndex(Arc<RawPartialIndex>);
+
+impl PartialIndex {
+    /// Creates an empty shared partial index.
+    pub fn new() -> Result<Self, MediaError> {
+        // SAFETY: no preconditions.
+        let ptr = unsafe { sys::bs_partial_index_create() };
+        let nn = NonNull::new(ptr)
+            .ok_or_else(|| MediaError::BestSource("failed to allocate partial index".to_owned()))?;
+        Ok(Self(Arc::new(RawPartialIndex(nn))))
+    }
+
+    /// Number of frames indexed so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        // SAFETY: `self.0` is valid for the lifetime of `Arc`.
+        let n = unsafe { sys::bs_partial_index_len(self.0 .0.as_ptr()) };
+        usize::try_from(n.max(0)).unwrap_or(0)
+    }
+
+    /// Whether no frames have been indexed yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether frame `frame_index` is already covered by the partial index with a valid PTS.
+    #[must_use]
+    pub fn is_exact_at(&self, frame_index: usize) -> bool {
+        let Ok(n) = i64::try_from(frame_index) else {
+            return false;
+        };
+        // SAFETY: `self.0` is valid.
+        unsafe { sys::bs_partial_index_is_exact_at(self.0 .0.as_ptr(), n) != 0 }
+    }
+
+    /// Next indexed keyframe strictly after `current`, if discovered so far.
+    #[must_use]
+    pub fn next_keyframe(&self, current: usize) -> Option<usize> {
+        let cur = i64::try_from(current).ok()?;
+        // SAFETY: `self.0` is valid.
+        let kf = unsafe { sys::bs_partial_index_next_keyframe(self.0 .0.as_ptr(), cur) };
+        usize::try_from(kf).ok()
+    }
+
+    /// Previous indexed keyframe strictly before `current`, if discovered so far.
+    #[must_use]
+    pub fn prev_keyframe(&self, current: usize) -> Option<usize> {
+        let cur = i64::try_from(current).ok()?;
+        // SAFETY: `self.0` is valid.
+        let kf = unsafe { sys::bs_partial_index_prev_keyframe(self.0 .0.as_ptr(), cur) };
+        usize::try_from(kf).ok()
+    }
+
+    pub(crate) fn as_ptr(&self) -> *mut sys::bs_partial_index {
+        self.0 .0.as_ptr()
+    }
+}
+
 pub(crate) struct RawBsVideo {
     handle: NonNull<sys::bs_video>,
     cancel: Option<Arc<AtomicBool>>,
@@ -106,6 +183,7 @@ impl RawBsVideo {
 
     pub(crate) fn open(
         args: &OpenArgs<'_>,
+        partial: Option<&PartialIndex>,
         cancel: &AtomicBool,
         on_progress: &mut dyn FnMut(i64, i64),
     ) -> Result<Self, MediaError> {
@@ -117,15 +195,18 @@ impl RawBsVideo {
         };
         let mut out: *mut sys::bs_video = std::ptr::null_mut();
         let mut err = [0 as c_char; ERR_LEN];
+        let partial_ptr = partial.map_or(std::ptr::null_mut(), PartialIndex::as_ptr);
         // SAFETY: all pointers are valid for the duration of the call; `state` outlives it and
-        // is only used synchronously by the progress trampoline.
+        // is only used synchronously by the progress trampoline, and `partial_ptr` (when non-null)
+        // stays alive for the call and C++ stores only a shared copy of its `PartialIndexData`.
         let rc = unsafe {
-            sys::bs_video_open(
+            sys::bs_video_open_with_partial(
                 path.as_ptr(),
                 args.track,
                 args.threads,
                 args.cache_mode,
                 cache.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                partial_ptr,
                 Some(progress_trampoline),
                 (&raw mut state).cast::<c_void>(),
                 &raw mut out,
@@ -149,6 +230,40 @@ impl RawBsVideo {
             handle,
             cancel: None,
         })
+    }
+
+    pub(crate) fn open_cached(args: &OpenArgs<'_>) -> Result<Self, MediaError> {
+        let path = c_path(args.path)?;
+        let cache = args.cache_path.map(c_path).transpose()?;
+        let mut out: *mut sys::bs_video = std::ptr::null_mut();
+        let mut err = [0 as c_char; ERR_LEN];
+        // SAFETY: all pointers are valid for the duration of the call.
+        let rc = unsafe {
+            sys::bs_video_open_cached(
+                path.as_ptr(),
+                args.track,
+                args.threads,
+                args.cache_mode,
+                cache.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                &raw mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        map_rc(rc, &err)?;
+        let handle =
+            NonNull::new(out).ok_or_else(|| MediaError::BestSource("null handle".to_owned()))?;
+        Ok(Self {
+            handle,
+            cancel: None,
+        })
+    }
+
+    pub(crate) fn set_limits(&mut self, max_cache_bytes: usize, max_decoders: i32) {
+        // SAFETY: `self.handle` is valid.
+        unsafe {
+            sys::bs_video_set_limits(self.handle.as_ptr(), max_cache_bytes, max_decoders);
+        }
     }
 
     /// Lets `flag` abandon in-flight seeks/decodes on this handle.
@@ -323,6 +438,33 @@ impl RawBsAudio {
         })
     }
 
+    pub(crate) fn open_cached(args: &OpenArgs<'_>) -> Result<Self, MediaError> {
+        let path = c_path(args.path)?;
+        let cache = args.cache_path.map(c_path).transpose()?;
+        let mut out: *mut sys::bs_audio = std::ptr::null_mut();
+        let mut err = [0 as c_char; ERR_LEN];
+        // SAFETY: all pointers are valid for the duration of the call.
+        let rc = unsafe {
+            sys::bs_audio_open_cached(
+                path.as_ptr(),
+                args.track,
+                args.threads,
+                args.cache_mode,
+                cache.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                &raw mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        map_rc(rc, &err)?;
+        let handle =
+            NonNull::new(out).ok_or_else(|| MediaError::BestSource("null handle".to_owned()))?;
+        Ok(Self {
+            handle,
+            cancel: None,
+        })
+    }
+
     pub(crate) fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
         let ptr = Arc::as_ptr(&flag).cast_mut().cast::<c_void>();
         // SAFETY: as in `RawBsVideo::set_cancel`.
@@ -454,6 +596,12 @@ impl RawBsQuick {
         let handle =
             NonNull::new(out).ok_or_else(|| MediaError::BestSource("null handle".to_owned()))?;
         Ok(Self { handle })
+    }
+
+    pub(crate) fn set_partial_index(&mut self, partial: Option<&PartialIndex>) {
+        let ptr = partial.map_or(std::ptr::null_mut(), PartialIndex::as_ptr);
+        // SAFETY: `self.handle` is valid; C++ copies the shared_ptr when `ptr` is non-null.
+        unsafe { sys::bs_quick_set_partial_index(self.handle.as_ptr(), ptr) };
     }
 
     pub(crate) fn props(&self) -> sys::bs_quick_props {
