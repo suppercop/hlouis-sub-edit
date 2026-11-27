@@ -18,6 +18,9 @@ Full plan with rationale is kept by the project owner. This file is the scope ag
 - **UI:** context hotkeys, toolbar/menu, layouts, preferences, Light/Dark/System theme, English + Vietnamese, High-DPI, log window, version check, scroll-modifier options.
 - **Providers from arch1t3cht fork:** BestSource, VapourSynth.
 
+## UI direction (owner preference)
+The owner prefers the **classic Aegisub 3.2.2 look and layout** over the 3.4/3.5 UI, and has tuned their own Aegisub 3.5.1 to look like 3.2.2. Use that as the reference: same panel arrangement (video top-left, audio top-right, edit box under audio, grid at the bottom), compact toolbar, classic grid/edit-box density and colours as the Light theme default. New features (pan/zoom, new audio marker, dark theme) are added without changing that layout. The owner's Aegisub config and hotkeys (%APPDATA%\Aegisub\config.json, hotkey.json) are the reference for default layout options and hotkeys; import them where they map.
+
 ## Out of scope
 SSA, TTXT, MicroDVD, plain text, EBU STL, Encore, Transtation; open-with-charset; recent files; Export As filters; attachments manager; VSFilter; spell check, thesaurus, translation assistant; Kanji timer; MoonScript, automation manager, macro menu, Lua export filters, `aegisub.*` macro API, DependencyControl; font copy/zip; other UI languages; line folding; perspective tool; Linux/macOS.
 
