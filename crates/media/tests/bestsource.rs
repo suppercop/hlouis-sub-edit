@@ -2,8 +2,9 @@
 //! `ffmpeg.exe` (`.native/tools`, or `HLOUIS_FFMPEG`). No media is committed.
 
 use media::{
-    AudioProvider, BestSourceAudio, BestSourceOptions, BestSourceProvider, FfmsVideo, HybridVideo,
-    IndexCache, MediaError, PlanarFrame, ProviderKind, UpgradeStatus, VideoProvider,
+    AudioProvider, BestSourceAudio, BestSourceOptions, BestSourceProvider, FastOpen, FfmsVideo,
+    HybridOptions, HybridVideo, IndexCache, IndexStore, MediaError, PlanarFrame, ProviderKind,
+    QuickVideo, ThreadPriority, UpgradeStatus, VideoProvider,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -382,23 +383,81 @@ fn missing_file_is_a_clean_error() {
     }
 }
 
+fn hybrid_opts(fast: FastOpen, store: Option<IndexStore>) -> HybridOptions {
+    HybridOptions {
+        fast,
+        bestsource: no_cache(),
+        store,
+        priority: ThreadPriority::BelowNormal,
+    }
+}
+
 #[test]
-fn hybrid_starts_on_ffms2_then_switches_to_bestsource() {
+fn hybrid_starts_fast_then_switches_to_bestsource() {
     let Some(clip) = cfr_clip() else { return };
+    for fast in [FastOpen::Quick, FastOpen::Ffms2] {
+        let cancel = AtomicBool::new(false);
+        let mut h = HybridVideo::open(clip, &hybrid_opts(fast, None), &cancel, |_, _| {})
+            .expect("hybrid open");
+        let mut buf = Vec::new();
+        if h.is_indexing() {
+            assert!(h.index_progress().is_some());
+            h.decode_frame_into(10, &mut buf)
+                .expect("decode on fast path");
+        }
+        match h.wait_upgrade() {
+            UpgradeStatus::Switched | UpgradeStatus::Done => {}
+            other => panic!("upgrade failed: {other:?}"),
+        }
+        assert_eq!(h.kind(), ProviderKind::BestSource);
+        assert!(h.is_frame_exact());
+        assert!(h.index_progress().is_none());
+        assert_eq!(h.info().num_frames, CFR_FRAMES);
+        h.decode_frame_into(10, &mut buf)
+            .expect("decode on bestsource");
+    }
+}
+
+#[test]
+fn hybrid_with_store_opens_exact_directly_the_second_time() {
+    let Some(clip) = cfr_clip() else { return };
+    let store = IndexStore::new(work_dir().join("store"), IndexStore::DEFAULT_MAX_BYTES);
     let cancel = AtomicBool::new(false);
-    let mut h = HybridVideo::open(clip, &no_cache(), &cancel, |_, _| {}).expect("hybrid open");
-    let mut buf = Vec::new();
-    if h.kind() == ProviderKind::Ffms2 {
-        h.decode_frame_into(10, &mut buf).expect("decode on ffms2");
+    let opts = hybrid_opts(FastOpen::Quick, Some(store.clone()));
+    let mut h = HybridVideo::open(clip, &opts, &cancel, |_, _| {}).expect("first open");
+    assert_eq!(h.kind(), ProviderKind::Quick);
+    assert!(!h.is_frame_exact());
+    assert!(matches!(h.wait_upgrade(), UpgradeStatus::Switched));
+    drop(h);
+    assert!(store.has_index(clip));
+    let h2 = HybridVideo::open(clip, &opts, &cancel, |_, _| {}).expect("cached open");
+    assert_eq!(h2.kind(), ProviderKind::BestSource);
+    assert!(!h2.is_indexing());
+}
+
+#[test]
+fn quick_open_decodes_frames_matching_exact_decode_on_cfr() {
+    let Some(clip) = cfr_clip() else { return };
+    let mut q = QuickVideo::open(clip, -1, 0).expect("quick open");
+    assert!(!q.is_frame_exact());
+    assert_eq!((q.info().width, q.info().height), (320, 240));
+    assert!(
+        q.info().num_frames.abs_diff(CFR_FRAMES) <= 1,
+        "{} frames, {} ms, fps {}/{}",
+        q.info().num_frames,
+        q.info().duration_ms,
+        q.info().fps_num,
+        q.info().fps_den
+    );
+    let mut bs = open_bs(clip);
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    // Sequential, forward skip, backward seek and long seek.
+    for n in [0, 1, 2, 30, 31, 200, 5, 120, 121, 239] {
+        let pts = q.decode_frame_into(n, &mut a).expect("quick decode");
+        bs.decode_frame_into(n, &mut b).expect("exact decode");
+        assert_eq!(pts, bs.info().frame_pts_ms[n], "frame {n} pts");
+        assert_eq!(checksum(&a), checksum(&b), "frame {n} pixels");
     }
-    match h.wait_upgrade() {
-        UpgradeStatus::Switched | UpgradeStatus::Done => {}
-        other => panic!("upgrade failed: {other:?}"),
-    }
-    assert_eq!(h.kind(), ProviderKind::BestSource);
-    assert_eq!(h.info().num_frames, CFR_FRAMES);
-    h.decode_frame_into(10, &mut buf)
-        .expect("decode on bestsource");
 }
 
 #[test]

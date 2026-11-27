@@ -8,15 +8,21 @@ use std::sync::atomic::AtomicBool;
 use thiserror::Error;
 
 mod bestsource;
+mod index_store;
 mod provider;
+mod quick;
 
 pub use bestsource::{
     track_types, BestSourceAudio, BestSourceOptions, BestSourceProvider, IndexCache, PlanarFormat,
     PlanarFrame,
 };
+pub use ffi::win::{process_cpu_time, set_current_thread_priority, ThreadPriority};
+pub use index_store::IndexStore;
 pub use provider::{
-    open_video, AudioInfo, AudioProvider, HybridVideo, ProviderKind, UpgradeStatus, VideoProvider,
+    background_decode_threads, open_video, AudioInfo, AudioProvider, FastOpen, HybridOptions,
+    HybridVideo, IndexProgress, ProviderKind, UpgradeStatus, VideoProvider,
 };
+pub use quick::QuickVideo;
 
 /// Errors returned by the FFMS2 video source.
 #[derive(Debug, Error)]
@@ -76,6 +82,7 @@ impl VideoInfo {
 
 mod ffi {
     pub(crate) mod bestsource;
+    pub(crate) mod win;
 
     use super::{MediaError, VideoInfo};
     use ffms2_sys::{

@@ -417,3 +417,84 @@ pub(crate) fn set_ffmpeg_log_level(level: i32) {
     // SAFETY: av_log_set_level is a plain global setter.
     unsafe { sys::bs_set_ffmpeg_log_level(level) };
 }
+
+/// Index-free decoder (instant first frame, approximate CFR frame numbering).
+pub(crate) struct RawBsQuick {
+    handle: NonNull<sys::bs_quick>,
+}
+
+// SAFETY: exclusively owned and only used through `&mut self` / `&self` by one thread at a time;
+// the underlying decoder has no thread affinity.
+unsafe impl Send for RawBsQuick {}
+
+impl Drop for RawBsQuick {
+    fn drop(&mut self) {
+        // SAFETY: `handle` came from `bs_quick_open` and is uniquely owned.
+        unsafe { sys::bs_quick_close(self.handle.as_ptr()) };
+    }
+}
+
+impl RawBsQuick {
+    pub(crate) fn open(path: &Path, track: i32, threads: i32) -> Result<Self, MediaError> {
+        let p = c_path(path)?;
+        let mut out: *mut sys::bs_quick = std::ptr::null_mut();
+        let mut err = [0 as c_char; ERR_LEN];
+        // SAFETY: all pointers are valid for the duration of the call.
+        let rc = unsafe {
+            sys::bs_quick_open(
+                p.as_ptr(),
+                track,
+                threads,
+                &raw mut out,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        map_rc(rc, &err)?;
+        let handle =
+            NonNull::new(out).ok_or_else(|| MediaError::BestSource("null handle".to_owned()))?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn props(&self) -> sys::bs_quick_props {
+        let mut p = sys::bs_quick_props::default();
+        // SAFETY: `handle` is valid and `p` is a valid out pointer.
+        unsafe { sys::bs_quick_get_props(self.handle.as_ptr(), &raw mut p) };
+        p
+    }
+
+    pub(crate) fn frame_rgba(
+        &mut self,
+        n: i64,
+        dst: &mut [u8],
+        width: u32,
+        height: u32,
+    ) -> Result<i64, MediaError> {
+        let stride = (width as usize) * 4;
+        if dst.len() < stride * height as usize {
+            return Err(MediaError::InvalidMetadata);
+        }
+        let w = c_int::try_from(width).map_err(|_| MediaError::InvalidMetadata)?;
+        let h = c_int::try_from(height).map_err(|_| MediaError::InvalidMetadata)?;
+        let s = isize::try_from(stride).map_err(|_| MediaError::InvalidMetadata)?;
+        let mut pts = 0i64;
+        let mut err = [0 as c_char; ERR_LEN];
+        // SAFETY: `dst` holds at least `stride * height` bytes (checked above), what sws_scale
+        // writes for a `width x height` RGBA image.
+        let rc = unsafe {
+            sys::bs_quick_get_frame_rgba(
+                self.handle.as_ptr(),
+                n,
+                dst.as_mut_ptr(),
+                s,
+                w,
+                h,
+                &raw mut pts,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        map_rc(rc, &err)?;
+        Ok(pts)
+    }
+}
