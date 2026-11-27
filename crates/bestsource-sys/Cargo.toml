@@ -1,0 +1,16 @@
+[package]
+name = "bestsource-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "bestsource"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1.2"
+
+[lib]
+bench = false
+
+[lints]
+workspace = true

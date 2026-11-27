@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, "phase-*", "perf-*"]
   pull_request:
-    branches: [main]
+    branches: [main, "phase-*"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,8 +44,10 @@ jobs:
             .native/bin
             .native/licenses
             .native/downloads
+            .native/src
+            .native/tools
             .native/ffms2-ffmpeg.stamp
-          key: native-v2-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'scripts/fetch-native.ps1') }}
+          key: native-v3-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'scripts/fetch-native.ps1') }}
 
       - name: Cache vcpkg binary archives
         if: steps.cache-native.outputs.cache-hit != 'true'
