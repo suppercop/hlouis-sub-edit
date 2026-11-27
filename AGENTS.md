@@ -13,6 +13,34 @@ Scope is fixed in `docs/PLAN.md`. Do not add features that are not in the plan; 
 - Themes: **Light, Dark, Follow Windows.** No hard-coded colors outside the theme module.
 - GUI: `egui`/`eframe` on the `wgpu` backend (may change to Qt only if Phase 0 says so).
 
+## Performance is a hard requirement
+
+The whole reason for this rewrite is speed and smoothness. A feature that works but misses its budget is **not done**.
+
+### Budgets (release build, Windows 11, mid-range laptop, 1080p display at any DPI)
+| Area | Budget |
+|---|---|
+| Cold start to usable window (no media) | < 800 ms |
+| Open 10,000-line ASS / save it | < 150 ms / < 100 ms |
+| Grid scroll, 50,000 lines | never below display refresh (60/90/120 Hz); no frame > 16 ms |
+| Keystroke to screen in edit box (incl. highlight + grid refresh) | < 16 ms |
+| Any undo/redo, find/replace on 10,000 lines | < 50 ms / < 200 ms |
+| Video 1080p H.264 & HEVC 10-bit playback with subs | 0 dropped frames over 60 s |
+| Video seek to any frame (indexed) | < 100 ms typical, < 250 ms worst |
+| Subtitle re-render after an edit (current frame) | < 16 ms |
+| Audio waveform for a 24-min episode | first view < 1 s, full < 3 s (background) |
+| Audio display scroll/zoom (waveform or spectrum) | at display refresh |
+| Memory, 1080p episode + 1,000-line script loaded | < 800 MB |
+
+### Rules
+1. Nothing slow on the UI thread: decoding, indexing, waveform/spectrum, file I/O, Lua, font scanning, SCXvid all run on worker threads with progress + cancel. The UI thread only lays out and paints.
+2. No per-frame allocations in hot paths (video, audio view, grid rows): reuse buffers/pools; prefer borrowing over cloning strings.
+3. Virtualise everything that scales with script length; never iterate all lines per frame.
+4. Cache expensive results (indexes, waveform peaks, layout jobs, libass tracks) and invalidate precisely.
+5. Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `opt-level = 3`. Target baseline x86-64-v2 (no `target-cpu=native` in shipped builds).
+6. Every crate with hot code has `criterion` benches; CI runs them and **fails on a >10% regression** against `main`.
+7. Every phase report includes a performance table against these budgets **and a side-by-side with Aegisub 3.5.1** on the same machine and files. Missing a budget = open issue that blocks acceptance unless the owner waives it.
+
 ## Repository layout (Cargo workspace)
 
 ```
