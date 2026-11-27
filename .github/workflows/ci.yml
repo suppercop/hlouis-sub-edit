@@ -89,6 +89,7 @@ jobs:
           Copy-Item -Force target/release/hlouis-sub-edit.exe dist/
           Copy-Item -Force .native/bin/*.dll dist/
           Copy-Item -Force .native/licenses/* dist/licenses/
+          Copy-Item -Force licenses/* dist/licenses/
           Copy-Item -Force LICENSE dist/
           Copy-Item -Force docs/THIRD_PARTY.md dist/
 
