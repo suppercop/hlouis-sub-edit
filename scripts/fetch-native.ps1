@@ -73,7 +73,19 @@ function Invoke-PinnedDownload {
     Write-Host "[native] Downloading $Url ..."
     & curl.exe -fL --retry 3 --retry-delay 2 -o $DestPath $Url
     if ($LASTEXITCODE -ne 0) {
-        throw "curl.exe failed downloading $Url (exit $LASTEXITCODE)"
+        if (($Url -match '^https://github\.com/([^/]+/[^/]+)/releases/download/([^/]+)/([^/?]+)$') -and (Get-Command gh.exe -ErrorAction SilentlyContinue)) {
+            $ghRepo = $Matches[1]
+            $ghTag = $Matches[2]
+            $ghAsset = $Matches[3]
+            Write-Host "[native] Direct download failed; trying gh release download ($ghRepo $ghTag/$ghAsset) ..."
+            & gh.exe release download $ghTag --repo $ghRepo --pattern $ghAsset --output $DestPath --clobber
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed downloading $Url via curl and gh release download (exit $LASTEXITCODE)"
+            }
+        }
+        else {
+            throw "curl.exe failed downloading $Url (exit $LASTEXITCODE)"
+        }
     }
 
     $actualHash = (Get-FileHash -Path $DestPath -Algorithm SHA256).Hash.ToUpperInvariant()
@@ -145,13 +157,13 @@ finally {
 
 $vcpkgTripletDir = Join-Path $VcpkgInstalledDir "x64-windows"
 
-# 2. Download pinned LGPL FFmpeg shared build (BtbN n8.1.3-41, LGPL-3.0)
-$ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-26-12-56/ffmpeg-n8.1.3-41-ga8029b6528-win64-lgpl-shared-8.1.zip"
-$ffmpegSha256 = "372016B1248544B4FFC290AE41C9C57E6441BD0DA32068EA18032A25B7B36E08"
-$ffmpegArchive = Join-Path $DownloadsDir "ffmpeg-n8.1.3-win64-lgpl-shared.zip"
+# 2. Download pinned LGPL FFmpeg shared build (n9.0.2-982-g836df4e858, LGPL-3.0) from native-deps-v1 release
+$ffmpegUrl = "https://github.com/suppercop/hlouis-sub-edit/releases/download/native-deps-v1/ffmpeg-n9.0.2-982-g836df4e858-win64-lgpl-shared-9.0.zip"
+$ffmpegSha256 = "F7BA27E7986A2D0835881E742A682DEC17896F6DC2CDCF9E596F043D2763D894"
+$ffmpegArchive = Join-Path $DownloadsDir "ffmpeg-n9.0.2-982-g836df4e858-win64-lgpl-shared-9.0.zip"
 Invoke-PinnedDownload -Url $ffmpegUrl -DestPath $ffmpegArchive -ExpectedSha256 $ffmpegSha256
 
-$ffmpegRoot = Join-Path $WorkDir "ffmpeg-n8.1.3-41-ga8029b6528-win64-lgpl-shared-8.1"
+$ffmpegRoot = Join-Path $WorkDir "ffmpeg-n9.0.2-982-g836df4e858-win64-lgpl-shared-9.0"
 if ($Force -or (-not (Test-Path (Join-Path $ffmpegRoot "lib\avcodec.lib")))) {
     Write-Host "[native] Extracting FFmpeg LGPL shared build ..."
     if (Test-Path $ffmpegRoot) {
@@ -184,7 +196,10 @@ if ($Force -or (-not (Test-Path (Join-Path $ffmsRoot "include\ffms.h")))) {
 # 4. Compile ffms2.dll + ffms2.lib (MIT) dynamically linked against LGPL FFmpeg + zlib
 $ffmsOutDll = Join-Path $BinOut "ffms2.dll"
 $ffmsOutLib = Join-Path $LibOut "ffms2.lib"
-if ($Force -or (-not (Test-Path $ffmsOutDll)) -or (-not (Test-Path $ffmsOutLib))) {
+$ffmsStampPath = Join-Path $OutputDir "ffms2-ffmpeg.stamp"
+$desiredStamp = "$ffmpegSha256|3af2ef2ae47bc30b64597c9e419e5b19c4bda7d8"
+$currentStamp = if (Test-Path $ffmsStampPath) { (Get-Content -Raw $ffmsStampPath).Trim() } else { "" }
+if ($Force -or (-not (Test-Path $ffmsOutDll)) -or (-not (Test-Path $ffmsOutLib)) -or ($currentStamp -ne $desiredStamp)) {
     Write-Host "[native] Compiling ffms2.dll with MSVC ..."
     $ffmsBuildDir = Join-Path $WorkDir "ffms2-obj"
     New-Item -ItemType Directory -Force -Path $ffmsBuildDir | Out-Null
@@ -265,6 +280,7 @@ if ($Force -or (-not (Test-Path $ffmsOutDll)) -or (-not (Test-Path $ffmsOutLib))
     if ($LASTEXITCODE -ne 0) {
         throw "link.exe failed linking ffms2.dll (exit $LASTEXITCODE)"
     }
+    Set-Content -Path $ffmsStampPath -Value $desiredStamp -Encoding ASCII
 }
 
 # 5. Stage headers, import libraries, runtime DLLs, and licenses into .native/
@@ -305,6 +321,7 @@ $ffmpegDlls = @(
     "swresample-*.dll"
 )
 foreach ($pattern in $ffmpegDlls) {
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $BinOut $pattern)
     Copy-Item -Force (Join-Path $ffmpegRoot "bin\$pattern") $BinOut
 }
 

@@ -44,7 +44,8 @@ jobs:
             .native/bin
             .native/licenses
             .native/downloads
-          key: native-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'scripts/fetch-native.ps1') }}
+            .native/ffms2-ffmpeg.stamp
+          key: native-v2-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'scripts/fetch-native.ps1') }}
 
       - name: Cache vcpkg binary archives
         if: steps.cache-native.outputs.cache-hit != 'true'
@@ -57,6 +58,8 @@ jobs:
 
       - name: Fetch and build native dependencies
         if: steps.cache-native.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           ./scripts/fetch-native.ps1
