@@ -53,6 +53,7 @@ members = [
     "crates/template-doctor",
     "crates/ui-theme",
     "crates/ui-grid",
+    "crates/ui-editbox",
 ]
 
 [workspace.package]
