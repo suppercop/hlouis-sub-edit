@@ -66,6 +66,7 @@ members = [
     "crates/recovery",
     "crates/version-check",
     "crates/perf-report",
+    "crates/golden-tools",
 ]
 
 [workspace.package]
