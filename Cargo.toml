@@ -5,6 +5,7 @@ members = [
     "crates/ass-core",
     "crates/ass-tools",
     "crates/mkv-subs",
+    "crates/keyframes",
     "crates/i18n",
     "crates/libass-sys",
     "crates/ffms2-sys",
