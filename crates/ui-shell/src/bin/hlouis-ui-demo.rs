@@ -355,7 +355,7 @@ fn generate_demo_script(line_count: usize) -> ScriptFile {
             _ => AssEvent::dialogue(
                 AssTime::from_cs(s),
                 AssTime::from_cs(s + 120),
-                r"{\i1}Sample subtitle dialogue line — Phụ đề tiếng Việt",
+                r"{\i1}Sample subtitle dialogue line\NPhụ đề tiếng Việt",
             ),
         };
         if i % 10 == 3 {
@@ -369,6 +369,8 @@ fn generate_demo_script(line_count: usize) -> ScriptFile {
 fn build_demo_shell(line_count: usize) -> AppShell {
     let script = generate_demo_script(line_count);
     let mut shell = AppShell::new(script);
+    "Demons' Crest - 05.ass".clone_into(&mut shell.script_name);
+    shell.set_theme(ThemeSpec::Light);
     if let Ok(tc) = Timecodes::from_cfr(24_000, 1_001) {
         let kfs: Vec<u32> = (0..1_000).map(|i| i * 24).collect();
         shell.attach_video(tc, 24_000, kfs, 320, 180);
@@ -405,13 +407,15 @@ impl eframe::App for DemoEframeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.shell
             .show(ui, Some(&self.vid), Some(&self.aud), &self.clock);
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Title(self.shell.window_title()));
     }
 }
 
 fn run_interactive_window() -> ExitCode {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("HLouis Sub Edit — UI Demo (Aegisub 3.2.2 Layout)")
+            .with_title("Demons' Crest - 05.ass - hlouis-sub-edit")
             .with_inner_size([1366.0, 820.0])
             .with_min_inner_size([900.0, 560.0]),
         ..Default::default()

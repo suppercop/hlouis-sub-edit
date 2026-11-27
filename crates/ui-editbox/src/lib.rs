@@ -1,22 +1,16 @@
 //! Subtitle Edit Box widget (`egui 0.37`) mirroring Aegisub 3.2.2 / 3.5.1 `src/subs_edit_box.cpp`.
 //!
-//! Layout matches classic Aegisub 3.2.2's 3-row header + syntax-highlighted multiline editor:
-//! - Row 1: `Comment` checkbox (separate from Layer), `Style` combo + `Edit` button, `Actor`,
-//!   `Effect`, and character / CPS counter.
-//! - Row 2: `Layer` spinner, `Start`, `End`, `Duration`, `Margin L`, `Margin R`, `Margin V`.
-//! - Row 3: Compact formatting buttons (`B`, `I`, `U`, `S`, `fn`), 4 colour swatches
-//!   (`1c`/`2c`/`3c`/`4c`), green commit checkmark, `Time` / `Frame` radio toggle, and
-//!   `Show Original` checkbox.
-//! - Row 4: Optional read-only Original line + syntax-highlighted multiline `TextEdit` filling
-//!   the remaining pane height.
-//!
-//! Features:
-//! - Syntax-highlighted multiline `TextEdit` via [`syntax_highlight::IncrementalTokenizer`] +
-//!   `egui::text::LayoutJob` using strictly [`theme::Palette`] token colours.
-//! - Per-row `id_salt(("edit_box", line_idx))` so cursor/undo state never bleeds between rows.
-//! - Native IME-friendly editing (no bare-key interception; safe for Vietnamese Telex/VNI & CJK).
-//! - Commits edits via [`document::DocumentController::amend_text`] (0 allocations while typing).
-//! - Keystroke -> re-layout of a 2,000-char heavy-typeset line: `< 0.5 ms`.
+//! Layout matches Aegisub 3.5.1 (3.2.2-style config):
+//! - Row 1: `Comment` checkbox, `Style` combo, `Edit` button, `Actor` editable combo, `Effect`
+//!   editable combo, and max line length number only (e.g. `23`).
+//! - Row 2: `Layer` spin box (up/down arrows, no `L:` prefix), `Start`, `End`, `Duration`, and
+//!   margins L / R / V as three plain number boxes (no `L:`/`R:`/`V:` prefixes).
+//! - Row 3: `B`, `I`, `U`, `S`, `fn`, four coloured `"AB"` buttons (primary, secondary, outline,
+//!   shadow colour pickers), green commit check `✓`, `Time` / `Frame` radios, and `Show Original`
+//!   checkbox (full label).
+//! - Row 4: White text area in Light mode (`palette.grid_bg` in Dark/Eye Comfort), proportional
+//!   UI font by default (optional monospace), `\N` shown in subtle grey inline, syntax-highlighted
+//!   multiline `TextEdit` filling the remaining pane height.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
@@ -28,7 +22,7 @@ use edit_box_ops::{
     toggle_bold, toggle_italic, toggle_strikeout, toggle_underline,
 };
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, Key, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
+use egui::{Align2, Color32, FontId, Key, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
 use i18n_catalog::Catalog;
 use keyframes::{TimeType, Timecodes};
 use std::fmt::Write as _;
@@ -38,12 +32,14 @@ use ui_theme::rgba;
 
 /// Persistent UI state for the subtitle edit box.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct EditBoxState {
     pub active_line: Option<usize>,
     pub text_buf: String,
     pub original_snapshot: String,
     pub show_original: bool,
     pub frame_mode: bool,
+    pub use_monospace: bool,
     pub shift_enter_mode: ShiftEnterMode,
     pub start_buf: String,
     pub end_buf: String,
@@ -57,7 +53,7 @@ pub struct EditBoxState {
     pub cps_error_threshold: u32,
     /// Set to `true` when the user clicks the `Edit` button beside the Style combo.
     pub edit_style_requested: bool,
-    /// 4 active ASS colour swatches (Primary, Secondary, Outline, Shadow) for quick insertion.
+    /// 4 active ASS colour swatches (Primary, Secondary, Outline, Shadow) rendered as `"AB"`.
     pub colour_swatches: [Color32; 4],
 }
 
@@ -69,6 +65,7 @@ impl Default for EditBoxState {
             original_snapshot: String::with_capacity(512),
             show_original: false,
             frame_mode: false,
+            use_monospace: false,
             shift_enter_mode: ShiftEnterMode::InsertHardNewline,
             start_buf: String::with_capacity(16),
             end_buf: String::with_capacity(16),
@@ -78,14 +75,14 @@ impl Default for EditBoxState {
             effect_buf: String::with_capacity(64),
             tokenizer: IncrementalTokenizer::new(),
             last_cursor_byte: 0,
-            cps_warn_threshold: 18,
-            cps_error_threshold: 25,
+            cps_warn_threshold: 20,
+            cps_error_threshold: 30,
             edit_style_requested: false,
             colour_swatches: [
-                Color32::from_rgb(255, 255, 255),
-                Color32::from_rgb(255, 210, 60),
-                Color32::from_rgb(20, 24, 32),
-                Color32::from_rgb(0, 0, 0),
+                Color32::from_rgb(20, 90, 210),
+                Color32::from_rgb(210, 120, 16),
+                Color32::from_rgb(40, 150, 60),
+                Color32::from_rgb(90, 60, 140),
             ],
         }
     }
@@ -123,10 +120,13 @@ impl EditBoxState {
     }
 }
 
-/// Maps a [`syntax_highlight::TokenKind`] to its [`theme::Palette`] colour (0 allocations).
+/// Maps a [`syntax_highlight::TokenKind`] to its [`theme::Palette`] colour (`\N` in subtle grey).
 #[inline]
 #[must_use]
 pub fn token_color(kind: TokenKind, palette: &Palette) -> Color32 {
+    if kind == TokenKind::Escape {
+        return Color32::from_rgb(138, 144, 154);
+    }
     let c = match kind {
         TokenKind::PlainText => palette.syntax_plain,
         TokenKind::OverrideBrace => palette.syntax_brace,
@@ -205,11 +205,14 @@ pub fn format_time_field(
     let _ = write!(out, "{hours}:{mins:02}:{secs:02}.{centis:02}");
 }
 
-/// Counts visible non-tag characters and CPS for `text` over `dur_cs` (0 allocations).
+/// Computes the maximum visible character length of any `\N`-separated line (Aegisub edit-box
+/// counter) plus CPS (0 allocations).
 #[inline]
 #[must_use]
 pub fn count_visible_chars_and_cps(text: &str, dur_cs: u32) -> (usize, u32) {
-    let mut chars = 0usize;
+    let mut total_chars = 0usize;
+    let mut cur_line_chars = 0usize;
+    let mut max_line_chars = 0usize;
     let mut in_tag = false;
     let mut prev_bs = false;
     for ch in text.chars() {
@@ -226,7 +229,13 @@ pub fn count_visible_chars_and_cps(text: &str, dur_cs: u32) -> (usize, u32) {
         }
         if prev_bs {
             prev_bs = false;
-            if matches!(ch, 'N' | 'n' | 'h') {
+            if matches!(ch, 'N' | 'n') {
+                max_line_chars = max_line_chars.max(cur_line_chars);
+                cur_line_chars = 0;
+                continue;
+            }
+            if ch == 'h' {
+                cur_line_chars += 1;
                 continue;
             }
         }
@@ -234,34 +243,157 @@ pub fn count_visible_chars_and_cps(text: &str, dur_cs: u32) -> (usize, u32) {
             prev_bs = true;
             continue;
         }
+        cur_line_chars += 1;
         if !ch.is_whitespace() {
-            chars += 1;
+            total_chars += 1;
         }
     }
+    max_line_chars = max_line_chars.max(cur_line_chars);
     #[allow(clippy::cast_possible_truncation)]
-    let c32 = chars as u32;
+    let c32 = total_chars as u32;
     let cps = c32
         .saturating_mul(100)
         .saturating_add(dur_cs / 2)
         .checked_div(dur_cs)
         .unwrap_or(0);
-    (chars, cps)
+    (max_line_chars, cps)
 }
 
-fn paint_colour_swatch(ui: &mut Ui, color: Color32, border: Color32, tooltip: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(15.0, 15.0), Sense::click());
+/// Paints a classic Aegisub `"AB"` colour-picker button (primary, secondary, outline, shadow).
+fn paint_ab_colour_button(ui: &mut Ui, fg_color: Color32, pal: &Palette, tooltip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(22.0, 18.0), Sense::click());
     let p = ui.painter();
-    p.rect_filled(rect.shrink(1.0), 1.5, color);
+    let bg = if resp.hovered() {
+        rgba(pal.hover)
+    } else {
+        rgba(pal.toolbar_bg)
+    };
+    p.rect_filled(rect, 2.0, bg);
     p.rect_stroke(
         rect,
-        1.5,
-        Stroke::new(1.0, border),
+        2.0,
+        Stroke::new(1.0, rgba(pal.border)),
         egui::StrokeKind::Inside,
+    );
+    p.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "AB",
+        FontId::proportional(10.5),
+        fg_color,
     );
     resp.on_hover_text(tooltip).clicked()
 }
 
-/// Renders the full Aegisub 3.2.2 Edit Box panel into `ui`.
+/// Paints a spin box with compact up/down arrows (no text prefix, matching Aegisub Layer).
+fn layer_spin_box(ui: &mut Ui, value: &mut i32, pal: &Palette) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        changed |= ui
+            .add(
+                egui::DragValue::new(value)
+                    .speed(1)
+                    .range(0..=9999)
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("Layer")
+            .changed();
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let (up_r, up_resp) = ui.allocate_exact_size(Vec2::new(11.0, 8.0), Sense::click());
+            let (dn_r, dn_resp) = ui.allocate_exact_size(Vec2::new(11.0, 8.0), Sense::click());
+            let p = ui.painter();
+            let fg = rgba(pal.text_primary);
+            let bd = Stroke::new(0.8, rgba(pal.border));
+            p.rect_filled(
+                up_r,
+                1.0,
+                if up_resp.hovered() {
+                    rgba(pal.hover)
+                } else {
+                    rgba(pal.toolbar_bg)
+                },
+            );
+            p.rect_stroke(up_r, 1.0, bd, egui::StrokeKind::Inside);
+            p.text(
+                up_r.center(),
+                Align2::CENTER_CENTER,
+                "▲",
+                FontId::proportional(6.5),
+                fg,
+            );
+            p.rect_filled(
+                dn_r,
+                1.0,
+                if dn_resp.hovered() {
+                    rgba(pal.hover)
+                } else {
+                    rgba(pal.toolbar_bg)
+                },
+            );
+            p.rect_stroke(dn_r, 1.0, bd, egui::StrokeKind::Inside);
+            p.text(
+                dn_r.center(),
+                Align2::CENTER_CENTER,
+                "▼",
+                FontId::proportional(6.5),
+                fg,
+            );
+            if up_resp.clicked() {
+                *value = (*value + 1).min(9999);
+                changed = true;
+            }
+            if dn_resp.clicked() {
+                *value = (*value - 1).max(0);
+                changed = true;
+            }
+        });
+    });
+    changed
+}
+
+/// Renders an editable combo (`TextEdit` + compact dropdown arrow showing suggestions).
+fn editable_combo(
+    ui: &mut Ui,
+    id_salt: (&str, usize),
+    buf: &mut String,
+    hint: &str,
+    width: f32,
+    suggestions: &[String],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let resp = ui.add(
+            TextEdit::singleline(buf)
+                .desired_width(width)
+                .hint_text(hint)
+                .id_salt(id_salt),
+        );
+        if resp.changed() {
+            changed = true;
+        }
+        egui::ComboBox::from_id_salt((id_salt.0, id_salt.1, "dd"))
+            .width(14.0)
+            .selected_text("")
+            .show_ui(ui, |ui| {
+                if suggestions.is_empty() {
+                    ui.weak("(none)");
+                } else {
+                    for s in suggestions {
+                        if ui.selectable_label(buf == s, s).clicked() {
+                            buf.clone_from(s);
+                            changed = true;
+                        }
+                    }
+                }
+            });
+    });
+    changed
+}
+
+/// Renders the full Aegisub 3.5.1 (3.2.2-style) Edit Box panel into `ui`.
 /// Returns `true` if the active line was modified on this frame.
 #[allow(clippy::too_many_lines)]
 pub fn show_edit_box(
@@ -274,7 +406,6 @@ pub fn show_edit_box(
 ) -> bool {
     state.sync_active_line(doc, timecodes);
     let Some(line_idx) = state.active_line else {
-        ui.label(catalog.get("status-ready").unwrap_or("No active line"));
         return false;
     };
     let Some(ev_snapshot) = doc
@@ -297,14 +428,14 @@ pub fn show_edit_box(
         .end()
         .as_cs()
         .saturating_sub(ev_snapshot.start().as_cs());
-    let (vis_chars, cps) = count_visible_chars_and_cps(&state.text_buf, dur_cs);
+    let (max_line_len, _cps) = count_visible_chars_and_cps(&state.text_buf, dur_cs);
     let sel = TextSelection::clamped(
         state.last_cursor_byte,
         state.last_cursor_byte,
         &state.text_buf,
     );
 
-    // ── Row 1 (Aegisub 3.2.2): Comment checkbox | Style combo + Edit | Actor | Effect | Chars/CPS
+    // ── Row 1 (Aegisub): Comment | Style combo | Edit | Actor editable combo | Effect editable combo | max line length only
     ui.horizontal(|ui| {
         if ui
             .checkbox(
@@ -331,7 +462,6 @@ pub fn show_edit_box(
             changed = true;
         }
 
-        // Style selector ComboBox populated from script styles + Edit button.
         let style_names: Vec<String> = doc
             .script()
             .styles()
@@ -372,49 +502,64 @@ pub fn show_edit_box(
             state.edit_style_requested = true;
         }
 
-        let actor_resp = ui.add(
-            TextEdit::singleline(&mut state.actor_buf)
-                .desired_width(68.0)
-                .hint_text(catalog.get("grid-col-actor").unwrap_or("Actor"))
-                .id_salt(("edit_actor", line_idx)),
-        );
-        if actor_resp.has_focus() {
-            let _ = autocomplete_actors(doc.script(), &state.actor_buf, 6);
+        let actor_sugs = autocomplete_actors(doc.script(), &state.actor_buf, 8);
+        if editable_combo(
+            ui,
+            ("edit_actor", line_idx),
+            &mut state.actor_buf,
+            catalog.get("grid-col-actor").unwrap_or("Actor"),
+            64.0,
+            &actor_sugs,
+        ) {
+            let mut after = ev_snapshot.clone();
+            after.set_name(state.actor_buf.clone());
+            let _ = doc.commit(
+                "change actor",
+                EditCommand::ModifyEvent {
+                    index: line_idx,
+                    before: Box::new(ev_snapshot.clone()),
+                    after: Box::new(after),
+                },
+                CommitType::TEXT,
+            );
+            changed = true;
         }
 
-        let eff_resp = ui.add(
-            TextEdit::singleline(&mut state.effect_buf)
-                .desired_width(68.0)
-                .hint_text(catalog.get("grid-col-effect").unwrap_or("Effect"))
-                .id_salt(("edit_effect", line_idx)),
-        );
-        if eff_resp.has_focus() {
-            let _ = autocomplete_effects(doc.script(), &state.effect_buf, 6);
+        let eff_sugs = autocomplete_effects(doc.script(), &state.effect_buf, 8);
+        if editable_combo(
+            ui,
+            ("edit_effect", line_idx),
+            &mut state.effect_buf,
+            catalog.get("grid-col-effect").unwrap_or("Effect"),
+            64.0,
+            &eff_sugs,
+        ) {
+            let mut after = ev_snapshot.clone();
+            after.set_effect(state.effect_buf.clone());
+            let _ = doc.commit(
+                "change effect",
+                EditCommand::ModifyEvent {
+                    index: line_idx,
+                    before: Box::new(ev_snapshot.clone()),
+                    after: Box::new(after),
+                },
+                CommitType::TEXT,
+            );
+            changed = true;
         }
 
-        let cps_col = if cps >= state.cps_error_threshold {
-            rgba(palette.grid_cps_error)
-        } else if cps >= state.cps_warn_threshold {
-            rgba(palette.grid_cps_warn)
-        } else {
-            rgba(palette.grid_cps_ok)
-        };
-        ui.label(RichText::new(format!("{vis_chars}")).small());
-        ui.colored_label(cps_col, RichText::new(format!("{cps} CPS")).small());
+        // Max line length number only (matches Aegisub's "23" readout).
+        let mut len_str = format!("{max_line_len}");
+        ui.add_enabled(
+            false,
+            TextEdit::singleline(&mut len_str).desired_width(28.0),
+        )
+        .on_hover_text("Maximum line length (characters)");
     });
 
-    // ── Row 2 (Aegisub 3.2.2): Layer spinner | Start | End | Duration | Margin L / R / V
+    // ── Row 2 (Aegisub): Layer spin box (no "L:") | Start | End | Duration | plain Margin L R V
     ui.horizontal(|ui| {
-        if ui
-            .add(
-                egui::DragValue::new(&mut layer)
-                    .speed(1)
-                    .prefix("L:")
-                    .range(0..=9999),
-            )
-            .on_hover_text(catalog.get("grid-col-layer").unwrap_or("Layer"))
-            .changed()
-        {
+        if layer_spin_box(ui, &mut layer, palette) {
             let mut after = ev_snapshot.clone();
             after.set_layer(layer);
             let _ = doc.commit(
@@ -442,21 +587,22 @@ pub fn show_edit_box(
         .on_hover_text(catalog.get("grid-col-end").unwrap_or("End"));
         ui.add_enabled(
             false,
-            TextEdit::singleline(&mut state.dur_buf).desired_width(64.0),
+            TextEdit::singleline(&mut state.dur_buf).desired_width(68.0),
         )
         .on_hover_text("Duration");
 
+        // Plain margin number boxes (no "L:", "R:", "V:" prefixes).
         let mut margins_changed = false;
         margins_changed |= ui
-            .add(egui::DragValue::new(&mut ml).prefix("L:").range(0..=9999))
+            .add(egui::DragValue::new(&mut ml).range(0..=9999))
             .on_hover_text("Left margin")
             .changed();
         margins_changed |= ui
-            .add(egui::DragValue::new(&mut mr).prefix("R:").range(0..=9999))
+            .add(egui::DragValue::new(&mut mr).range(0..=9999))
             .on_hover_text("Right margin")
             .changed();
         margins_changed |= ui
-            .add(egui::DragValue::new(&mut mv).prefix("V:").range(0..=9999))
+            .add(egui::DragValue::new(&mut mv).range(0..=9999))
             .on_hover_text("Vertical margin")
             .changed();
         if margins_changed {
@@ -477,7 +623,7 @@ pub fn show_edit_box(
         }
     });
 
-    // ── Row 3 (Aegisub 3.2.2): B I U S fn | 4 colour swatches | Commit ✓ | Time/Frame | Original
+    // ── Row 3 (Aegisub): B I U S fn | 4 coloured "AB" buttons | green commit ✓ | Time/Frame | Show Original
     ui.horizontal(|ui| {
         if ui
             .small_button(RichText::new("B").strong())
@@ -530,16 +676,14 @@ pub fn show_edit_box(
             changed = true;
         }
 
-        ui.separator();
-        let border = rgba(palette.border);
-        let swatch_tags = [
+        let ab_tags = [
             (0usize, r"{\1c&HFFFFFF&}", "Primary colour (\\1c)"),
             (1usize, r"{\2c&H3CD2FF&}", "Secondary colour (\\2c)"),
             (2usize, r"{\3c&H201814&}", "Outline colour (\\3c)"),
             (3usize, r"{\4c&H000000&}", "Shadow colour (\\4c)"),
         ];
-        for (idx, tag, tip) in swatch_tags {
-            if paint_colour_swatch(ui, state.colour_swatches[idx], border, tip) {
+        for (idx, tag, tip) in ab_tags {
+            if paint_ab_colour_button(ui, state.colour_swatches[idx], palette, tip) {
                 let pos = state.last_cursor_byte.min(state.text_buf.len());
                 state.text_buf.insert_str(pos, tag);
                 let _ = doc.amend_text(line_idx, "colour", &state.text_buf);
@@ -547,8 +691,7 @@ pub fn show_edit_box(
             }
         }
 
-        // Green commit checkmark button.
-        let commit_col = Color32::from_rgb(46, 170, 92);
+        let commit_col = Color32::from_rgb(38, 168, 84);
         if ui
             .small_button(RichText::new("✓").color(commit_col).strong())
             .on_hover_text("Commit changes (Enter)")
@@ -577,8 +720,7 @@ pub fn show_edit_box(
             );
         }
 
-        ui.checkbox(&mut state.show_original, "Orig")
-            .on_hover_text("Show Original text");
+        ui.checkbox(&mut state.show_original, "Show Original");
     });
 
     // Optional "Show Original" read-only preview.
@@ -591,20 +733,33 @@ pub fn show_edit_box(
         );
     }
 
-    // ── Row 4: Main syntax-highlighted multiline TextEdit filling remaining height.
+    // ── Row 4: White (in Light mode) proportional UI font syntax-highlighted multiline TextEdit.
     let pal_clone = palette.clone();
-    let font_mono = FontId::monospace(13.0);
+    let edit_font = if state.use_monospace {
+        FontId::monospace(12.5)
+    } else {
+        FontId::proportional(13.0)
+    };
     let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
         let s = text.as_str();
         let spans = syntax_highlight::tokenize(s);
-        let job = build_highlighted_layout_job(s, &spans, &pal_clone, &font_mono, wrap_width);
+        let job = build_highlighted_layout_job(s, &spans, &pal_clone, &edit_font, wrap_width);
         ui.fonts_mut(|f| f.layout_job(job))
     };
 
     let rem_h = ui.available_height().max(38.0);
     let rem_w = ui.available_width().max(80.0);
+    let is_light =
+        u16::from(palette.grid_bg.r) + u16::from(palette.grid_bg.g) + u16::from(palette.grid_bg.b)
+            > 384;
+    let bg_fill = if is_light {
+        Color32::WHITE
+    } else {
+        rgba(palette.grid_bg)
+    };
     let output = TextEdit::multiline(&mut state.text_buf)
         .id_salt(("edit_box", line_idx))
+        .background_color(bg_fill)
         .min_size(Vec2::new(rem_w, rem_h))
         .desired_width(f32::INFINITY)
         .layouter(&mut layouter)
@@ -659,12 +814,12 @@ mod tests {
             AssEvent::dialogue(
                 AssTime::ZERO,
                 AssTime::from_cs(250),
-                r"{\an5\blur2}Hello world",
+                r"{\an5\blur2}Hello\Nworld",
             ),
         );
         let mut doc = DocumentController::new(script);
         let mut state = EditBoxState::default();
-        let pal = theme::palette(ThemeSpec::Dark);
+        let pal = theme::palette(ThemeSpec::Light);
         let cat = Catalog::for_locale(Locale::En);
         let fonts = ui_theme::build_font_definitions(&ui_theme::FontConfig::default());
         let mut inited = false;

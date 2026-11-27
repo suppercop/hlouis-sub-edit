@@ -2,20 +2,20 @@
 //! [`syntax_highlight::GridDisplayConfig`], [`theme::Palette`], and [`i18n_catalog::Catalog`].
 //!
 //! Mirrors Aegisub 3.2.2 / 3.5.1 `src/base_grid.cpp`:
-//! - Virtualised rendering (`ScrollArea::show_rows`): only visible rows are laid out (< 1 ms CPU
-//!   even with 200,000 lines scrolled to the middle).
-//! - Classic Aegisub density; Actor & Margin columns hidden by default; column visibility, widths,
-//!   and order are customizable and persistable.
-//! - Comment / Selected / Active / Overlap / Visible-on-Video-Frame colouring and CPS badges all
-//!   sourced strictly from [`theme::Palette`].
-//! - Full Aegisub grid context menu including the `HLouis` submenu (`Select by Style`,
-//!   `Clean Whitespace`).
+//! - Default visible columns: `#`, `Start`, `End`, `CPS`, `Style`, `Text` (`Layer`, `Actor`,
+//!   `Effect`, and `Margins` hidden by default, matching the owner's Aegisub 3.2.2-style config).
+//! - Classic Aegisub Light styling: light-blue header row, light-green `#` column, white normal
+//!   rows, Aegisub blue selection, proportional UI font for times and text, compact 16 px rows.
+//! - Plain CPS numbers with subtle background warning tint above threshold (Aegisub 3.5 style).
+//! - Literal `\N` preserved in Text column; override `{...}` blocks simplified with `'☀'` only
+//!   when `display_cfg.mode == TagDisplayMode::Simplify`.
+//! - Virtualised rendering (`ScrollArea::show_rows`): `< 1 ms` CPU on 200,000 lines.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use ass_core::{AssEvent, AssTime, EventKind, ScriptFile};
-use egui::{Align, FontId, Key, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2};
+use egui::{Align, Color32, FontId, Key, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2};
 use grid_model::{ColumnVisibility, GridColumn, GridModel, KeyNav, RowFlags, RowTiming};
 use i18n_catalog::Catalog;
 use std::fmt::Write as _;
@@ -57,6 +57,9 @@ pub struct SubtitleGridState {
     pub cps_warn_threshold: u32,
     pub cps_error_threshold: u32,
     pub scroll_to_active_requested: bool,
+    /// When `true` and the active palette is light, apply classic Aegisub 3.2.2 grid colours
+    /// (light-blue header, light-green `#` column, white rows, Aegisub blue selection).
+    pub classic_light_colors: bool,
     cached_rows: Vec<CachedRow>,
     visible_buf: Vec<RowFlags>,
     time_buf_start: String,
@@ -66,13 +69,22 @@ pub struct SubtitleGridState {
 
 impl Default for SubtitleGridState {
     fn default() -> Self {
+        let mut model = GridModel::new();
+        // Owner's Aegisub 3.2.2-style default: #, Start, End, CPS, Style, Text
+        // (Layer, Actor, Effect, Margins hidden by default).
+        model.columns.layer = false;
+        model.columns.actor = false;
+        model.columns.effect = false;
+        model.columns.margin_l = false;
+        model.columns.margin_r = false;
+        model.columns.margin_v = false;
         Self {
-            model: GridModel::new(),
+            model,
             display_cfg: GridDisplayConfig {
                 simplify_marker: '☀',
                 ..GridDisplayConfig::default()
             },
-            row_height: 17.0,
+            row_height: 16.0,
             column_order: vec![
                 GridColumn::LineNumber,
                 GridColumn::Layer,
@@ -87,14 +99,13 @@ impl Default for SubtitleGridState {
                 GridColumn::MarginV,
                 GridColumn::Text,
             ],
-            // Default widths matching Aegisub 3.2.2 proportions.
             column_widths: [
-                44.0,  // LineNumber
-                36.0,  // Layer
-                82.0,  // Start
-                82.0,  // End
-                36.0,  // Cps
-                96.0,  // Style
+                40.0,  // LineNumber
+                34.0,  // Layer (hidden by default)
+                74.0,  // Start
+                74.0,  // End
+                34.0,  // Cps
+                92.0,  // Style
                 84.0,  // Actor (hidden by default)
                 84.0,  // Effect (hidden by default)
                 38.0,  // MarginL (hidden by default)
@@ -102,9 +113,10 @@ impl Default for SubtitleGridState {
                 38.0,  // MarginV (hidden by default)
                 480.0, // Text (fills remaining)
             ],
-            cps_warn_threshold: 18,
-            cps_error_threshold: 25,
+            cps_warn_threshold: 20,
+            cps_error_threshold: 30,
             scroll_to_active_requested: false,
+            classic_light_colors: true,
             cached_rows: Vec::new(),
             visible_buf: Vec::with_capacity(128),
             time_buf_start: String::with_capacity(16),
@@ -292,7 +304,6 @@ pub fn compute_event_cps(ev: &AssEvent) -> u32 {
             visible_chars += 1;
         }
     }
-    // chars / (dur_cs / 100) = (visible_chars * 100 + dur_cs/2) / dur_cs
     (visible_chars.saturating_mul(100) + dur_cs / 2) / dur_cs
 }
 
@@ -310,6 +321,12 @@ pub fn format_ass_time_into(t: AssTime, out: &mut String) {
     let _ = write!(out, "{h}:{m:02}:{s:02}.{cs:02}");
 }
 
+#[inline]
+fn is_light_palette(pal: &Palette) -> bool {
+    let lum = u16::from(pal.grid_bg.r) + u16::from(pal.grid_bg.g) + u16::from(pal.grid_bg.b);
+    lum > 384
+}
+
 struct RowH(f32);
 impl grid_model::FontMetrics for RowH {
     fn row_height(&self) -> f32 {
@@ -318,9 +335,6 @@ impl grid_model::FontMetrics for RowH {
 }
 
 /// Renders the virtualised subtitle grid into `ui`, returning any user-triggered [`GridAction`].
-///
-/// Only rows intersecting the visible scroll viewport are fetched and painted (< 1 ms CPU for
-/// 200,000 lines scrolled to the middle).
 #[allow(clippy::too_many_lines)]
 pub fn show_subtitle_grid(
     ui: &mut Ui,
@@ -336,8 +350,9 @@ pub fn show_subtitle_grid(
         .map_or(0, ass_core::EventsSection::event_count);
     let ppp = ui.ctx().pixels_per_point();
     let border_stroke = one_px_stroke(palette.border, ppp);
-    let font_body = FontId::proportional(12.0);
-    let font_mono = FontId::monospace(11.5);
+    // Aegisub uses the proportional UI font for times and text alike.
+    let font_body = FontId::proportional(11.5);
+    let use_classic_light = state.classic_light_colors && is_light_palette(palette);
 
     // 1. Keyboard navigation when grid has focus or no text edit owns focus.
     if !ui.ctx().egui_wants_keyboard_input() && total_rows > 0 {
@@ -370,14 +385,24 @@ pub fn show_subtitle_grid(
         }
     }
 
-    // 2. Column header row (with right-click column visibility toggle menu).
+    // 2. Column header row (light blue in classic Light mode, matching Aegisub).
     let header_h = state.row_height + 2.0;
     let (header_rect, header_resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width().max(100.0), header_h),
         Sense::click(),
     );
     let painter = ui.painter_at(header_rect);
-    painter.rect_filled(header_rect, 0.0, rgba(palette.toolbar_bg));
+    let header_bg = if use_classic_light {
+        Color32::from_rgb(165, 207, 231)
+    } else {
+        rgba(palette.toolbar_bg)
+    };
+    let header_text_col = if use_classic_light {
+        Color32::from_rgb(20, 24, 30)
+    } else {
+        rgba(palette.text_secondary)
+    };
+    painter.rect_filled(header_rect, 0.0, header_bg);
     let y_bot = snap_px(header_rect.bottom(), ppp);
     painter.line_segment(
         [
@@ -406,7 +431,7 @@ pub fn show_subtitle_grid(
             egui::Align2::LEFT_CENTER,
             label,
             font_body.clone(),
-            rgba(palette.text_secondary),
+            header_text_col,
         );
         x += w;
         let sx = snap_px(x, ppp);
@@ -499,32 +524,44 @@ pub fn show_subtitle_grid(
             let (row_rect, resp) =
                 ui.allocate_exact_size(Vec2::new(avail_w, row_height), Sense::click());
 
-            // Background colour strictly from Palette.
-            let bg = if is_active {
-                palette.grid_active_bg
+            let bg = if use_classic_light {
+                if is_active || is_selected {
+                    Color32::from_rgb(206, 255, 231)
+                } else if is_comment {
+                    Color32::from_rgb(216, 222, 245)
+                } else {
+                    Color32::WHITE
+                }
+            } else if is_active {
+                rgba(palette.grid_active_bg)
             } else if is_selected {
-                palette.grid_selected_bg
+                rgba(palette.grid_selected_bg)
             } else if is_comment {
-                palette.grid_comment_bg
+                rgba(palette.grid_comment_bg)
             } else if row_idx % 2 == 1 {
-                palette.grid_zebra_bg
+                rgba(palette.grid_zebra_bg)
             } else {
-                palette.grid_bg
+                rgba(palette.grid_bg)
             };
 
             let p = ui.painter_at(row_rect);
-            p.rect_filled(row_rect, 0.0, rgba(bg));
+            p.rect_filled(row_rect, 0.0, bg);
 
-            // Left accent bar for overlap / visible-on-video-frame.
             if is_overlap {
-                let bar = Rect::from_min_size(row_rect.min, Vec2::new(3.0, row_height));
+                let bar = Rect::from_min_size(row_rect.min, Vec2::new(2.5, row_height));
                 p.rect_filled(bar, 0.0, rgba(palette.grid_overlap));
             } else if is_vis_frame {
-                let bar = Rect::from_min_size(row_rect.min, Vec2::new(3.0, row_height));
+                let bar = Rect::from_min_size(row_rect.min, Vec2::new(2.5, row_height));
                 p.rect_filled(bar, 0.0, rgba(palette.focus_ring));
             }
 
-            let text_col = if is_selected || is_active {
+            let text_col = if use_classic_light {
+                if is_comment {
+                    Color32::from_rgb(56, 70, 110)
+                } else {
+                    Color32::from_rgb(16, 16, 16)
+                }
+            } else if is_selected || is_active {
                 rgba(palette.selection_text)
             } else if is_comment {
                 rgba(palette.text_secondary)
@@ -544,16 +581,27 @@ pub fn show_subtitle_grid(
                 } else {
                     state.column_widths[col_idx]
                 };
+                let cell_rect =
+                    Rect::from_min_size(Pos2::new(cx, row_rect.top()), Vec2::new(w, row_height));
 
                 match col {
                     GridColumn::LineNumber => {
+                        // Classic Aegisub light-green `#` column in Light mode.
+                        if use_classic_light {
+                            let num_bg = if is_active || is_selected {
+                                Color32::from_rgb(156, 226, 180)
+                            } else {
+                                Color32::from_rgb(196, 236, 201)
+                            };
+                            p.rect_filled(cell_rect, 0.0, num_bg);
+                        }
                         state.num_buf.clear();
                         let _ = write!(state.num_buf, "{}", row_idx + 1);
                         p.text(
-                            Pos2::new(cx + 5.0, cy),
-                            egui::Align2::LEFT_CENTER,
+                            Pos2::new(cx + w - 5.0, cy),
+                            egui::Align2::RIGHT_CENTER,
                             &state.num_buf,
-                            font_mono.clone(),
+                            font_body.clone(),
                             text_col,
                         );
                     }
@@ -564,7 +612,7 @@ pub fn show_subtitle_grid(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &state.num_buf,
-                            font_mono.clone(),
+                            font_body.clone(),
                             text_col,
                         );
                     }
@@ -577,7 +625,7 @@ pub fn show_subtitle_grid(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &state.time_buf_start,
-                            font_mono.clone(),
+                            font_body.clone(),
                             text_col,
                         );
                     }
@@ -587,31 +635,40 @@ pub fn show_subtitle_grid(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &state.time_buf_end,
-                            font_mono.clone(),
+                            font_body.clone(),
                             text_col,
                         );
                     }
                     GridColumn::Cps => {
+                        // Aegisub 3.5 style: plain numbers; background tint only above threshold.
                         let cps = row.cps;
-                        let cps_col = if cps >= state.cps_error_threshold {
-                            rgba(palette.grid_cps_error)
+                        if cps >= state.cps_error_threshold {
+                            let tint = if use_classic_light {
+                                Color32::from_rgb(255, 206, 206)
+                            } else {
+                                Color32::from_rgba_unmultiplied(210, 60, 60, 75)
+                            };
+                            p.rect_filled(cell_rect, 0.0, tint);
                         } else if cps >= state.cps_warn_threshold {
-                            rgba(palette.grid_cps_warn)
-                        } else {
-                            rgba(palette.grid_cps_ok)
-                        };
+                            let tint = if use_classic_light {
+                                Color32::from_rgb(255, 240, 198)
+                            } else {
+                                Color32::from_rgba_unmultiplied(210, 165, 50, 65)
+                            };
+                            p.rect_filled(cell_rect, 0.0, tint);
+                        }
                         state.num_buf.clear();
                         let _ = write!(state.num_buf, "{cps}");
                         p.text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
+                            Pos2::new(cx + w * 0.5, cy),
+                            egui::Align2::CENTER_CENTER,
                             &state.num_buf,
-                            font_mono.clone(),
-                            cps_col,
+                            font_body.clone(),
+                            text_col,
                         );
                     }
                     GridColumn::Style => {
-                        p.text(
+                        p.with_clip_rect(cell_rect).text(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &row.style,
@@ -620,7 +677,7 @@ pub fn show_subtitle_grid(
                         );
                     }
                     GridColumn::Actor => {
-                        p.text(
+                        p.with_clip_rect(cell_rect).text(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &row.actor,
@@ -629,7 +686,7 @@ pub fn show_subtitle_grid(
                         );
                     }
                     GridColumn::Effect => {
-                        p.text(
+                        p.with_clip_rect(cell_rect).text(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &row.effect,
@@ -644,7 +701,7 @@ pub fn show_subtitle_grid(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &state.num_buf,
-                            font_mono.clone(),
+                            font_body.clone(),
                             text_col,
                         );
                     }
@@ -655,7 +712,7 @@ pub fn show_subtitle_grid(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &state.num_buf,
-                            font_mono.clone(),
+                            font_body.clone(),
                             text_col,
                         );
                     }
@@ -666,12 +723,12 @@ pub fn show_subtitle_grid(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &state.num_buf,
-                            font_mono.clone(),
+                            font_body.clone(),
                             text_col,
                         );
                     }
                     GridColumn::Text => {
-                        p.text(
+                        p.with_clip_rect(cell_rect).text(
                             Pos2::new(cx + 4.0, cy),
                             egui::Align2::LEFT_CENTER,
                             &row.display_text,
@@ -691,7 +748,7 @@ pub fn show_subtitle_grid(
                 );
             }
 
-            // Crisp 1-px row divider.
+            // Crisp 1-px row divider (or Aegisub blue focus frame on active row).
             let ry = snap_px(row_rect.bottom(), ppp);
             p.line_segment(
                 [
@@ -700,6 +757,14 @@ pub fn show_subtitle_grid(
                 ],
                 Stroke::new(1.0 / ppp.max(0.5), rgba(palette.border)),
             );
+            if is_active {
+                p.rect_stroke(
+                    row_rect,
+                    0.0,
+                    Stroke::new(1.0, Color32::from_rgb(51, 130, 224)),
+                    egui::StrokeKind::Inside,
+                );
+            }
 
             // Click selection (Aegisub semantics).
             if resp.clicked() {
@@ -806,7 +871,7 @@ mod tests {
                 AssEvent::dialogue(
                     AssTime::from_cs(s),
                     AssTime::from_cs(s + 120),
-                    r"{\an5}Hello subtitle world",
+                    r"{\an5}Hello\Nsubtitle world",
                 ),
             );
         }
@@ -818,10 +883,12 @@ mod tests {
         let script = sample_script(1_000);
         let mut state = SubtitleGridState::default();
         state.sync_from_script(&script);
+        assert!(!state.model.columns.layer);
         assert!(!state.model.columns.actor);
+        assert!(!state.model.columns.effect);
         assert!(!state.model.columns.margin_l);
 
-        let pal = theme::palette(ThemeSpec::Dark);
+        let pal = theme::palette(ThemeSpec::Light);
         let cat = Catalog::for_locale(Locale::En);
         let fonts = ui_theme::build_font_definitions(&ui_theme::FontConfig::default());
         let mut inited = false;
