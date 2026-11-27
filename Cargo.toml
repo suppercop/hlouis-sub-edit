@@ -9,6 +9,7 @@ members = [
     "crates/fonts",
     "crates/autosave",
     "crates/project",
+    "crates/audio-peaks",
     "crates/i18n",
     "crates/libass-sys",
     "crates/ffms2-sys",
