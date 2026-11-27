@@ -1626,6 +1626,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "frame-check"
+version = "0.1.0"
+dependencies = [
+ "ass-core",
+ "keyframes",
+ "media",
+ "mkv-subs",
+ "render",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "frame-tools"
 version = "0.1.0"
 dependencies = [

@@ -11,7 +11,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 pub use version::{
-    parse_github_releases_json, parse_github_releases_with_skipped, ReleaseChannel, ReleaseInfo, SemVer, UpdateCheckState, VersionError,
+    parse_github_releases_json, parse_github_releases_with_skipped, ReleaseChannel, ReleaseInfo,
+    SemVer, UpdateCheckState, VersionError,
 };
 
 /// Log severity level.

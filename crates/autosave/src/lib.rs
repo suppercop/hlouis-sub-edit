@@ -689,7 +689,10 @@ mod tests {
         let blocker = dir.join("doc.AUTOSAVE.0000000000001-0000.ass");
         fs::create_dir_all(&blocker).unwrap();
         let res = write_autosave_now(&dir, "doc", b"x", 1, None);
-        assert!(matches!(res, Err(AutosaveError::PruneFailed { .. })), "{res:?}");
+        assert!(
+            matches!(res, Err(AutosaveError::PruneFailed { .. })),
+            "{res:?}"
+        );
         let msg = res.unwrap_err().to_string();
         assert!(msg.contains("could not be removed"), "{msg}");
         let _ = fs::remove_dir_all(&dir);
@@ -699,8 +702,8 @@ mod tests {
     fn recovery_report_carries_warnings_field() {
         let dir = temp_test_dir("recovery_warn");
         let report = discover_recoveries(&dir, "doc", None).unwrap();
-        assert!(report.warnings.is_empty());
-        assert!(report.candidates.is_empty());
+        assert_eq!(report.warnings.len(), 0);
+        assert_eq!(report.candidates.len(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

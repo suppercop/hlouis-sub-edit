@@ -318,22 +318,27 @@ impl Default for AppSettings {
     }
 }
 
-fn diff_json(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut Vec<String>) {
+fn diff_json(
+    path: &str,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    out: &mut Vec<String>,
+) {
     use serde_json::Value;
-    match (a, b) {
-        (Value::Object(x), Value::Object(y)) => {
-            for (k, va) in x {
-                let p = if path.is_empty() {
-                    k.clone()
+    match (before, after) {
+        (Value::Object(old), Value::Object(new)) => {
+            for (key, old_val) in old {
+                let child = if path.is_empty() {
+                    key.clone()
                 } else {
-                    format!("{path}.{k}")
+                    format!("{path}.{key}")
                 };
-                if let Some(vb) = y.get(k) {
-                    diff_json(&p, va, vb, out);
+                if let Some(new_val) = new.get(key) {
+                    diff_json(&child, old_val, new_val, out);
                 }
             }
         }
-        _ if a != b => out.push(format!("{path}: {a} -> {b}")),
+        _ if before != after => out.push(format!("{path}: {before} -> {after}")),
         _ => {}
     }
 }

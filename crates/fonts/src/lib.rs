@@ -88,7 +88,10 @@ impl std::fmt::Display for FontCheckWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoEventsSection => {
-                write!(f, "the script has no [Events] section; no fonts were checked")
+                write!(
+                    f,
+                    "the script has no [Events] section; no fonts were checked"
+                )
             }
             Self::NoRenderedText => write!(
                 f,
@@ -505,9 +508,12 @@ Dialogue: 0,0:00:03.00,0:00:05.00,Default,,0,0,0,,{\\fnEmptySwitch}{\\fn@Meiryo\
 
     #[test]
     fn empty_script_reports_that_nothing_was_checked() {
-        let script = parse_ass("[Script Info]
+        let script = parse_ass(
+            "[Script Info]
 ScriptType: v4.00+
-").value;
+",
+        )
+        .value;
         let report = check_fonts(&script, &MockFontProvider::default());
         assert!(report.is_clean());
         assert!(!report.is_conclusive());
@@ -524,7 +530,9 @@ Comment: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,note
         let report = check_fonts(&script, &MockFontProvider::default());
         assert!(!report.is_conclusive());
         assert!(report.warnings.contains(&FontCheckWarning::NoRenderedText));
-        assert!(report.warnings[0].to_string().contains("no fonts were checked"));
+        assert!(report.warnings[0]
+            .to_string()
+            .contains("no fonts were checked"));
     }
 
     #[test]

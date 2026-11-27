@@ -895,7 +895,10 @@ mod tests {
     fn non_object_json_is_an_error_not_empty_settings() {
         assert!(matches!(
             import_config_json("[]"),
-            Err(ConfigImportError::NotAnObject { file: "config.json", .. })
+            Err(ConfigImportError::NotAnObject {
+                file: "config.json",
+                ..
+            })
         ));
         let err = import_hotkey_json("42").unwrap_err();
         assert!(err.to_string().contains("hotkey.json"));

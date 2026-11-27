@@ -1075,13 +1075,25 @@ Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\\p1}m 0 0 l 100 50{\\p0}
 
     #[test]
     fn invalid_play_res_is_an_error_not_a_silent_default() {
-        let script = parse_ass("[Script Info]
+        let script = parse_ass(
+            "[Script Info]
 ScriptType: v4.00+
 PlayResX: abc
 PlayResY: 480
-").value;
+",
+        )
+        .value;
         let err = resample_resolution(&script, &ResampleOptions::new(1920, 1080)).unwrap_err();
-        assert!(matches!(err, ToolsError::InvalidSourceResolution { key: "PlayResX", .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                ToolsError::InvalidSourceResolution {
+                    key: "PlayResX",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("PlayResX"));
         // An explicit override still works.
         let mut opts = ResampleOptions::new(1920, 1080);

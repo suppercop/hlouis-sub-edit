@@ -174,7 +174,9 @@ impl ScriptProperties {
         for key in ["PlayResX", "PlayResY", "LayoutResX", "LayoutResY"] {
             if let Some(v) = info.get(key) {
                 if v.trim().parse::<u32>().is_err() {
-                    warnings.push(format!("`{key}: {v}` is not a valid resolution; it was ignored"));
+                    warnings.push(format!(
+                        "`{key}: {v}` is not a valid resolution; it was ignored"
+                    ));
                 }
             }
         }
@@ -559,10 +561,13 @@ PlayResY: 720
 
     #[test]
     fn invalid_resolution_is_reported() {
-        let script = ass_core::parse_ass("[Script Info]
+        let script = ass_core::parse_ass(
+            "[Script Info]
 PlayResX: wide
 PlayResY: 480
-").value;
+",
+        )
+        .value;
         let (props, warnings) = ScriptProperties::from_script_with_warnings(&script);
         assert_eq!(props.play_res_y, 480);
         assert_eq!(warnings.len(), 1, "{warnings:?}");

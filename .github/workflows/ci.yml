@@ -2,9 +2,9 @@ name: Windows CI
 
 on:
   push:
-    branches: [main, "phase-*", "perf-*"]
+    branches: [main, "phase-*", "perf-*", "robustness"]
   pull_request:
-    branches: [main]
+    branches: [main, "phase-*"]
 
 env:
   CARGO_TERM_COLOR: always
