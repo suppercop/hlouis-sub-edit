@@ -85,6 +85,7 @@ pub struct AppShell {
     pub last_pane_rects: LastPaneRects,
     fonts_installed: bool,
     last_theme_rev: u64,
+    status_line_cache: (Option<usize>, usize, String),
 }
 
 #[derive(Clone, Copy)]
@@ -182,12 +183,28 @@ fn toolbar_icon_button(ui: &mut Ui, icon: ToolbarIcon, pal: &Palette, tooltip: &
         ToolbarIcon::OpenMkv => {
             let b = Rect::from_center_size(c, Vec2::new(12.0, 9.0));
             p.rect_filled(b, 1.0, purple);
-            p.text(
-                c,
-                Align2::CENTER_CENTER,
-                "M",
-                egui::FontId::proportional(8.5),
-                egui::Color32::WHITE,
+            let mst = Stroke::new(1.3, egui::Color32::WHITE);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.5, c.y + 2.8),
+                    Pos2::new(c.x - 3.5, c.y - 2.8),
+                ],
+                mst,
+            );
+            p.line_segment(
+                [Pos2::new(c.x - 3.5, c.y - 2.8), Pos2::new(c.x, c.y + 0.8)],
+                mst,
+            );
+            p.line_segment(
+                [Pos2::new(c.x, c.y + 0.8), Pos2::new(c.x + 3.5, c.y - 2.8)],
+                mst,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x + 3.5, c.y - 2.8),
+                    Pos2::new(c.x + 3.5, c.y + 2.8),
+                ],
+                mst,
             );
         }
         ToolbarIcon::OpenVideo => {
@@ -309,13 +326,29 @@ fn toolbar_icon_button(ui: &mut Ui, icon: ToolbarIcon, pal: &Palette, tooltip: &
             );
         }
         ToolbarIcon::StyleEditor => {
-            p.text(
-                c,
-                Align2::CENTER_CENTER,
-                "Aa",
-                egui::FontId::proportional(9.5),
-                purple,
+            let ast = Stroke::new(1.5, purple);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 4.5, c.y + 4.0),
+                    Pos2::new(c.x - 1.5, c.y - 4.5),
+                ],
+                ast,
             );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 1.5, c.y - 4.5),
+                    Pos2::new(c.x + 1.5, c.y + 4.0),
+                ],
+                ast,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.3, c.y + 1.0),
+                    Pos2::new(c.x + 0.3, c.y + 1.0),
+                ],
+                ast,
+            );
+            p.circle_stroke(Pos2::new(c.x + 3.5, c.y + 1.8), 2.0, Stroke::new(1.3, blue));
         }
         ToolbarIcon::Properties => {
             for (dy, col) in [(-4.0, blue), (0.0, teal), (4.0, amber)] {
@@ -329,12 +362,27 @@ fn toolbar_icon_button(ui: &mut Ui, icon: ToolbarIcon, pal: &Palette, tooltip: &
             }
         }
         ToolbarIcon::Fonts => {
-            p.text(
-                c,
-                Align2::CENTER_CENTER,
-                "F",
-                egui::FontId::proportional(11.0),
-                red,
+            let fst = Stroke::new(1.7, red);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.0, c.y - 4.5),
+                    Pos2::new(c.x - 3.0, c.y + 4.5),
+                ],
+                fst,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.0, c.y - 4.5),
+                    Pos2::new(c.x + 3.5, c.y - 4.5),
+                ],
+                fst,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.0, c.y - 0.5),
+                    Pos2::new(c.x + 2.0, c.y - 0.5),
+                ],
+                fst,
             );
         }
         ToolbarIcon::Resample => {
@@ -517,6 +565,7 @@ impl AppShell {
             last_pane_rects: LastPaneRects::default(),
             fonts_installed: false,
             last_theme_rev: 0,
+            status_line_cache: (None, usize::MAX, String::with_capacity(32)),
         }
     }
 
@@ -1095,8 +1144,20 @@ impl AppShell {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let total = self.grid.model.row_count();
-                        let active = self.doc.active_line().map_or(0, |i| i + 1);
-                        ui.small(format!("Line {active} / {total}"));
+                        let active_opt = self.doc.active_line();
+                        if self.status_line_cache.0 != active_opt
+                            || self.status_line_cache.1 != total
+                        {
+                            self.status_line_cache.0 = active_opt;
+                            self.status_line_cache.1 = total;
+                            self.status_line_cache.2.clear();
+                            let active = active_opt.map_or(0, |i| i + 1);
+                            let _ = std::fmt::Write::write_fmt(
+                                &mut self.status_line_cache.2,
+                                format_args!("Line {active} / {total}"),
+                            );
+                        }
+                        ui.small(self.status_line_cache.2.as_str());
                         if self.doc.is_dirty() {
                             ui.separator();
                             ui.small(self.catalog.get("status-unsaved").unwrap_or("Modified"));

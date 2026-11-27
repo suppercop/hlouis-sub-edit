@@ -15,12 +15,13 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use egui::{
-    Align2, Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, TextureHandle,
+    Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, TextureHandle,
     TextureOptions, Ui, Vec2,
 };
 use i18n_catalog::Catalog;
 use playback::{Clock, PlaybackController};
 use std::f32::consts::TAU;
+use std::fmt::Write as _;
 use theme::Palette;
 use ui_theme::{rgba, snap_px};
 use video_geometry::VideoDisplayState;
@@ -94,6 +95,9 @@ pub struct VideoPanelState {
     texture_uploads: u64,
     // Reusable scratch buffer for drawing 500+ vector clip segments without allocating.
     poly_scratch: Vec<Pos2>,
+    frame_time_buf: String,
+    offset_buf: String,
+    last_readout_key: Option<(i64, u32, i64, i64)>,
 }
 
 impl Default for VideoPanelState {
@@ -129,6 +133,9 @@ impl VideoPanelState {
             uploaded_key: None,
             texture_uploads: 0,
             poly_scratch: Vec::with_capacity(1024),
+            frame_time_buf: String::with_capacity(32),
+            offset_buf: String::with_capacity(32),
+            last_readout_key: None,
         }
     }
 
@@ -319,13 +326,35 @@ fn visual_help_button(ui: &mut Ui, active: bool, pal: &Palette) -> bool {
         egui::StrokeKind::Inside,
     );
     p.circle_filled(rect.center(), 6.5, Color32::from_rgb(42, 120, 214));
-    p.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        "?",
-        FontId::proportional(11.0),
-        Color32::WHITE,
+    let c = rect.center();
+    let qst = Stroke::new(1.5, Color32::WHITE);
+    p.line_segment(
+        [
+            Pos2::new(c.x - 2.0, c.y - 2.2),
+            Pos2::new(c.x - 1.2, c.y - 3.6),
+        ],
+        qst,
     );
+    p.line_segment(
+        [
+            Pos2::new(c.x - 1.2, c.y - 3.6),
+            Pos2::new(c.x + 1.4, c.y - 3.6),
+        ],
+        qst,
+    );
+    p.line_segment(
+        [
+            Pos2::new(c.x + 1.4, c.y - 3.6),
+            Pos2::new(c.x + 2.0, c.y - 1.8),
+        ],
+        qst,
+    );
+    p.line_segment(
+        [Pos2::new(c.x + 2.0, c.y - 1.8), Pos2::new(c.x, c.y + 0.5)],
+        qst,
+    );
+    p.line_segment([Pos2::new(c.x, c.y + 0.5), Pos2::new(c.x, c.y + 1.8)], qst);
+    p.circle_filled(Pos2::new(c.x, c.y + 3.8), 1.0, Color32::WHITE);
     resp.on_hover_text("Toggle visual typesetting tool help")
         .clicked()
 }
@@ -433,22 +462,27 @@ pub fn paint_visual_overlay(
     }
 }
 
-fn format_video_time_ms(ms: i64) -> String {
-    let clamped = ms.max(0);
-    let millis = clamped % 1_000;
-    let total_s = clamped / 1_000;
-    let s = total_s % 60;
-    let total_m = total_s / 60;
-    let m = total_m % 60;
-    let h = total_m / 60;
-    format!("{h}:{m:02}:{s:02}.{millis:03}")
+fn zoom_label_static(tenths: u16) -> Option<&'static str> {
+    match tenths {
+        250 => Some("25%"),
+        375 => Some("37.5%"),
+        500 => Some("50%"),
+        750 => Some("75%"),
+        1000 => Some("100%"),
+        1500 => Some("150%"),
+        2000 => Some("200%"),
+        _ => None,
+    }
 }
 
-fn format_zoom_tenths(tenths: u16) -> String {
+fn format_zoom_tenths(tenths: u16) -> std::borrow::Cow<'static, str> {
+    if let Some(s) = zoom_label_static(tenths) {
+        return std::borrow::Cow::Borrowed(s);
+    }
     if tenths.is_multiple_of(10) {
-        format!("{}%", tenths / 10)
+        std::borrow::Cow::Owned(format!("{}%", tenths / 10))
     } else {
-        format!("{}.{}%", tenths / 10, tenths % 10)
+        std::borrow::Cow::Owned(format!("{}.{}%", tenths / 10, tenths % 10))
     }
 }
 
@@ -733,20 +767,42 @@ pub fn show_video_panel(
         }
 
         let cur_ms = pb.current_time_ms();
-        let mut frame_time_txt = format!("{} - {frame}", format_video_time_ms(cur_ms));
+        let rkey = (
+            cur_ms,
+            frame,
+            state.active_line_start_ms,
+            state.active_line_end_ms,
+        );
+        if state.last_readout_key != Some(rkey) {
+            state.frame_time_buf.clear();
+            let clamped = cur_ms.max(0);
+            let millis = clamped % 1_000;
+            let total_secs = clamped / 1_000;
+            let secs = total_secs % 60;
+            let total_mins = total_secs / 60;
+            let mins = total_mins % 60;
+            let hrs = total_mins / 60;
+            let _ = write!(
+                state.frame_time_buf,
+                "{hrs}:{mins:02}:{secs:02}.{millis:03} - {frame}"
+            );
+
+            let from_start = cur_ms - state.active_line_start_ms;
+            let to_end = cur_ms - state.active_line_end_ms;
+            state.offset_buf.clear();
+            let _ = write!(state.offset_buf, "{from_start:+}ms; {to_end:+}ms");
+            state.last_readout_key = Some(rkey);
+        }
         ui.add_enabled(
             false,
-            egui::TextEdit::singleline(&mut frame_time_txt)
+            egui::TextEdit::singleline(&mut state.frame_time_buf)
                 .font(FontId::proportional(11.0))
                 .desired_width(114.0),
         );
 
-        let from_start = cur_ms - state.active_line_start_ms;
-        let to_end = cur_ms - state.active_line_end_ms;
-        let mut offset_txt = format!("{from_start:+}ms; {to_end:+}ms");
         ui.add_enabled(
             false,
-            egui::TextEdit::singleline(&mut offset_txt)
+            egui::TextEdit::singleline(&mut state.offset_buf)
                 .font(FontId::proportional(11.0))
                 .desired_width(98.0),
         )

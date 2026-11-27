@@ -15,13 +15,62 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use ass_core::{AssEvent, AssTime, EventKind, ScriptFile};
-use egui::{Align, Color32, FontId, Key, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2};
+use egui::{
+    Align, Color32, FontId, Galley, Key, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2,
+};
 use grid_model::{ColumnVisibility, GridColumn, GridModel, KeyNav, RowFlags, RowTiming};
 use i18n_catalog::Catalog;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use syntax_highlight::{GridDisplayConfig, format_grid_text_into};
 use theme::Palette;
 use ui_theme::{one_px_stroke, rgba, snap_px};
+
+#[derive(Clone)]
+struct CachedHeaderGalley {
+    label: String,
+    font_bits: u32,
+    color: Color32,
+    galley: Arc<Galley>,
+}
+
+impl std::fmt::Debug for CachedHeaderGalley {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedHeaderGalley")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+struct CachedGridRowGalleys {
+    row_idx: usize,
+    rev: u64,
+    text_col: Color32,
+    font_bits: u32,
+    cols: [Option<Arc<Galley>>; 12],
+}
+
+impl Default for CachedGridRowGalleys {
+    fn default() -> Self {
+        Self {
+            row_idx: usize::MAX,
+            rev: 0,
+            text_col: Color32::TRANSPARENT,
+            font_bits: 0,
+            cols: std::array::from_fn(|_| None),
+        }
+    }
+}
+
+impl std::fmt::Debug for CachedGridRowGalleys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedGridRowGalleys")
+            .field("row_idx", &self.row_idx)
+            .field("rev", &self.rev)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Action emitted by the subtitle grid (mouse/keyboard selection or context menu).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +81,7 @@ pub enum GridAction {
 
 #[derive(Debug, Clone)]
 struct CachedRow {
+    rev: u64,
     is_comment: bool,
     layer: i32,
     start_cs: u32,
@@ -60,11 +110,14 @@ pub struct SubtitleGridState {
     /// When `true` and the active palette is light, apply classic Aegisub 3.2.2 grid colours
     /// (light-blue header, light-green `#` column, white rows, Aegisub blue selection).
     pub classic_light_colors: bool,
+    grid_rev: u64,
     cached_rows: Vec<CachedRow>,
     visible_buf: Vec<RowFlags>,
     time_buf_start: String,
     time_buf_end: String,
     num_buf: String,
+    header_galleys: [Option<CachedHeaderGalley>; 12],
+    row_galley_cache: Vec<CachedGridRowGalleys>,
 }
 
 impl Default for SubtitleGridState {
@@ -117,11 +170,14 @@ impl Default for SubtitleGridState {
             cps_error_threshold: 30,
             scroll_to_active_requested: false,
             classic_light_colors: true,
+            grid_rev: 1,
             cached_rows: Vec::new(),
             visible_buf: Vec::with_capacity(128),
             time_buf_start: String::with_capacity(16),
             time_buf_end: String::with_capacity(16),
             num_buf: String::with_capacity(16),
+            header_galleys: std::array::from_fn(|_| None),
+            row_galley_cache: vec![CachedGridRowGalleys::default(); 128],
         }
     }
 }
@@ -129,6 +185,8 @@ impl Default for SubtitleGridState {
 impl SubtitleGridState {
     /// Syncs the underlying [`GridModel`] timings and O(1) render cache from `script`.
     pub fn sync_from_script(&mut self, script: &ScriptFile) {
+        self.grid_rev = self.grid_rev.wrapping_add(1);
+        let rev = self.grid_rev;
         let count = script
             .events_section()
             .map_or(0, ass_core::EventsSection::event_count);
@@ -145,6 +203,7 @@ impl SubtitleGridState {
             });
             format_grid_text_into(ev.text(), &self.display_cfg, &mut tmp);
             self.cached_rows.push(CachedRow {
+                rev,
                 is_comment,
                 layer: ev.layer(),
                 start_cs: ev.start().as_cs(),
@@ -164,6 +223,8 @@ impl SubtitleGridState {
 
     /// Updates a single edited row in O(1) without rescanning the script.
     pub fn sync_row(&mut self, row_idx: usize, ev: &AssEvent) {
+        self.grid_rev = self.grid_rev.wrapping_add(1);
+        let rev = self.grid_rev;
         let is_comment = ev.kind() == EventKind::Comment;
         self.model.update_row_timing(
             row_idx,
@@ -174,6 +235,7 @@ impl SubtitleGridState {
             },
         );
         if let Some(slot) = self.cached_rows.get_mut(row_idx) {
+            slot.rev = rev;
             slot.is_comment = is_comment;
             slot.layer = ev.layer();
             slot.start_cs = ev.start().as_cs();
@@ -412,29 +474,49 @@ pub fn show_subtitle_grid(
         border_stroke,
     );
 
-    let mut x = header_rect.left();
+    let ctx = ui.ctx().clone();
+    let font_bits = font_body.size.to_bits();
+    let mut hx = header_rect.left();
     for &col in &state.column_order {
         if !SubtitleGridState::is_column_visible(&state.model.columns, col) {
             continue;
         }
         let col_idx = SubtitleGridState::column_index(col);
-        let w = if col == GridColumn::Text {
-            (header_rect.right() - x).max(120.0)
+        let col_w = if col == GridColumn::Text {
+            (header_rect.right() - hx).max(120.0)
         } else {
             state.column_widths[col_idx]
         };
         let label = catalog
             .get(SubtitleGridState::column_header_key(col))
             .unwrap_or("?");
-        painter.text(
-            Pos2::new(x + 4.0, header_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            font_body.clone(),
+        let hgalley = match &mut state.header_galleys[col_idx] {
+            Some(c)
+                if c.font_bits == font_bits && c.color == header_text_col && c.label == label =>
+            {
+                Arc::clone(&c.galley)
+            }
+            slot => {
+                let built = ctx.fonts_mut(|f| {
+                    f.layout_no_wrap(label.to_owned(), font_body.clone(), header_text_col)
+                });
+                *slot = Some(CachedHeaderGalley {
+                    label: label.to_owned(),
+                    font_bits,
+                    color: header_text_col,
+                    galley: Arc::clone(&built),
+                });
+                built
+            }
+        };
+        let gh = hgalley.size().y;
+        painter.galley(
+            Pos2::new(hx + 4.0, header_rect.center().y - gh * 0.5),
+            hgalley,
             header_text_col,
         );
-        x += w;
-        let sx = snap_px(x, ppp);
+        hx += col_w;
+        let sx = snap_px(hx, ppp);
         painter.line_segment(
             [
                 Pos2::new(sx, header_rect.top()),
@@ -544,15 +626,15 @@ pub fn show_subtitle_grid(
                 rgba(palette.grid_bg)
             };
 
-            let p = ui.painter_at(row_rect);
-            p.rect_filled(row_rect, 0.0, bg);
+            let row_painter = ui.painter_at(row_rect);
+            row_painter.rect_filled(row_rect, 0.0, bg);
 
             if is_overlap {
                 let bar = Rect::from_min_size(row_rect.min, Vec2::new(2.5, row_height));
-                p.rect_filled(bar, 0.0, rgba(palette.grid_overlap));
+                row_painter.rect_filled(bar, 0.0, rgba(palette.grid_overlap));
             } else if is_vis_frame {
                 let bar = Rect::from_min_size(row_rect.min, Vec2::new(2.5, row_height));
-                p.rect_filled(bar, 0.0, rgba(palette.focus_ring));
+                row_painter.rect_filled(bar, 0.0, rgba(palette.focus_ring));
             }
 
             let text_col = if use_classic_light {
@@ -571,175 +653,162 @@ pub fn show_subtitle_grid(
 
             let mut cx = row_rect.left();
             let cy = row_rect.center().y;
+            let cache_slot = &mut state.row_galley_cache[row_idx & 127];
+            if cache_slot.row_idx != row_idx
+                || cache_slot.rev != row.rev
+                || cache_slot.text_col != text_col
+                || cache_slot.font_bits != font_bits
+            {
+                cache_slot.row_idx = row_idx;
+                cache_slot.rev = row.rev;
+                cache_slot.text_col = text_col;
+                cache_slot.font_bits = font_bits;
+                for c in &mut cache_slot.cols {
+                    *c = None;
+                }
+            }
             for &col in &state.column_order {
                 if !SubtitleGridState::is_column_visible(&state.model.columns, col) {
                     continue;
                 }
                 let col_idx = SubtitleGridState::column_index(col);
-                let w = if col == GridColumn::Text {
+                let col_w = if col == GridColumn::Text {
                     (row_rect.right() - cx).max(120.0)
                 } else {
                     state.column_widths[col_idx]
                 };
-                let cell_rect =
-                    Rect::from_min_size(Pos2::new(cx, row_rect.top()), Vec2::new(w, row_height));
+                let cell_rect = Rect::from_min_size(
+                    Pos2::new(cx, row_rect.top()),
+                    Vec2::new(col_w, row_height),
+                );
 
+                if col == GridColumn::LineNumber && use_classic_light {
+                    let num_bg = if is_active || is_selected {
+                        Color32::from_rgb(156, 226, 180)
+                    } else {
+                        Color32::from_rgb(196, 236, 201)
+                    };
+                    row_painter.rect_filled(cell_rect, 0.0, num_bg);
+                } else if col == GridColumn::Cps {
+                    let cps = row.cps;
+                    if cps >= state.cps_error_threshold {
+                        let tint = if use_classic_light {
+                            Color32::from_rgb(255, 206, 206)
+                        } else {
+                            Color32::from_rgba_unmultiplied(210, 60, 60, 75)
+                        };
+                        row_painter.rect_filled(cell_rect, 0.0, tint);
+                    } else if cps >= state.cps_warn_threshold {
+                        let tint = if use_classic_light {
+                            Color32::from_rgb(255, 240, 198)
+                        } else {
+                            Color32::from_rgba_unmultiplied(210, 165, 50, 65)
+                        };
+                        row_painter.rect_filled(cell_rect, 0.0, tint);
+                    }
+                }
+
+                let cell_galley = if let Some(ref existing) = cache_slot.cols[col_idx] {
+                    Arc::clone(existing)
+                } else {
+                    let cell_txt: &str = match col {
+                        GridColumn::LineNumber => {
+                            state.num_buf.clear();
+                            let _ = write!(state.num_buf, "{}", row_idx + 1);
+                            &state.num_buf
+                        }
+                        GridColumn::Layer => {
+                            state.num_buf.clear();
+                            let _ = write!(state.num_buf, "{}", row.layer);
+                            &state.num_buf
+                        }
+                        GridColumn::Start => {
+                            format_ass_time_into(
+                                AssTime::from_cs(row.start_cs),
+                                &mut state.time_buf_start,
+                            );
+                            &state.time_buf_start
+                        }
+                        GridColumn::End => {
+                            format_ass_time_into(
+                                AssTime::from_cs(row.end_cs),
+                                &mut state.time_buf_end,
+                            );
+                            &state.time_buf_end
+                        }
+                        GridColumn::Cps => {
+                            state.num_buf.clear();
+                            let _ = write!(state.num_buf, "{}", row.cps);
+                            &state.num_buf
+                        }
+                        GridColumn::Style => &row.style,
+                        GridColumn::Actor => &row.actor,
+                        GridColumn::Effect => &row.effect,
+                        GridColumn::MarginL => {
+                            state.num_buf.clear();
+                            let _ = write!(state.num_buf, "{}", row.margin_l);
+                            &state.num_buf
+                        }
+                        GridColumn::MarginR => {
+                            state.num_buf.clear();
+                            let _ = write!(state.num_buf, "{}", row.margin_r);
+                            &state.num_buf
+                        }
+                        GridColumn::MarginV => {
+                            state.num_buf.clear();
+                            let _ = write!(state.num_buf, "{}", row.margin_v);
+                            &state.num_buf
+                        }
+                        GridColumn::Text => &row.display_text,
+                    };
+                    let built = ctx.fonts_mut(|f| {
+                        f.layout_no_wrap(cell_txt.to_owned(), font_body.clone(), text_col)
+                    });
+                    cache_slot.cols[col_idx] = Some(Arc::clone(&built));
+                    built
+                };
+                let gsize = cell_galley.size();
                 match col {
                     GridColumn::LineNumber => {
-                        // Classic Aegisub light-green `#` column in Light mode.
-                        if use_classic_light {
-                            let num_bg = if is_active || is_selected {
-                                Color32::from_rgb(156, 226, 180)
-                            } else {
-                                Color32::from_rgb(196, 236, 201)
-                            };
-                            p.rect_filled(cell_rect, 0.0, num_bg);
-                        }
-                        state.num_buf.clear();
-                        let _ = write!(state.num_buf, "{}", row_idx + 1);
-                        p.text(
-                            Pos2::new(cx + w - 5.0, cy),
-                            egui::Align2::RIGHT_CENTER,
-                            &state.num_buf,
-                            font_body.clone(),
-                            text_col,
-                        );
-                    }
-                    GridColumn::Layer => {
-                        state.num_buf.clear();
-                        let _ = write!(state.num_buf, "{}", row.layer);
-                        p.text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &state.num_buf,
-                            font_body.clone(),
-                            text_col,
-                        );
-                    }
-                    GridColumn::Start => {
-                        format_ass_time_into(
-                            AssTime::from_cs(row.start_cs),
-                            &mut state.time_buf_start,
-                        );
-                        p.text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &state.time_buf_start,
-                            font_body.clone(),
-                            text_col,
-                        );
-                    }
-                    GridColumn::End => {
-                        format_ass_time_into(AssTime::from_cs(row.end_cs), &mut state.time_buf_end);
-                        p.text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &state.time_buf_end,
-                            font_body.clone(),
+                        row_painter.galley(
+                            Pos2::new(cx + col_w - 5.0 - gsize.x, cy - gsize.y * 0.5),
+                            cell_galley,
                             text_col,
                         );
                     }
                     GridColumn::Cps => {
-                        // Aegisub 3.5 style: plain numbers; background tint only above threshold.
-                        let cps = row.cps;
-                        if cps >= state.cps_error_threshold {
-                            let tint = if use_classic_light {
-                                Color32::from_rgb(255, 206, 206)
-                            } else {
-                                Color32::from_rgba_unmultiplied(210, 60, 60, 75)
-                            };
-                            p.rect_filled(cell_rect, 0.0, tint);
-                        } else if cps >= state.cps_warn_threshold {
-                            let tint = if use_classic_light {
-                                Color32::from_rgb(255, 240, 198)
-                            } else {
-                                Color32::from_rgba_unmultiplied(210, 165, 50, 65)
-                            };
-                            p.rect_filled(cell_rect, 0.0, tint);
-                        }
-                        state.num_buf.clear();
-                        let _ = write!(state.num_buf, "{cps}");
-                        p.text(
-                            Pos2::new(cx + w * 0.5, cy),
-                            egui::Align2::CENTER_CENTER,
-                            &state.num_buf,
-                            font_body.clone(),
+                        row_painter.galley(
+                            Pos2::new(cx + (col_w - gsize.x) * 0.5, cy - gsize.y * 0.5),
+                            cell_galley,
                             text_col,
                         );
                     }
-                    GridColumn::Style => {
-                        p.with_clip_rect(cell_rect).text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &row.style,
-                            font_body.clone(),
+                    GridColumn::Style
+                    | GridColumn::Actor
+                    | GridColumn::Effect
+                    | GridColumn::Text => {
+                        row_painter.with_clip_rect(cell_rect).galley(
+                            Pos2::new(cx + 4.0, cy - gsize.y * 0.5),
+                            cell_galley,
                             text_col,
                         );
                     }
-                    GridColumn::Actor => {
-                        p.with_clip_rect(cell_rect).text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &row.actor,
-                            font_body.clone(),
-                            text_col,
-                        );
-                    }
-                    GridColumn::Effect => {
-                        p.with_clip_rect(cell_rect).text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &row.effect,
-                            font_body.clone(),
-                            text_col,
-                        );
-                    }
-                    GridColumn::MarginL => {
-                        state.num_buf.clear();
-                        let _ = write!(state.num_buf, "{}", row.margin_l);
-                        p.text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &state.num_buf,
-                            font_body.clone(),
-                            text_col,
-                        );
-                    }
-                    GridColumn::MarginR => {
-                        state.num_buf.clear();
-                        let _ = write!(state.num_buf, "{}", row.margin_r);
-                        p.text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &state.num_buf,
-                            font_body.clone(),
-                            text_col,
-                        );
-                    }
-                    GridColumn::MarginV => {
-                        state.num_buf.clear();
-                        let _ = write!(state.num_buf, "{}", row.margin_v);
-                        p.text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &state.num_buf,
-                            font_body.clone(),
-                            text_col,
-                        );
-                    }
-                    GridColumn::Text => {
-                        p.with_clip_rect(cell_rect).text(
-                            Pos2::new(cx + 4.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &row.display_text,
-                            font_body.clone(),
+                    GridColumn::Layer
+                    | GridColumn::Start
+                    | GridColumn::End
+                    | GridColumn::MarginL
+                    | GridColumn::MarginR
+                    | GridColumn::MarginV => {
+                        row_painter.galley(
+                            Pos2::new(cx + 4.0, cy - gsize.y * 0.5),
+                            cell_galley,
                             text_col,
                         );
                     }
                 }
-                cx += w;
+                cx += col_w;
                 let sx = snap_px(cx, ppp);
-                p.line_segment(
+                row_painter.line_segment(
                     [
                         Pos2::new(sx, row_rect.top()),
                         Pos2::new(sx, row_rect.bottom()),
@@ -750,7 +819,7 @@ pub fn show_subtitle_grid(
 
             // Crisp 1-px row divider (or Aegisub blue focus frame on active row).
             let ry = snap_px(row_rect.bottom(), ppp);
-            p.line_segment(
+            row_painter.line_segment(
                 [
                     Pos2::new(row_rect.left(), ry),
                     Pos2::new(row_rect.right(), ry),
@@ -758,7 +827,7 @@ pub fn show_subtitle_grid(
                 Stroke::new(1.0 / ppp.max(0.5), rgba(palette.border)),
             );
             if is_active {
-                p.rect_stroke(
+                row_painter.rect_stroke(
                     row_rect,
                     0.0,
                     Stroke::new(1.0, Color32::from_rgb(51, 130, 224)),

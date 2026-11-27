@@ -15,20 +15,73 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use ass_core::{AssTime, EditCommand, EventKind};
+use ass_core::{AssTime, EditCommand, EventKind, ScriptFile};
 use document::{CommitType, DocumentController};
 use edit_box_ops::{
     ShiftEnterMode, TextSelection, autocomplete_actors, autocomplete_effects, insert_hard_space,
     toggle_bold, toggle_italic, toggle_strikeout, toggle_underline,
 };
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Align2, Color32, FontId, Key, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
+use egui::{Color32, FontId, Galley, Key, Pos2, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
 use i18n_catalog::Catalog;
 use keyframes::{TimeType, Timecodes};
 use std::fmt::Write as _;
-use syntax_highlight::{IncrementalTokenizer, TokenKind, TokenSpan};
+use std::sync::Arc;
+use syntax_highlight::{IncrementalTokenizer, TokenKind, TokenSpan, tokenize_into};
 use theme::Palette;
 use ui_theme::rgba;
+
+#[derive(Clone)]
+struct CachedEditGalley {
+    text: String,
+    wrap_width_bits: u32,
+    use_monospace: bool,
+    pal_sig: [u32; 9],
+    galley: Arc<Galley>,
+}
+
+impl std::fmt::Debug for CachedEditGalley {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedEditGalley")
+            .field("len", &self.text.len())
+            .field("wrap_width_bits", &self.wrap_width_bits)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+struct CachedAbGalley {
+    color: Color32,
+    galley: Arc<Galley>,
+}
+
+impl std::fmt::Debug for CachedAbGalley {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedAbGalley")
+            .field("color", &self.color)
+            .finish_non_exhaustive()
+    }
+}
+
+#[inline]
+const fn rgba_u32(c: theme::Rgba8) -> u32 {
+    u32::from_le_bytes([c.r, c.g, c.b, c.a])
+}
+
+#[inline]
+const fn palette_syntax_sig(p: &Palette) -> [u32; 9] {
+    [
+        rgba_u32(p.syntax_plain),
+        rgba_u32(p.syntax_brace),
+        rgba_u32(p.syntax_tag_name),
+        rgba_u32(p.syntax_tag_value),
+        rgba_u32(p.syntax_karaoke),
+        rgba_u32(p.syntax_escape),
+        rgba_u32(p.syntax_comment),
+        rgba_u32(p.syntax_drawing),
+        rgba_u32(p.syntax_error),
+    ]
+}
 
 /// Persistent UI state for the subtitle edit box.
 #[derive(Debug, Clone)]
@@ -55,6 +108,11 @@ pub struct EditBoxState {
     pub edit_style_requested: bool,
     /// 4 active ASS colour swatches (Primary, Secondary, Outline, Shadow) rendered as `"AB"`.
     pub colour_swatches: [Color32; 4],
+    max_len_buf: String,
+    last_max_len: Option<usize>,
+    span_scratch: Vec<TokenSpan>,
+    galley_cache: Option<CachedEditGalley>,
+    ab_galleys: [Option<CachedAbGalley>; 4],
 }
 
 impl Default for EditBoxState {
@@ -84,6 +142,11 @@ impl Default for EditBoxState {
                 Color32::from_rgb(40, 150, 60),
                 Color32::from_rgb(90, 60, 140),
             ],
+            max_len_buf: String::with_capacity(12),
+            last_max_len: None,
+            span_scratch: Vec::with_capacity(128),
+            galley_cache: None,
+            ab_galleys: [None, None, None, None],
         }
     }
 }
@@ -260,14 +323,33 @@ pub fn count_visible_chars_and_cps(text: &str, dur_cs: u32) -> (usize, u32) {
 }
 
 /// Paints a classic Aegisub `"AB"` colour-picker button (primary, secondary, outline, shadow).
-fn paint_ab_colour_button(ui: &mut Ui, fg_color: Color32, pal: &Palette, tooltip: &str) -> bool {
+fn paint_ab_colour_button(
+    ui: &mut Ui,
+    fg_color: Color32,
+    cached: &mut Option<CachedAbGalley>,
+    pal: &Palette,
+    tooltip: &str,
+) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(22.0, 18.0), Sense::click());
-    let p = ui.painter();
     let bg = if resp.hovered() {
         rgba(pal.hover)
     } else {
         rgba(pal.toolbar_bg)
     };
+    let galley = match cached {
+        Some(entry) if entry.color == fg_color => Arc::clone(&entry.galley),
+        slot => {
+            let g = ui.fonts_mut(|f| {
+                f.layout_no_wrap("AB".to_owned(), FontId::proportional(10.5), fg_color)
+            });
+            *slot = Some(CachedAbGalley {
+                color: fg_color,
+                galley: Arc::clone(&g),
+            });
+            g
+        }
+    };
+    let p = ui.painter();
     p.rect_filled(rect, 2.0, bg);
     p.rect_stroke(
         rect,
@@ -275,11 +357,13 @@ fn paint_ab_colour_button(ui: &mut Ui, fg_color: Color32, pal: &Palette, tooltip
         Stroke::new(1.0, rgba(pal.border)),
         egui::StrokeKind::Inside,
     );
-    p.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        "AB",
-        FontId::proportional(10.5),
+    let gsize = galley.size();
+    p.galley(
+        Pos2::new(
+            rect.center().x - gsize.x * 0.5,
+            rect.center().y - gsize.y * 0.5,
+        ),
+        galley,
         fg_color,
     );
     resp.on_hover_text(tooltip).clicked()
@@ -306,6 +390,7 @@ fn layer_spin_box(ui: &mut Ui, value: &mut i32, pal: &Palette) -> bool {
             let p = ui.painter();
             let fg = rgba(pal.text_primary);
             let bd = Stroke::new(0.8, rgba(pal.border));
+            let arrow_st = Stroke::new(1.2, fg);
             p.rect_filled(
                 up_r,
                 1.0,
@@ -316,12 +401,20 @@ fn layer_spin_box(ui: &mut Ui, value: &mut i32, pal: &Palette) -> bool {
                 },
             );
             p.rect_stroke(up_r, 1.0, bd, egui::StrokeKind::Inside);
-            p.text(
-                up_r.center(),
-                Align2::CENTER_CENTER,
-                "▲",
-                FontId::proportional(6.5),
-                fg,
+            let uc = up_r.center();
+            p.line_segment(
+                [
+                    Pos2::new(uc.x - 2.5, uc.y + 1.2),
+                    Pos2::new(uc.x, uc.y - 1.5),
+                ],
+                arrow_st,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(uc.x, uc.y - 1.5),
+                    Pos2::new(uc.x + 2.5, uc.y + 1.2),
+                ],
+                arrow_st,
             );
             p.rect_filled(
                 dn_r,
@@ -333,12 +426,20 @@ fn layer_spin_box(ui: &mut Ui, value: &mut i32, pal: &Palette) -> bool {
                 },
             );
             p.rect_stroke(dn_r, 1.0, bd, egui::StrokeKind::Inside);
-            p.text(
-                dn_r.center(),
-                Align2::CENTER_CENTER,
-                "▼",
-                FontId::proportional(6.5),
-                fg,
+            let dc = dn_r.center();
+            p.line_segment(
+                [
+                    Pos2::new(dc.x - 2.5, dc.y - 1.2),
+                    Pos2::new(dc.x, dc.y + 1.5),
+                ],
+                arrow_st,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(dc.x, dc.y + 1.5),
+                    Pos2::new(dc.x + 2.5, dc.y - 1.2),
+                ],
+                arrow_st,
             );
             if up_resp.clicked() {
                 *value = (*value + 1).min(9999);
@@ -353,14 +454,16 @@ fn layer_spin_box(ui: &mut Ui, value: &mut i32, pal: &Palette) -> bool {
     changed
 }
 
-/// Renders an editable combo (`TextEdit` + compact dropdown arrow showing suggestions).
+/// Renders an editable combo (`TextEdit` + compact dropdown arrow whose suggestions are computed
+/// lazily ONLY when the popup is open, avoiding 200k-line script scans per frame).
 fn editable_combo(
     ui: &mut Ui,
     id_salt: (&str, usize),
     buf: &mut String,
     hint: &str,
     width: f32,
-    suggestions: &[String],
+    script: &ScriptFile,
+    suggest_fn: fn(&ScriptFile, &str, usize) -> Vec<String>,
 ) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -378,10 +481,11 @@ fn editable_combo(
             .width(14.0)
             .selected_text("")
             .show_ui(ui, |ui| {
+                let suggestions = suggest_fn(script, buf, 8);
                 if suggestions.is_empty() {
                     ui.weak("(none)");
                 } else {
-                    for s in suggestions {
+                    for s in &suggestions {
                         if ui.selectable_label(buf == s, s).clicked() {
                             buf.clone_from(s);
                             changed = true;
@@ -462,22 +566,22 @@ pub fn show_edit_box(
             changed = true;
         }
 
-        let style_names: Vec<String> = doc
-            .script()
-            .styles()
-            .map(|st| st.name().to_owned())
-            .collect();
         let prev_style = state.style_buf.clone();
         egui::ComboBox::from_id_salt(("edit_style_combo", line_idx))
             .width(86.0)
             .selected_text(&state.style_buf)
             .show_ui(ui, |ui| {
-                if style_names.is_empty() {
-                    ui.selectable_value(&mut state.style_buf, "Default".to_owned(), "Default");
-                } else {
-                    for name in &style_names {
-                        ui.selectable_value(&mut state.style_buf, name.clone(), name);
+                let mut any_style = false;
+                for st in doc.script().styles() {
+                    any_style = true;
+                    let name = st.name();
+                    if ui.selectable_label(state.style_buf == name, name).clicked() {
+                        state.style_buf.clear();
+                        state.style_buf.push_str(name);
                     }
+                }
+                if !any_style {
+                    ui.selectable_value(&mut state.style_buf, "Default".to_owned(), "Default");
                 }
             });
         if state.style_buf != prev_style {
@@ -502,14 +606,14 @@ pub fn show_edit_box(
             state.edit_style_requested = true;
         }
 
-        let actor_sugs = autocomplete_actors(doc.script(), &state.actor_buf, 8);
         if editable_combo(
             ui,
             ("edit_actor", line_idx),
             &mut state.actor_buf,
             catalog.get("grid-col-actor").unwrap_or("Actor"),
             64.0,
-            &actor_sugs,
+            doc.script(),
+            autocomplete_actors,
         ) {
             let mut after = ev_snapshot.clone();
             after.set_name(state.actor_buf.clone());
@@ -525,14 +629,14 @@ pub fn show_edit_box(
             changed = true;
         }
 
-        let eff_sugs = autocomplete_effects(doc.script(), &state.effect_buf, 8);
         if editable_combo(
             ui,
             ("edit_effect", line_idx),
             &mut state.effect_buf,
             catalog.get("grid-col-effect").unwrap_or("Effect"),
             64.0,
-            &eff_sugs,
+            doc.script(),
+            autocomplete_effects,
         ) {
             let mut after = ev_snapshot.clone();
             after.set_effect(state.effect_buf.clone());
@@ -549,10 +653,14 @@ pub fn show_edit_box(
         }
 
         // Max line length number only (matches Aegisub's "23" readout).
-        let mut len_str = format!("{max_line_len}");
+        if state.last_max_len != Some(max_line_len) {
+            state.max_len_buf.clear();
+            let _ = write!(state.max_len_buf, "{max_line_len}");
+            state.last_max_len = Some(max_line_len);
+        }
         ui.add_enabled(
             false,
-            TextEdit::singleline(&mut len_str).desired_width(28.0),
+            TextEdit::singleline(&mut state.max_len_buf).desired_width(28.0),
         )
         .on_hover_text("Maximum line length (characters)");
     });
@@ -683,7 +791,13 @@ pub fn show_edit_box(
             (3usize, r"{\4c&H000000&}", "Shadow colour (\\4c)"),
         ];
         for (idx, tag, tip) in ab_tags {
-            if paint_ab_colour_button(ui, state.colour_swatches[idx], palette, tip) {
+            if paint_ab_colour_button(
+                ui,
+                state.colour_swatches[idx],
+                &mut state.ab_galleys[idx],
+                palette,
+                tip,
+            ) {
                 let pos = state.last_cursor_byte.min(state.text_buf.len());
                 state.text_buf.insert_str(pos, tag);
                 let _ = doc.amend_text(line_idx, "colour", &state.text_buf);
@@ -735,18 +849,13 @@ pub fn show_edit_box(
 
     // ── Row 4: White (in Light mode) proportional UI font syntax-highlighted multiline TextEdit.
     let pal_clone = palette.clone();
-    let edit_font = if state.use_monospace {
+    let pal_sig = palette_syntax_sig(palette);
+    let use_monospace = state.use_monospace;
+    let edit_font = if use_monospace {
         FontId::monospace(12.5)
     } else {
         FontId::proportional(13.0)
     };
-    let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-        let s = text.as_str();
-        let spans = syntax_highlight::tokenize(s);
-        let job = build_highlighted_layout_job(s, &spans, &pal_clone, &edit_font, wrap_width);
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
-
     let rem_h = ui.available_height().max(38.0);
     let rem_w = ui.available_width().max(80.0);
     let is_light =
@@ -757,13 +866,55 @@ pub fn show_edit_box(
     } else {
         rgba(palette.grid_bg)
     };
-    let output = TextEdit::multiline(&mut state.text_buf)
-        .id_salt(("edit_box", line_idx))
-        .background_color(bg_fill)
-        .min_size(Vec2::new(rem_w, rem_h))
-        .desired_width(f32::INFINITY)
-        .layouter(&mut layouter)
-        .show(ui);
+    let mut galley_cache = state.galley_cache.take();
+    let mut span_scratch = std::mem::take(&mut state.span_scratch);
+    let output = {
+        let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+            let s = text.as_str();
+            let wrap_bits = wrap_width.to_bits();
+            if let Some(ref c) = galley_cache
+                && c.wrap_width_bits == wrap_bits
+                && c.use_monospace == use_monospace
+                && c.pal_sig == pal_sig
+                && c.text == s
+            {
+                return Arc::clone(&c.galley);
+            }
+            tokenize_into(s, &mut span_scratch);
+            let job =
+                build_highlighted_layout_job(s, &span_scratch, &pal_clone, &edit_font, wrap_width);
+            let g = ui.fonts_mut(|f| f.layout_job(job));
+            let cached_text = if let Some(mut old) = galley_cache.take() {
+                old.text.clear();
+                old.text.push_str(s);
+                old.wrap_width_bits = wrap_bits;
+                old.use_monospace = use_monospace;
+                old.pal_sig = pal_sig;
+                old.galley = Arc::clone(&g);
+                old
+            } else {
+                CachedEditGalley {
+                    text: s.to_owned(),
+                    wrap_width_bits: wrap_bits,
+                    use_monospace,
+                    pal_sig,
+                    galley: Arc::clone(&g),
+                }
+            };
+            galley_cache = Some(cached_text);
+            g
+        };
+
+        TextEdit::multiline(&mut state.text_buf)
+            .id_salt(("edit_box", line_idx))
+            .background_color(bg_fill)
+            .min_size(Vec2::new(rem_w, rem_h))
+            .desired_width(f32::INFINITY)
+            .layouter(&mut layouter)
+            .show(ui)
+    };
+    state.galley_cache = galley_cache;
+    state.span_scratch = span_scratch;
 
     if let Some(range) = output.cursor_range {
         let char_idx = range.primary.index;

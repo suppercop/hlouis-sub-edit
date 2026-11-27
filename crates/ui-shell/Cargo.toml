@@ -14,7 +14,6 @@ audio-view = { path = "../audio-view" }
 commands = { path = "../commands" }
 document = { path = "../document" }
 egui = { workspace = true, features = ["default_fonts"] }
-egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
 hlouis-tools = { path = "../hlouis-tools" }
 i18n-catalog = { path = "../i18n-catalog" }
 keyframes = { path = "../keyframes" }
@@ -37,6 +36,7 @@ ui-video = { path = "../ui-video" }
 
 [dev-dependencies]
 criterion = "0.5"
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
 
 [[bench]]
 name = "ui_shell"

@@ -22,12 +22,13 @@ use audio_view::{
     build_frame_layout,
 };
 use egui::{
-    Align2, Color32, ColorImage, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions,
-    Ui, Vec2,
+    Align2, Color32, ColorImage, FontId, Galley, Pos2, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, Vec2,
 };
 use i18n_catalog::Catalog;
 use karaoke_timing::KaraokeTimingController;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use theme::Palette;
 use timing_controller::{DialogueTimingController, DragTarget, PlayRangeKind, TimeRangeMs};
 use ui_theme::{rgba, snap_px};
@@ -74,6 +75,14 @@ struct TextureCacheKey {
     palette_rev: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RulerCacheKey {
+    start_ms: i64,
+    end_ms: i64,
+    width_bits: u32,
+    ppp_bits: u32,
+}
+
 /// Persistent UI state + cached waveform texture + reusable scratch buffers for the audio panel.
 #[allow(clippy::struct_excessive_bools)]
 pub struct AudioPanelState {
@@ -100,6 +109,8 @@ pub struct AudioPanelState {
     pixel_buf: Vec<Color32>,
     frame_layout: AudioFrameLayout,
     ruler_buf: String,
+    ruler_key: Option<RulerCacheKey>,
+    ruler_ticks: Vec<(f32, Arc<Galley>)>,
 }
 
 impl Default for AudioPanelState {
@@ -137,6 +148,8 @@ impl AudioPanelState {
             pixel_buf: Vec::with_capacity(2048 * 160),
             frame_layout: AudioFrameLayout::with_capacity(2048),
             ruler_buf: String::with_capacity(16),
+            ruler_key: None,
+            ruler_ticks: Vec::with_capacity(32),
         }
     }
 
@@ -536,30 +549,65 @@ fn audio_tool_button(
             );
         }
         AudioToolIcon::AutoCommit => {
-            p.text(
-                c,
-                Align2::CENTER_CENTER,
-                "A✓",
-                FontId::proportional(9.0),
-                green,
+            let st = Stroke::new(1.5, green);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 4.5, c.y + 0.5),
+                    Pos2::new(c.x - 1.5, c.y + 3.5),
+                ],
+                st,
             );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 1.5, c.y + 3.5),
+                    Pos2::new(c.x + 4.5, c.y - 3.5),
+                ],
+                st,
+            );
+            p.circle_filled(Pos2::new(c.x - 4.0, c.y - 3.5), 1.5, blue);
         }
         AudioToolIcon::AutoNext => {
-            p.text(
-                c,
-                Align2::CENTER_CENTER,
-                "A→",
-                FontId::proportional(9.0),
-                blue,
+            let st = Stroke::new(1.5, blue);
+            p.line_segment([Pos2::new(c.x - 4.5, c.y), Pos2::new(c.x + 4.0, c.y)], st);
+            p.line_segment(
+                [Pos2::new(c.x + 4.0, c.y), Pos2::new(c.x + 1.0, c.y - 3.0)],
+                st,
             );
+            p.line_segment(
+                [Pos2::new(c.x + 4.0, c.y), Pos2::new(c.x + 1.0, c.y + 3.0)],
+                st,
+            );
+            p.circle_filled(Pos2::new(c.x - 4.0, c.y - 4.0), 1.5, green);
         }
         AudioToolIcon::AutoScroll => {
-            p.text(
-                c,
-                Align2::CENTER_CENTER,
-                "⇄",
-                FontId::proportional(11.0),
-                amber,
+            let st = Stroke::new(1.4, amber);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 5.0, c.y - 2.0),
+                    Pos2::new(c.x + 4.5, c.y - 2.0),
+                ],
+                st,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x + 4.5, c.y - 2.0),
+                    Pos2::new(c.x + 2.0, c.y - 4.5),
+                ],
+                st,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 4.5, c.y + 2.5),
+                    Pos2::new(c.x + 5.0, c.y + 2.5),
+                ],
+                st,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 4.5, c.y + 2.5),
+                    Pos2::new(c.x - 2.0, c.y + 5.0),
+                ],
+                st,
             );
         }
         AudioToolIcon::Spectrum => {
@@ -669,11 +717,40 @@ pub fn show_audio_panel(
             let first_tick = ((vis.start_ms + step_ms - 1) / step_ms) * step_ms;
             let tick_font = FontId::proportional(9.5);
             let tick_col = Color32::from_rgb(208, 216, 230);
-            let mut t_ms = first_tick;
-            let mut tick_idx = 0usize;
-            while t_ms <= vis.end_ms {
-                let frac = (t_ms - vis.start_ms) as f32 / span_ms as f32;
-                let tx = snap_px(ruler_rect.left() + frac * ruler_rect.width(), ppp);
+            let rkey = RulerCacheKey {
+                start_ms: vis.start_ms,
+                end_ms: vis.end_ms,
+                width_bits: canvas_w.to_bits(),
+                ppp_bits: ppp.to_bits(),
+            };
+            if state.ruler_key != Some(rkey) {
+                state.ruler_ticks.clear();
+                let mut t_ms = first_tick;
+                let mut tick_idx = 0usize;
+                while t_ms <= vis.end_ms {
+                    let frac = (t_ms - vis.start_ms) as f32 / span_ms as f32;
+                    let rel_x = frac * ruler_rect.width();
+                    let total_s = (t_ms / 1_000).max(0);
+                    let h = total_s / 3600;
+                    let m = (total_s / 60) % 60;
+                    let s = total_s % 60;
+                    state.ruler_buf.clear();
+                    if tick_idx == 0 || s == 0 {
+                        let _ = write!(state.ruler_buf, "{h}:{m:02}:{s:02}");
+                    } else {
+                        let _ = write!(state.ruler_buf, "{s:02}");
+                    }
+                    let g = ui.fonts_mut(|f| {
+                        f.layout_no_wrap(state.ruler_buf.clone(), tick_font.clone(), tick_col)
+                    });
+                    state.ruler_ticks.push((rel_x, g));
+                    t_ms += step_ms;
+                    tick_idx += 1;
+                }
+                state.ruler_key = Some(rkey);
+            }
+            for (rel_x, g) in &state.ruler_ticks {
+                let tx = snap_px(ruler_rect.left() + *rel_x, ppp);
                 rp.line_segment(
                     [
                         Pos2::new(tx, ruler_rect.bottom() - 4.0),
@@ -681,25 +758,11 @@ pub fn show_audio_panel(
                     ],
                     Stroke::new(1.0 / ppp.max(0.5), tick_col),
                 );
-                let total_s = (t_ms / 1_000).max(0);
-                let h = total_s / 3600;
-                let m = (total_s / 60) % 60;
-                let s = total_s % 60;
-                state.ruler_buf.clear();
-                if tick_idx == 0 || s == 0 {
-                    let _ = write!(state.ruler_buf, "{h}:{m:02}:{s:02}");
-                } else {
-                    let _ = write!(state.ruler_buf, "{s:02}");
-                }
-                rp.text(
+                rp.galley(
                     Pos2::new(tx + 2.0, ruler_rect.top() + 2.0),
-                    Align2::LEFT_TOP,
-                    &state.ruler_buf,
-                    tick_font.clone(),
+                    Arc::clone(g),
                     tick_col,
                 );
-                t_ms += step_ms;
-                tick_idx += 1;
             }
 
             // 2. Main waveform / spectrum canvas.
