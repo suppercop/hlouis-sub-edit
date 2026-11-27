@@ -20,17 +20,19 @@ The whole reason for this rewrite is speed and smoothness. A feature that works 
 ### Budgets (release build, Windows 11, mid-range laptop, 1080p display at any DPI)
 | Area | Budget |
 |---|---|
-| Cold start to usable window (no media) | < 800 ms |
+| Idle (paused, no input) | CPU < 0.5% of one core; repaint only on input, playback or new results |
+| Cold start to usable window (no media) | < 500 ms |
 | Open 10,000-line ASS / save it | < 150 ms / < 100 ms |
-| Grid scroll, 50,000 lines | never below display refresh (60/90/120 Hz); no frame > 16 ms |
+| Grid scroll, 200,000 lines | never below display refresh (60/90/120 Hz); no frame > 16 ms; select-all < 50 ms |
 | Keystroke to screen in edit box (incl. highlight + grid refresh) | < 16 ms |
-| Any undo/redo, find/replace on 10,000 lines | < 50 ms / < 200 ms |
-| Video 1080p H.264 & HEVC 10-bit playback with subs | 0 dropped frames over 60 s |
-| Video seek to any frame (indexed) | < 100 ms typical, < 250 ms worst |
+| Undo/redo / find-replace on 20,000 lines | < 5 ms / < 200 ms |
+| Video 1080p H.264, HEVC 10-bit and 1080p60 playback with subs | 0 dropped frames over 60 s; libass < 3 ms/frame |
+| Open a 24-min 1080p episode (index cached on disk) | first frame < 1 s; uncached indexing runs in background with progress |
+| Video seek to any frame / ±1 frame / next keyframe | < 100 ms (worst < 250 ms) / < 20 ms / < 50 ms |
 | Subtitle re-render after an edit (current frame) | < 16 ms |
 | Audio waveform for a 24-min episode | first view < 1 s, full < 3 s (background) |
 | Audio display scroll/zoom (waveform or spectrum) | at display refresh |
-| Memory, 1080p episode + 1,000-line script loaded | < 800 MB |
+| Memory (private bytes), 1080p episode + 20,000-line script | < 600 MB |
 
 ### Rules
 1. Nothing slow on the UI thread: decoding, indexing, waveform/spectrum, file I/O, Lua, font scanning, SCXvid all run on worker threads with progress + cancel. The UI thread only lays out and paints.
