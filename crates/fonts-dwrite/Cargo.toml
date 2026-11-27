@@ -1,0 +1,21 @@
+[package]
+name = "fonts-dwrite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fonts = { path = "../fonts" }
+thiserror.workspace = true
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_DirectWrite"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+ass-core = { path = "../ass-core" }
+criterion.workspace = true
+
+[[bench]]
+name = "fonts_dwrite"
+harness = false
