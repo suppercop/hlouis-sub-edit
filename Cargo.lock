@@ -1040,6 +1040,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dialogs-model"
+version = "0.1.0"
+dependencies = [
+ "ass-tools",
+ "criterion",
+ "script-props",
+ "serde",
+ "serde_json",
+ "settings",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1075,6 +1088,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
  "libloading",
+]
+
+[[package]]
+name = "document"
+version = "0.1.0"
+dependencies = [
+ "ass-core",
+ "autosave",
+ "criterion",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1626,6 +1650,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "frame-cache"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+]
+
+[[package]]
 name = "frame-tools"
 version = "0.1.0"
 dependencies = [
@@ -1955,6 +1986,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "i18n-catalog"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2231,7 +2269,6 @@ version = "0.1.0"
 dependencies = [
  "ass-core",
  "criterion",
- "smallvec",
 ]
 
 [[package]]
@@ -2430,6 +2467,16 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "mkv-import"
+version = "0.1.0"
+dependencies = [
+ "ass-core",
+ "criterion",
+ "mkv-subs",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3038,6 +3085,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "perf-metrics"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+]
+
+[[package]]
 name = "petgraph"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3183,6 +3237,15 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "playback"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "keyframes",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "plotters"

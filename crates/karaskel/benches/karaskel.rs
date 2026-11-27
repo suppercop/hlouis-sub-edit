@@ -1,6 +1,6 @@
 use ass_core::{AssStyle, ScriptFile};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use karaskel::{preprocess_script, TextExtents, TextMetric};
+use karaskel::{preprocess_script_into, KaraskelOutput, TextExtents, TextMetric};
 use std::fmt::Write as _;
 
 struct FastMockExtents;
@@ -35,10 +35,11 @@ fn build_2000_karaoke_lines() -> ScriptFile {
 
 fn bench_karaskel(c: &mut Criterion) {
     let script = build_2000_karaoke_lines();
+    let mut out = KaraskelOutput::default();
 
     c.bench_function("karaskel_preprocess_2000_lines_20_syls", |b| {
         b.iter(|| {
-            let out = preprocess_script(black_box(&script), &FastMockExtents, false);
+            preprocess_script_into(black_box(&script), &FastMockExtents, false, &mut out);
             black_box(out.lines.len());
         });
     });
