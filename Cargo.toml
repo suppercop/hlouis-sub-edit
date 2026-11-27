@@ -19,6 +19,7 @@ members = [
     "crates/ffms2-sys",
     "crates/render",
     "crates/media",
+    "crates/karaskel",
     "crates/script-props",
     "crates/style-editor",
     "crates/grid-model",
