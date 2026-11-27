@@ -50,7 +50,7 @@ All `--bench-ui` measurements below were captured with `target\release\hlouis-su
 | `resample_resolution_20k_tags_drawings` | `<= 15 ms` | `11.116 ms` | **PASS** (down from `38.9 ms`) |
 | `karaoke_parse_rebuild_20k` | `<= 15 ms` | `11.062 ms` | **PASS** (down from `38.9 ms`) |
 
-Full workspace CI ceiling calibration (`median * 1.3`, or `median * 2.0` under `1 µs`, over 3 `windows-latest` CI runs) is stored in `ci/bench-ceilings.json` and enforced by `scripts/compare-benches.ps1` alongside the `+10%` regression gate.
+Full workspace CI ceiling calibration (`median * 1.3`, or `median * 2.0` under `1 µs`, over 3 `windows-latest` CI runs via [calibration run 46018649176](https://github.com/suppercop/hlouis-sub-edit/actions/runs/46018649176), covering all `91` Criterion benchmarks) is stored in `ci/bench-ceilings.json` and enforced by `scripts/compare-benches.ps1` alongside the `+10%` regression gate.
 
 ---
 
@@ -73,8 +73,9 @@ Verified passing under `cargo test --workspace` with thread-local `#[global_allo
 ## 4. Open Performance Issues
 
 GitHub issues opened for every tightened budget row not yet passed end-to-end (with measured baselines and concrete architectural plans):
-- `perf: cold start to usable window` (`1.65–2.31 s` vs `< 300 ms`)
-- `perf: keystroke to screen in edit box` (`p95 11.84 ms` windowed DWM VSync vs `< 8 ms`)
-- `perf: subtitle re-render after edit` (`20k` full reload `p95 42.06 ms` vs `< 8 ms`)
-- `perf: step +-1 frame` (`p95 34.7–51.9 ms` past 4-frame cache vs `< 10 ms`)
-- `perf: video playback upload` (`p99 2.20 ms` DX12 `write_texture` on 90 Hz iGPU vs `< 2 ms`)
+- [#8](https://github.com/suppercop/hlouis-sub-edit/issues/8) `perf: cold start to usable window` (`1.65–2.31 s` vs `< 300 ms`)
+- [#9](https://github.com/suppercop/hlouis-sub-edit/issues/9) `perf: keystroke to screen in edit box` (`p95 11.84 ms` windowed DWM VSync vs `< 8 ms`)
+- [#10](https://github.com/suppercop/hlouis-sub-edit/issues/10) `perf: subtitle re-render after edit` (`20k` full reload `p95 42.06 ms` vs `< 8 ms`)
+- [#11](https://github.com/suppercop/hlouis-sub-edit/issues/11) `perf: step +-1 frame` (`p95 34.7–51.9 ms` past 4-frame cache vs `< 10 ms`)
+- [#12](https://github.com/suppercop/hlouis-sub-edit/issues/12) `perf: video playback upload` (`p99 2.20 ms` DX12 `write_texture` on 90 Hz iGPU vs `< 2 ms`)
+- [#13](https://github.com/suppercop/hlouis-sub-edit/issues/13) `perf: idle paused cpu sampling` (`0.00 repaints/s` passes; `1.008%` OS 15.6 ms timer quantum artifact over `1.55 s` window vs `< 0.2%`)
