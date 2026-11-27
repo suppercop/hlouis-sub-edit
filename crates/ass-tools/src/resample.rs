@@ -74,6 +74,7 @@ struct ResampleState {
     ry: f64,
     ar: f64,
     shift_x: f64,
+    shift_right: f64,
     shift_y: f64,
     color_conv: Option<YcbcrConverter>,
 }
@@ -343,11 +344,25 @@ pub fn resample_resolution(
     }
 
     // Scale all events (margins + override tags + drawings).
+    // Note (Aegisub resolution_resampler.cpp): non-zero per-line margins receive the margin/border
+    // shift just like styles, whereas 0 means "use style margin" and stays 0.
     if let Some(events_sec) = script.events_section() {
         for (idx, ev) in events_sec.events().enumerate() {
-            let margin_left = scale_margin(ev.margin_l(), state.rx, 0.0);
-            let margin_right = scale_margin(ev.margin_r(), state.rx, 0.0);
-            let margin_vert = scale_margin(ev.margin_v(), state.ry, 0.0);
+            let margin_left = if ev.margin_l() == 0 {
+                0
+            } else {
+                scale_margin(ev.margin_l(), state.rx, state.shift_x)
+            };
+            let margin_right = if ev.margin_r() == 0 {
+                0
+            } else {
+                scale_margin(ev.margin_r(), state.rx, state.shift_right)
+            };
+            let margin_vert = if ev.margin_v() == 0 {
+                0
+            } else {
+                scale_margin(ev.margin_v(), state.ry, state.shift_y)
+            };
 
             // Fast path: skip tag parser when text contains no `{` override block.
             let new_text = if ev.text().contains('{') {
@@ -438,6 +453,7 @@ fn compute_state(src_x: u32, src_y: u32, opts: &ResampleOptions) -> ResampleStat
         ry,
         ar,
         shift_x: f64::from(opts.margin_left) * rx + border_x,
+        shift_right: f64::from(opts.margin_right) * rx + border_x,
         shift_y: f64::from(opts.margin_top) * ry + border_y,
         color_conv: None,
     }
@@ -453,7 +469,7 @@ fn resample_style(st: &AssStyle, s: ResampleState) -> AssStyle {
         out.set_scale_x(round_2(st.scale_x() * s.ar));
     }
     out.set_margin_l(scale_margin(st.margin_l(), s.rx, s.shift_x));
-    out.set_margin_r(scale_margin(st.margin_r(), s.rx, s.shift_x));
+    out.set_margin_r(scale_margin(st.margin_r(), s.rx, s.shift_right));
     out.set_margin_v(scale_margin(st.margin_v(), s.ry, s.shift_y));
     if let Some(conv) = s.color_conv {
         if let Some(c) = convert_ass_style_colour(st.primary_colour(), conv) {
@@ -500,7 +516,12 @@ fn resample_event_text(text: &str, state: ResampleState) -> Option<String> {
             TextBlock::Plain(s) => out.push_str(s),
             TextBlock::Escape(esc) => out.push_str(esc.as_str()),
             TextBlock::Drawing { level, commands } => {
-                let scaled = scale_drawing_commands(commands, state.rx, state.ry, 0.0, 0.0, *level);
+                // Aegisub resolution_resampler.cpp passes shift=(0, 0) and rx/ar for \p>0 drawings:
+                // drawings are positioned by \pos or alignment/margins (not screen borders), and
+                // dividing X by ar avoids double-stretching when Stretch scales ScaleX/\fscx by ar.
+                let drawing_rx = state.rx / state.ar;
+                let scaled =
+                    scale_drawing_commands(commands, drawing_rx, state.ry, 0.0, 0.0, *level);
                 if scaled != *commands {
                     changed = true;
                 }
@@ -959,5 +980,51 @@ Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\c&H00FF00&\\1c&H0000FF&\\2c
             r2.abs_diff(80) <= 2 && g2.abs_diff(160) <= 2 && b2.abs_diff(120) <= 2,
             "in-gamut round-trip=({r2},{g2},{b2})"
         );
+    }
+
+    #[test]
+    fn drawings_omit_border_shift_and_stretch_uncompensated_while_clips_and_nonzero_event_margins_shift(
+    ) {
+        // 4:3 (640x480) -> 16:9 (1280x720) AddBorders: r = 1.5, border_x = 160, border_y = 0.
+        let raw = "\
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 480
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,20,0,0,,{\\clip(m 0 0 l 100 50)}Clipped
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\\p1}m 0 0 l 100 50{\\p0}
+";
+        let mut script_ab = parse_ass(raw).value;
+        let opts_ab = ResampleOptions::new(1280, 720);
+        resample_resolution(&script_ab, &opts_ab)
+            .expect("resample")
+            .apply(&mut script_ab)
+            .expect("apply");
+
+        let evs: Vec<_> = script_ab.events().collect();
+        // Vector \clip gets border_x=160 shift; non-zero MarginL=20 shifts (20*1.5 + 160 = 190); 0 MarginR stays 0.
+        assert_eq!(evs[0].text(), r"{\clip(m 160 0 l 310 75)}Clipped");
+        assert_eq!(evs[0].margin_l(), 190);
+        assert_eq!(evs[0].margin_r(), 0);
+        // \p1 drawing does NOT get the border_x=160 shift (matches Aegisub resolution_resampler.cpp).
+        assert_eq!(evs[1].text(), r"{\p1}m 0 0 l 150 75{\p0}");
+
+        // In Stretch mode (640x480 -> 1920x1080: rx=3.0, ry=2.25, ar=4/3), \p1 X uses rx/ar == ry == 2.25.
+        let mut script_st = parse_ass(raw).value;
+        let mut opts_st = ResampleOptions::new(1920, 1080);
+        opts_st.ar_mode = AspectRatioMode::Stretch;
+        resample_resolution(&script_st, &opts_st)
+            .expect("stretch")
+            .apply(&mut script_st)
+            .expect("apply");
+        let st_evs: Vec<_> = script_st.events().collect();
+        assert_eq!(st_evs[1].text(), r"{\p1}m 0 0 l 225 112.5{\p0}");
     }
 }
