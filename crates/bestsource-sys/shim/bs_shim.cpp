@@ -7,9 +7,12 @@
 #include <cstring>
 #include <algorithm>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "audiosource.h"
 #include "bsshared.h"
@@ -132,7 +135,51 @@ public:
     }
 };
 
+struct PartialIndexData {
+    std::mutex Mu;
+    std::vector<int64_t> Pts;
+    std::vector<int64_t> Keyframes;
+};
+
+thread_local PartialIndexData *g_partial_sink = nullptr;
+thread_local bool g_abort_on_cache_miss = false;
+
+struct ScopedPartialHook {
+    PartialIndexData *Prev;
+    explicit ScopedPartialHook(PartialIndexData *Sink) : Prev(g_partial_sink) { g_partial_sink = Sink; }
+    ~ScopedPartialHook() { g_partial_sink = Prev; }
+};
+
+struct ScopedCacheOnlyGuard {
+    bool Prev;
+    explicit ScopedCacheOnlyGuard(bool Enable) : Prev(g_abort_on_cache_miss) { g_abort_on_cache_miss = Enable; }
+    ~ScopedCacheOnlyGuard() { g_abort_on_cache_miss = Prev; }
+};
+
 } // namespace
+
+namespace bs_shim_hooks {
+void OnFrameIndexed(int64_t pts, bool keyframe) noexcept {
+    if (PartialIndexData *Sink = g_partial_sink) {
+        try {
+            std::lock_guard<std::mutex> Lock(Sink->Mu);
+            const int64_t Idx = static_cast<int64_t>(Sink->Pts.size());
+            Sink->Pts.push_back(pts);
+            if (keyframe)
+                Sink->Keyframes.push_back(Idx);
+        } catch (...) {
+        }
+    }
+}
+
+bool ShouldAbortOnCacheMiss() noexcept {
+    return g_abort_on_cache_miss;
+}
+} // namespace bs_shim_hooks
+
+struct bs_partial_index {
+    std::shared_ptr<PartialIndexData> Data;
+};
 
 struct bs_video {
     std::unique_ptr<BestVideoSource> Src;
@@ -146,6 +193,54 @@ struct bs_audio {
     bs_cancel_cb CancelCb = nullptr;
     void *CancelUser = nullptr;
 };
+
+extern "C" bs_partial_index *bs_partial_index_create(void) {
+    try {
+        return new bs_partial_index{std::make_shared<PartialIndexData>()};
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" void bs_partial_index_free(bs_partial_index *p) {
+    delete p;
+}
+
+extern "C" int64_t bs_partial_index_len(const bs_partial_index *p) {
+    if (!p || !p->Data)
+        return 0;
+    std::lock_guard<std::mutex> Lock(p->Data->Mu);
+    return static_cast<int64_t>(p->Data->Pts.size());
+}
+
+extern "C" int bs_partial_index_is_exact_at(const bs_partial_index *p, int64_t n) {
+    if (!p || !p->Data || n < 0)
+        return 0;
+    std::lock_guard<std::mutex> Lock(p->Data->Mu);
+    const size_t Idx = static_cast<size_t>(n);
+    return (Idx < p->Data->Pts.size() && p->Data->Pts[Idx] != AV_NOPTS_VALUE) ? 1 : 0;
+}
+
+extern "C" int64_t bs_partial_index_next_keyframe(const bs_partial_index *p, int64_t current) {
+    if (!p || !p->Data)
+        return -1;
+    std::lock_guard<std::mutex> Lock(p->Data->Mu);
+    const auto &Kfs = p->Data->Keyframes;
+    auto It = std::upper_bound(Kfs.begin(), Kfs.end(), current);
+    return (It != Kfs.end()) ? *It : -1;
+}
+
+extern "C" int64_t bs_partial_index_prev_keyframe(const bs_partial_index *p, int64_t current) {
+    if (!p || !p->Data)
+        return -1;
+    std::lock_guard<std::mutex> Lock(p->Data->Mu);
+    const auto &Kfs = p->Data->Keyframes;
+    auto It = std::lower_bound(Kfs.begin(), Kfs.end(), current);
+    if (It == Kfs.begin())
+        return -1;
+    --It;
+    return *It;
+}
 
 extern "C" int bs_version(void) {
     return BEST_SOURCE_VERSION_MAJOR * 100 + BEST_SOURCE_VERSION_MINOR;
@@ -167,16 +262,24 @@ extern "C" int bs_track_list(const char *path_utf8, int *media_types, int cap, c
     });
 }
 
-extern "C" int bs_video_open(const char *path_utf8, int track, int threads, int cache_mode,
-                             const char *cache_path_utf8, bs_progress_cb progress, void *progress_user,
-                             bs_video **out, char *err, size_t err_len) {
+extern "C" int bs_video_open_with_partial(const char *path_utf8, int track, int threads, int cache_mode,
+                                          const char *cache_path_utf8, bs_partial_index *partial,
+                                          bs_progress_cb progress, void *progress_user, bs_video **out,
+                                          char *err, size_t err_len) {
     if (!out || !path_utf8) {
         SetErr(err, err_len, "null argument");
         return BS_ERR;
     }
     *out = nullptr;
+    PartialIndexData *Sink = (partial && partial->Data) ? partial->Data.get() : nullptr;
+    if (Sink) {
+        std::lock_guard<std::mutex> Lock(Sink->Mu);
+        Sink->Pts.clear();
+        Sink->Keyframes.clear();
+    }
     ProgressCtx Ctx{progress, progress_user};
     int R = Guard(err, err_len, [&]() -> int {
+        ScopedPartialHook Hook(Sink);
         auto V = std::make_unique<bs_video>();
         V->Src = std::make_unique<BestVideoSource>(CreateProbablyUTF8Path(path_utf8), false, std::nullopt, track, 0,
                                                    ThreadsOf(threads), cache_mode, CachePathOf(cache_path_utf8),
@@ -189,6 +292,31 @@ extern "C" int bs_video_open(const char *path_utf8, int track, int threads, int 
         return BS_CANCELLED;
     }
     return R;
+}
+
+extern "C" int bs_video_open(const char *path_utf8, int track, int threads, int cache_mode,
+                             const char *cache_path_utf8, bs_progress_cb progress, void *progress_user,
+                             bs_video **out, char *err, size_t err_len) {
+    return bs_video_open_with_partial(path_utf8, track, threads, cache_mode, cache_path_utf8, nullptr,
+                                      progress, progress_user, out, err, err_len);
+}
+
+extern "C" int bs_video_open_cached(const char *path_utf8, int track, int threads, int cache_mode,
+                                    const char *cache_path_utf8, bs_video **out, char *err, size_t err_len) {
+    if (!out || !path_utf8) {
+        SetErr(err, err_len, "null argument");
+        return BS_ERR;
+    }
+    *out = nullptr;
+    return Guard(err, err_len, [&]() -> int {
+        ScopedCacheOnlyGuard CacheGuard(true);
+        auto V = std::make_unique<bs_video>();
+        V->Src = std::make_unique<BestVideoSource>(CreateProbablyUTF8Path(path_utf8), false, std::nullopt, track, 0,
+                                                   ThreadsOf(threads), cache_mode, CachePathOf(cache_path_utf8),
+                                                   nullptr, nullptr);
+        *out = V.release();
+        return BS_OK;
+    });
 }
 
 extern "C" void bs_video_close(bs_video *v) {
@@ -204,6 +332,15 @@ extern "C" void bs_video_set_cancel(bs_video *v, bs_cancel_cb cb, void *user) {
         v->Src->SetCancellationCallback([v]() { return v->CancelCb && v->CancelCb(v->CancelUser) != 0; });
     else
         v->Src->SetCancellationCallback(nullptr);
+}
+
+extern "C" void bs_video_set_limits(bs_video *v, size_t max_cache_bytes, int max_decoders) {
+    if (!v || !v->Src)
+        return;
+    if (max_cache_bytes > 0)
+        v->Src->SetMaxCacheSize(max_cache_bytes);
+    if (max_decoders > 0)
+        v->Src->SetMaxDecoderInstances(max_decoders);
 }
 
 extern "C" void bs_video_get_props(const bs_video *v, bs_video_props *o) {
@@ -311,6 +448,23 @@ extern "C" int bs_audio_open(const char *path_utf8, int track, int threads, int 
     return R;
 }
 
+extern "C" int bs_audio_open_cached(const char *path_utf8, int track, int threads, int cache_mode,
+                                    const char *cache_path_utf8, bs_audio **out, char *err, size_t err_len) {
+    if (!out || !path_utf8) {
+        SetErr(err, err_len, "null argument");
+        return BS_ERR;
+    }
+    *out = nullptr;
+    return Guard(err, err_len, [&]() -> int {
+        ScopedCacheOnlyGuard CacheGuard(true);
+        auto A = std::make_unique<bs_audio>();
+        A->Src = std::make_unique<BestAudioSource>(CreateProbablyUTF8Path(path_utf8), track, -1, ThreadsOf(threads),
+                                                   cache_mode, CachePathOf(cache_path_utf8), nullptr, 0.0, nullptr);
+        *out = A.release();
+        return BS_OK;
+    });
+}
+
 extern "C" void bs_audio_close(bs_audio *a) {
     delete a;
 }
@@ -360,13 +514,18 @@ extern "C" int bs_audio_get_packed(bs_audio *a, uint8_t *dst, int64_t start, int
 
 struct bs_quick {
     std::unique_ptr<LWVideoDecoder> Dec;
+    std::filesystem::path SourcePath;
+    int TrackArg = -1;
+    int Threads = 0;
     LWVideoProperties VP = {};
     AVFrame *Last = nullptr; /* the frame returned for slot LastN */
     int64_t LastN = -1;
+    bool LastExact = false;
     int64_t FirstPTS = 0;
     int Width = 0;
     int Height = 0;
     int Track = -1;
+    std::shared_ptr<PartialIndexData> Partial;
     RgbaConverter Conv;
     ~bs_quick() { av_frame_free(&Last); }
 
@@ -385,27 +544,166 @@ struct bs_quick {
         return static_cast<int64_t>(Num / Den + (Num >= 0 ? 0.5L : -0.5L));
     }
 
-    int64_t PtsOfSlot(int64_t N) const {
-        const long double T = static_cast<long double>(N) * VP.FPS.Den * VP.TimeBase.Den /
+    int64_t PtsDeltaForFrames(int64_t DeltaFrames) const {
+        const long double T = static_cast<long double>(DeltaFrames) * VP.FPS.Den * VP.TimeBase.Den /
                               (static_cast<long double>(VP.FPS.Num) * VP.TimeBase.Num);
-        return FirstPTS + static_cast<int64_t>(T);
+        return static_cast<int64_t>(T + (T >= 0 ? 0.5L : -0.5L));
     }
 
-    void Keep(AVFrame *F, int64_t N) {
+    int64_t PtsOfSlot(int64_t N) const {
+        return FirstPTS + PtsDeltaForFrames(N);
+    }
+
+    int64_t FrameDeltaForPts(int64_t DeltaPts) const {
+        const long double Num = static_cast<long double>(DeltaPts) * VP.TimeBase.Num * VP.FPS.Num;
+        const long double Den = static_cast<long double>(VP.TimeBase.Den) * VP.FPS.Den;
+        return static_cast<int64_t>(Num / Den + (Num >= 0 ? 0.5L : -0.5L));
+    }
+
+    void Keep(AVFrame *F, int64_t N, bool Exact) {
         av_frame_free(&Last);
         Last = F;
         LastN = N;
+        LastExact = Exact;
     }
 
-    /* Decodes forward until a frame at slot >= N; returns false at end of stream. */
-    bool DecodeForwardTo(int64_t N) {
+    struct PartialSnapshot {
+        bool IsExact = false;
+        int64_t TargetPts = AV_NOPTS_VALUE;
+        int64_t LastIndexedIdx = -1;
+        int64_t LastIndexedPts = AV_NOPTS_VALUE;
+        int64_t CandidateKfPts[8] = {};
+        size_t NumCandidates = 0;
+    };
+
+    PartialSnapshot SnapshotPartial(int64_t N) const {
+        PartialSnapshot S;
+        if (!Partial)
+            return S;
+        std::lock_guard<std::mutex> Lock(Partial->Mu);
+        const size_t Count = Partial->Pts.size();
+        for (size_t Back = 0; Back < Count && Back < 16; Back++) {
+            const size_t Idx = Count - 1 - Back;
+            if (Partial->Pts[Idx] != AV_NOPTS_VALUE) {
+                S.LastIndexedIdx = static_cast<int64_t>(Idx);
+                S.LastIndexedPts = Partial->Pts[Idx];
+                break;
+            }
+        }
+        if (N >= 0 && static_cast<size_t>(N) < Count && Partial->Pts[static_cast<size_t>(N)] != AV_NOPTS_VALUE) {
+            S.IsExact = true;
+            S.TargetPts = Partial->Pts[static_cast<size_t>(N)];
+            auto It = std::upper_bound(Partial->Keyframes.begin(), Partial->Keyframes.end(), N);
+            while (It != Partial->Keyframes.begin() && S.NumCandidates < 7) {
+                --It;
+                const int64_t KfIdx = *It;
+                if (KfIdx >= 0 && static_cast<size_t>(KfIdx) < Count) {
+                    const int64_t KfPts = Partial->Pts[static_cast<size_t>(KfIdx)];
+                    if (KfPts != AV_NOPTS_VALUE)
+                        S.CandidateKfPts[S.NumCandidates++] = KfPts;
+                }
+            }
+            const int64_t ZeroPts = Partial->Pts[0];
+            if (ZeroPts != AV_NOPTS_VALUE && S.NumCandidates < 8) {
+                bool HasZero = false;
+                for (size_t i = 0; i < S.NumCandidates; i++) {
+                    if (S.CandidateKfPts[i] == ZeroPts) {
+                        HasZero = true;
+                        break;
+                    }
+                }
+                if (!HasZero)
+                    S.CandidateKfPts[S.NumCandidates++] = ZeroPts;
+            }
+        }
+        return S;
+    }
+
+    void ReopenDecoder() {
+        std::map<std::string, std::string> Opts;
+        Dec = std::make_unique<LWVideoDecoder>(SourcePath, false, std::nullopt, TrackArg, 0,
+                                               ThreadsOf(Threads), Opts, nullptr);
+    }
+
+    bool DecodeForwardExact(int64_t N, int64_t TargetPts) {
         while (true) {
             AVFrame *F = Dec->GetNextFrame();
             if (!F)
                 return false;
-            int64_t S = SlotOf(PtsOf(F));
-            if (S >= N) {
-                Keep(F, S);
+            const int64_t P = PtsOf(F);
+            if (P == TargetPts) {
+                Keep(F, N, true);
+                return true;
+            }
+            if (P != AV_NOPTS_VALUE && P > TargetPts) {
+                av_frame_free(&F);
+                return false;
+            }
+            av_frame_free(&F);
+        }
+    }
+
+    bool GetExact(int64_t N, const PartialSnapshot &S) {
+        /* Sequential or short forward step from an already-exact decoder position needs no seek. */
+        if (Last && LastExact && N > LastN && N - LastN <= 48) {
+            if (DecodeForwardExact(N, S.TargetPts))
+                return true;
+        }
+        for (size_t i = 0; i < S.NumCandidates; i++) {
+            if (!Dec->Seek(S.CandidateKfPts[i]))
+                continue;
+            AVFrame *F = Dec->GetNextFrame();
+            if (!F)
+                continue;
+            int64_t P = PtsOf(F);
+            if (P != AV_NOPTS_VALUE && P > S.TargetPts) {
+                av_frame_free(&F);
+                continue;
+            }
+            while (true) {
+                P = PtsOf(F);
+                if (P == S.TargetPts) {
+                    Keep(F, N, true);
+                    return true;
+                }
+                if (P != AV_NOPTS_VALUE && P > S.TargetPts) {
+                    if (i + 1 == S.NumCandidates) {
+                        Keep(F, N, false);
+                        return true;
+                    }
+                    av_frame_free(&F);
+                    break;
+                }
+                AVFrame *Next = Dec->GetNextFrame();
+                if (!Next) {
+                    if (i + 1 == S.NumCandidates) {
+                        Keep(F, N, false);
+                        return true;
+                    }
+                    av_frame_free(&F);
+                    break;
+                }
+                av_frame_free(&F);
+                F = Next;
+            }
+        }
+        /* Fallback: reopen from frame 0 if seeking to start failed or overshot on this container. */
+        ReopenDecoder();
+        if (DecodeForwardExact(N, S.TargetPts))
+            return true;
+        return false;
+    }
+
+    /* Decodes forward until a frame at slot >= N; returns false at end of stream. */
+    bool DecodeForwardTo(int64_t N, int64_t CurSlot) {
+        while (true) {
+            AVFrame *F = Dec->GetNextFrame();
+            if (!F)
+                return false;
+            const int64_t P = PtsOf(F);
+            CurSlot = (P == AV_NOPTS_VALUE) ? (CurSlot + 1) : SlotOf(P);
+            if (CurSlot >= N) {
+                Keep(F, CurSlot, false);
                 return true;
             }
             av_frame_free(&F);
@@ -413,31 +711,52 @@ struct bs_quick {
     }
 
     void Get(int64_t N) {
-        if (Last && LastN == N)
+        const PartialSnapshot S = SnapshotPartial(N);
+        if (Last && LastN == N && (LastExact || !S.IsExact))
             return;
+        if (S.IsExact && GetExact(N, S))
+            return;
+
         /* Forward within a short distance: just keep decoding. */
         if (Last && N > LastN && N - LastN <= 48) {
-            DecodeForwardTo(N); /* at end of stream the last decoded frame is kept */
+            DecodeForwardTo(N, LastN); /* at end of stream the last decoded frame is kept */
             return;
         }
         const int64_t BackStep = 10 * (VP.FPS.Num / std::max(1, VP.FPS.Den) + 1);
-        int64_t Target = PtsOfSlot(N);
+        int64_t Target = (S.LastIndexedPts != AV_NOPTS_VALUE && N >= S.LastIndexedIdx)
+                             ? (S.LastIndexedPts + PtsDeltaForFrames(N - S.LastIndexedIdx))
+                             : PtsOfSlot(N);
         for (int Attempt = 0; Attempt < 3; Attempt++) {
-            if (!Dec->Seek(Target))
+            if (!Dec->Seek(Target)) {
+                if (N > 0 && Attempt < 2) {
+                    Target = PtsOfSlot(std::max<int64_t>(0, N - (Attempt + 1) * BackStep));
+                    continue;
+                }
                 break;
+            }
             AVFrame *F = Dec->GetNextFrame();
-            if (!F)
+            if (!F) {
+                if (N > 0 && Attempt < 2) {
+                    Target = PtsOfSlot(std::max<int64_t>(0, N - (Attempt + 1) * BackStep));
+                    continue;
+                }
+                if (Last)
+                    return;
                 break;
-            int64_t S = SlotOf(PtsOf(F));
-            if (S > N && N > 0 && Attempt < 2) {
+            }
+            const int64_t P = PtsOf(F);
+            int64_t Slot = (S.LastIndexedPts != AV_NOPTS_VALUE && P != AV_NOPTS_VALUE && N >= S.LastIndexedIdx)
+                               ? (S.LastIndexedIdx + FrameDeltaForPts(P - S.LastIndexedPts))
+                               : SlotOf(P);
+            if (Slot > N && N > 0 && Attempt < 2) {
                 /* Landed after the target (sparse cues or open GOP): seek further back. */
                 av_frame_free(&F);
                 Target = PtsOfSlot(std::max<int64_t>(0, N - (Attempt + 1) * BackStep));
                 continue;
             }
-            Keep(F, S);
-            if (S < N)
-                DecodeForwardTo(N);
+            Keep(F, Slot, false);
+            if (Slot < N)
+                DecodeForwardTo(N, Slot);
             return;
         }
         throw BestSourceException("seek failed");
@@ -452,8 +771,11 @@ extern "C" int bs_quick_open(const char *path_utf8, int track, int threads, bs_q
     *out = nullptr;
     return Guard(err, err_len, [&]() -> int {
         auto Q = std::make_unique<bs_quick>();
+        Q->SourcePath = CreateProbablyUTF8Path(path_utf8);
+        Q->TrackArg = track;
+        Q->Threads = threads;
         std::map<std::string, std::string> Opts;
-        Q->Dec = std::make_unique<LWVideoDecoder>(CreateProbablyUTF8Path(path_utf8), false, std::nullopt, track, 0,
+        Q->Dec = std::make_unique<LWVideoDecoder>(Q->SourcePath, false, std::nullopt, track, 0,
                                                   ThreadsOf(threads), Opts, nullptr);
         Q->Dec->GetVideoProperties(Q->VP);
         Q->Track = Q->Dec->GetTrack();
@@ -492,10 +814,16 @@ extern "C" int bs_quick_open(const char *path_utf8, int track, int threads, bs_q
         Q->FirstPTS = bs_quick::PtsOf(F);
         if (Q->FirstPTS == AV_NOPTS_VALUE)
             Q->FirstPTS = 0;
-        Q->Keep(F, 0);
+        Q->Keep(F, 0, bs_quick::PtsOf(F) != AV_NOPTS_VALUE);
         *out = Q.release();
         return BS_OK;
     });
+}
+
+extern "C" void bs_quick_set_partial_index(bs_quick *q, bs_partial_index *partial) {
+    if (!q)
+        return;
+    q->Partial = partial ? partial->Data : nullptr;
 }
 
 extern "C" void bs_quick_close(bs_quick *q) {

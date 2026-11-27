@@ -52,6 +52,18 @@ fn main() {
     for stamp in ["bestsource.stamp", "libp2p.stamp", "xxhash.stamp"] {
         println!("cargo:rerun-if-changed={}", src.join(stamp).display());
     }
+    println!(
+        "cargo:rerun-if-changed={}",
+        bs.join("videosource.cpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bs.join("audiosource.cpp").display()
+    );
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set"));
+    let patched_video = patch_videosource(&bs.join("videosource.cpp"), &out_dir);
+    let patched_audio = patch_audiosource(&bs.join("audiosource.cpp"), &out_dir);
 
     let mut build = cc::Build::new();
     build
@@ -72,15 +84,11 @@ fn main() {
         .include(&xxh)
         .include(&include)
         .include("shim");
-    for f in [
-        "audiosource.cpp",
-        "bsshared.cpp",
-        "gpuhash.cpp",
-        "tracklist.cpp",
-        "videosource.cpp",
-    ] {
+    for f in ["bsshared.cpp", "gpuhash.cpp", "tracklist.cpp"] {
         build.file(bs.join(f));
     }
+    build.file(&patched_audio);
+    build.file(&patched_video);
     for f in [
         "p2p_api.cpp",
         "v210.cpp",
@@ -100,4 +108,82 @@ fn main() {
     for l in ["shell32", "ole32", "uuid"] {
         println!("cargo:rustc-link-lib=dylib={l}");
     }
+}
+
+fn patch_once(src: &mut String, anchor: &str, replacement: &str, label: &str) {
+    assert!(
+        src.contains(anchor),
+        "bestsource patch anchor missing for {label}: {anchor:?}"
+    );
+    *src = src.replacen(anchor, replacement, 1);
+}
+
+fn patch_videosource(src_path: &Path, out_dir: &Path) -> PathBuf {
+    let mut text = std::fs::read_to_string(src_path)
+        .expect("read videosource.cpp")
+        .replace("\r\n", "\n");
+
+    patch_once(
+        &mut text,
+        "#include \"version.h\"",
+        "#include \"version.h\"\n\nnamespace bs_shim_hooks {\nvoid OnFrameIndexed(int64_t pts, bool keyframe) noexcept;\nbool ShouldAbortOnCacheMiss() noexcept;\n}",
+        "videosource hooks decl",
+    );
+    patch_once(
+        &mut text,
+        "        const bool IndexFromCache = (CacheMode != bcmDisable) && ReadVideoTrackIndex(IsAbsolutePathCacheMode(CacheMode), CachePath);\n        if (!IndexFromCache) {",
+        "        const bool IndexFromCache = (CacheMode != bcmDisable) && ReadVideoTrackIndex(IsAbsolutePathCacheMode(CacheMode), CachePath);\n        if (!IndexFromCache) {\n            if (bs_shim_hooks::ShouldAbortOnCacheMiss())\n                throw BestSourceException(\"cached video index unavailable or invalid\");",
+        "videosource cache-only guard",
+    );
+    patch_once(
+        &mut text,
+        "        TrackIndex.Frames.push_back({ F->pts, F->repeat_pict, !!(F->flags & AV_FRAME_FLAG_KEY), !!(F->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST), GetEffectivePixelFormat(F), VisibleWidth(F), VisibleHeight(F), HashDecodedFrame(Decoder.get(), F) });",
+        "        TrackIndex.Frames.push_back({ F->pts, F->repeat_pict, !!(F->flags & AV_FRAME_FLAG_KEY), !!(F->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST), GetEffectivePixelFormat(F), VisibleWidth(F), VisibleHeight(F), HashDecodedFrame(Decoder.get(), F) });\n        bs_shim_hooks::OnFrameIndexed(F->pts, !!(F->flags & AV_FRAME_FLAG_KEY));",
+        "videosource progressive hook",
+    );
+    patch_once(
+        &mut text,
+        "        int DictSize = ReadInt(F);\n        if (DictSize > 0xFF)\n            return false;",
+        "        int DictSize = ReadInt(F);\n        if (DictSize < 0 || DictSize > 0xFF)\n            return false;",
+        "videosource dict size check",
+    );
+    patch_once(
+        &mut text,
+        "    for (const auto &FI : Index.Frames)\n        if (!av_pix_fmt_desc_get(static_cast<AVPixelFormat>(FI.Format)) || FI.Width <= 0 || FI.Height <= 0)\n            return false;",
+        "    for (const auto &FI : Index.Frames)\n        if (!av_pix_fmt_desc_get(static_cast<AVPixelFormat>(FI.Format)) || FI.Width <= 0 || FI.Height <= 0 || FI.RepeatPict < 0)\n            return false;",
+        "videosource repeat_pict check",
+    );
+
+    let out = out_dir.join("videosource.cpp");
+    std::fs::write(&out, text).expect("write patched videosource.cpp");
+    out
+}
+
+fn patch_audiosource(src_path: &Path, out_dir: &Path) -> PathBuf {
+    let mut text = std::fs::read_to_string(src_path)
+        .expect("read audiosource.cpp")
+        .replace("\r\n", "\n");
+
+    patch_once(
+        &mut text,
+        "#include \"version.h\"",
+        "#include \"version.h\"\n\nnamespace bs_shim_hooks {\nbool ShouldAbortOnCacheMiss() noexcept;\n}",
+        "audiosource hooks decl",
+    );
+    patch_once(
+        &mut text,
+        "    if (CacheMode == bcmDisable || !ReadAudioTrackIndex(IsAbsolutePathCacheMode(CacheMode), CachePath)) {",
+        "    if (CacheMode == bcmDisable || !ReadAudioTrackIndex(IsAbsolutePathCacheMode(CacheMode), CachePath)) {\n        if (bs_shim_hooks::ShouldAbortOnCacheMiss())\n            throw BestSourceException(\"cached audio index unavailable or invalid\");",
+        "audiosource cache-only guard",
+    );
+    patch_once(
+        &mut text,
+        "        int DictSize = ReadInt(F);\n        if (DictSize > 0xFF)\n            return false;",
+        "        int DictSize = ReadInt(F);\n        if (DictSize < 0 || DictSize > 0xFF)\n            return false;",
+        "audiosource dict size check",
+    );
+
+    let out = out_dir.join("audiosource.cpp");
+    std::fs::write(&out, text).expect("write patched audiosource.cpp");
+    out
 }

@@ -37,6 +37,11 @@ pub struct bs_audio {
 }
 
 #[repr(C)]
+pub struct bs_partial_index {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct bs_video_props {
     pub track: c_int,
@@ -72,6 +77,13 @@ pub struct bs_audio_props {
 }
 
 extern "C" {
+    pub fn bs_partial_index_create() -> *mut bs_partial_index;
+    pub fn bs_partial_index_free(p: *mut bs_partial_index);
+    pub fn bs_partial_index_len(p: *const bs_partial_index) -> i64;
+    pub fn bs_partial_index_is_exact_at(p: *const bs_partial_index, n: i64) -> c_int;
+    pub fn bs_partial_index_next_keyframe(p: *const bs_partial_index, current: i64) -> i64;
+    pub fn bs_partial_index_prev_keyframe(p: *const bs_partial_index, current: i64) -> i64;
+
     pub fn bs_version() -> c_int;
     pub fn bs_set_ffmpeg_log_level(level: c_int);
     pub fn bs_track_list(
@@ -94,8 +106,32 @@ extern "C" {
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
+    pub fn bs_video_open_with_partial(
+        path_utf8: *const c_char,
+        track: c_int,
+        threads: c_int,
+        cache_mode: c_int,
+        cache_path_utf8: *const c_char,
+        partial: *mut bs_partial_index,
+        progress: bs_progress_cb,
+        progress_user: *mut c_void,
+        out: *mut *mut bs_video,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    pub fn bs_video_open_cached(
+        path_utf8: *const c_char,
+        track: c_int,
+        threads: c_int,
+        cache_mode: c_int,
+        cache_path_utf8: *const c_char,
+        out: *mut *mut bs_video,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
     pub fn bs_video_close(v: *mut bs_video);
     pub fn bs_video_set_cancel(v: *mut bs_video, cb: bs_cancel_cb, user: *mut c_void);
+    pub fn bs_video_set_limits(v: *mut bs_video, max_cache_bytes: usize, max_decoders: c_int);
     pub fn bs_video_get_props(v: *const bs_video, out: *mut bs_video_props);
     pub fn bs_video_frame_table(
         v: *const bs_video,
@@ -135,6 +171,16 @@ extern "C" {
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
+    pub fn bs_audio_open_cached(
+        path_utf8: *const c_char,
+        track: c_int,
+        threads: c_int,
+        cache_mode: c_int,
+        cache_path_utf8: *const c_char,
+        out: *mut *mut bs_audio,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
     pub fn bs_audio_close(a: *mut bs_audio);
     pub fn bs_audio_set_cancel(a: *mut bs_audio, cb: bs_cancel_cb, user: *mut c_void);
     pub fn bs_audio_get_props(a: *const bs_audio, out: *mut bs_audio_props);
@@ -155,6 +201,7 @@ extern "C" {
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
+    pub fn bs_quick_set_partial_index(q: *mut bs_quick, partial: *mut bs_partial_index);
     pub fn bs_quick_close(q: *mut bs_quick);
     pub fn bs_quick_get_props(q: *const bs_quick, out: *mut bs_quick_props);
     pub fn bs_quick_get_frame_rgba(

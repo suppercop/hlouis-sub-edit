@@ -31,6 +31,14 @@ typedef int (*bs_cancel_cb)(void *user);
 
 typedef struct bs_video bs_video;
 typedef struct bs_audio bs_audio;
+typedef struct bs_partial_index bs_partial_index;
+
+bs_partial_index *bs_partial_index_create(void);
+void bs_partial_index_free(bs_partial_index *p);
+int64_t bs_partial_index_len(const bs_partial_index *p);
+int bs_partial_index_is_exact_at(const bs_partial_index *p, int64_t n);
+int64_t bs_partial_index_next_keyframe(const bs_partial_index *p, int64_t current);
+int64_t bs_partial_index_prev_keyframe(const bs_partial_index *p, int64_t current);
 
 typedef struct bs_video_props {
     int track;
@@ -75,8 +83,16 @@ int bs_track_list(const char *path_utf8, int *media_types, int cap, char *err, s
 int bs_video_open(const char *path_utf8, int track, int threads, int cache_mode,
                   const char *cache_path_utf8, bs_progress_cb progress, void *progress_user,
                   bs_video **out, char *err, size_t err_len);
+int bs_video_open_with_partial(const char *path_utf8, int track, int threads, int cache_mode,
+                               const char *cache_path_utf8, bs_partial_index *partial,
+                               bs_progress_cb progress, void *progress_user, bs_video **out,
+                               char *err, size_t err_len);
+/* Opens only if a valid cached index exists (fails immediately without indexing otherwise). */
+int bs_video_open_cached(const char *path_utf8, int track, int threads, int cache_mode,
+                         const char *cache_path_utf8, bs_video **out, char *err, size_t err_len);
 void bs_video_close(bs_video *v);
 void bs_video_set_cancel(bs_video *v, bs_cancel_cb cb, void *user);
+void bs_video_set_limits(bs_video *v, size_t max_cache_bytes, int max_decoders);
 void bs_video_get_props(const bs_video *v, bs_video_props *out);
 /* Fills `count` frames starting at 0: pts in time base units, keyframe flag 0/1. */
 int bs_video_frame_table(const bs_video *v, int64_t *pts, uint8_t *keyframe, int64_t count);
@@ -91,6 +107,8 @@ int bs_video_get_frame_planar(bs_video *v, int64_t n, uint8_t *const dst[3],
 int bs_audio_open(const char *path_utf8, int track, int threads, int cache_mode,
                   const char *cache_path_utf8, bs_progress_cb progress, void *progress_user,
                   bs_audio **out, char *err, size_t err_len);
+int bs_audio_open_cached(const char *path_utf8, int track, int threads, int cache_mode,
+                         const char *cache_path_utf8, bs_audio **out, char *err, size_t err_len);
 void bs_audio_close(bs_audio *a);
 void bs_audio_set_cancel(bs_audio *a, bs_cancel_cb cb, void *user);
 void bs_audio_get_props(const bs_audio *a, bs_audio_props *out);
@@ -119,6 +137,7 @@ typedef struct bs_quick_props {
 } bs_quick_props;
 
 int bs_quick_open(const char *path_utf8, int track, int threads, bs_quick **out, char *err, size_t err_len);
+void bs_quick_set_partial_index(bs_quick *q, bs_partial_index *partial);
 void bs_quick_close(bs_quick *q);
 void bs_quick_get_props(const bs_quick *q, bs_quick_props *out);
 /* Decodes the frame displayed at frame slot n (CFR estimate) into RGBA8. Sequential n is cheap;
