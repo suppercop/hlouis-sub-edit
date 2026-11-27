@@ -30,5 +30,6 @@ Trống (Claude chính sắp hết hạn mức 5 giờ, Claude thứ hai có th�
 
 - UI theo Aegisub 3.2.2 cổ điển; ẩn cột Actor và Margin; panel đổi kích thước được và nhớ kích thước.
 - FFmpeg LGPL 9.0.2, lưu bản sao ở release `native-deps-v1`. BestSource là mặc định từ Phase 4.
+- **Từ 2026-11-27 18:09:** Claude chỉ điều hành và review, không gọi agent con Claude (Sonnet/Opus) để viết code. Mọi việc code giao cho Gemini: **ưu tiên Neon web** cho mọi việc viết được và test được ngoài Windows (logic, UI egui, test, tài liệu), vì Neon mạnh hơn và hạn mức dồi dào hơn. **Hydrogen (`agy`)** chỉ nhận việc bắt buộc phải có máy Windows: build và thư viện native (C++, DLL), ráp patch của Neon, chạy và đo trên máy thật, sửa CI Windows. Hạn mức Claude giữ cho điều hành.
 - Việc lặt vặt chạy `gemini-4-hydrogen-high`; thiết kế và việc khó chạy `xhigh`.
 - Code logic thuần có thể giao Gemini 4 Neon web viết patch; `agy` chỉ ráp, build và test trên Windows.
