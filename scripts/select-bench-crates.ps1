@@ -44,7 +44,10 @@ foreach ($file in $changedFiles) {
     $norm = $file.Replace('\', '/')
     foreach ($prefix in $crateMap.Keys) {
         if ($norm.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-            [void]$selected.Add($crateMap[$prefix])
+            $rel = $norm.Substring($prefix.Length)
+            if ($rel -match '^(src/|benches/|Cargo\.toml$|build\.rs$)') {
+                [void]$selected.Add($crateMap[$prefix])
+            }
         }
     }
 }
