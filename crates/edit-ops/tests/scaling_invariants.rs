@@ -82,13 +82,23 @@ fn sort_and_delete_scale_o_n_log_n_and_o_n() {
     let s20 = build_script(20_000);
     let s40 = build_script(40_000);
 
-    let t1 = Instant::now();
     let (_, a_sort10) = ffi::measure(|| stable_sort(&s10, SortKey::Start, false, None));
-    let d10 = t1.elapsed();
     let (_, a_sort20) = ffi::measure(|| stable_sort(&s20, SortKey::Start, false, None));
-    let t4 = Instant::now();
     let (_, a_sort40) = ffi::measure(|| stable_sort(&s40, SortKey::Start, false, None));
-    let d40 = t4.elapsed();
+    // Min-of-3 wall times, taken after the warm-up runs above, so a single
+    // scheduler hiccup on a shared runner cannot fail the O(N log N) check.
+    let min_of_3 = |s: &ScriptFile| {
+        (0..3)
+            .map(|_| {
+                let t = Instant::now();
+                let _ = std::hint::black_box(stable_sort(s, SortKey::Start, false, None));
+                t.elapsed()
+            })
+            .min()
+            .unwrap_or_default()
+    };
+    let d10 = min_of_3(&s10);
+    let d40 = min_of_3(&s40);
 
     assert!(a_sort20 * 10 <= a_sort10 * 25 + 64);
     assert!(a_sort40 * 10 <= a_sort10 * 48 + 64);

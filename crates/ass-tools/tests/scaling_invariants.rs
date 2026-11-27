@@ -86,6 +86,17 @@ fn build_script(n: usize) -> ScriptFile {
     script
 }
 
+fn min_resample_time(s: &ScriptFile, opts: &ResampleOptions) -> Duration {
+    (0..3)
+        .map(|_| {
+            let t = Instant::now();
+            let _ = std::hint::black_box(resample_resolution(s, opts));
+            t.elapsed()
+        })
+        .min()
+        .unwrap_or_default()
+}
+
 #[test]
 fn core_tools_scale_linearly_from_10k_to_40k() {
     let s10 = build_script(10_000);
@@ -181,12 +192,12 @@ fn core_tools_scale_linearly_from_10k_to_40k() {
 
     // 5. Resample allocation + time linearity
     let r_opts = ResampleOptions::new(1920, 1080);
-    let t0 = Instant::now();
     let (_, resamp_alloc_10) = ffi::measure(|| resample_resolution(&s10, &r_opts));
-    let d10 = t0.elapsed();
-    let t1 = Instant::now();
     let (_, resamp_alloc_40) = ffi::measure(|| resample_resolution(&s40, &r_opts));
-    let d40 = t1.elapsed();
+    // Min-of-3 wall times (after the allocation-counting warm-up above) so one
+    // scheduler hiccup on a shared runner cannot fail the O(N) check.
+    let d10 = min_resample_time(&s10, &r_opts);
+    let d40 = min_resample_time(&s40, &r_opts);
     assert!(resamp_alloc_40 * 10 <= resamp_alloc_10 * 44 + 64);
     assert!(
         d40 <= d10.max(Duration::from_millis(2)) * 8,

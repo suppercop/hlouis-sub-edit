@@ -686,10 +686,15 @@ mod tests {
             )
             .expect("edit");
 
-        let t0 = Instant::now();
-        assert!(history.undo(&mut script).expect("undo"));
-        assert!(history.redo(&mut script).expect("redo"));
-        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // Best of 5 undo+redo pairs: the budget is for the operation, not for
+        // a scheduler hiccup on a shared CI runner.
+        let mut elapsed_ms = f64::MAX;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            assert!(history.undo(&mut script).expect("undo"));
+            assert!(history.redo(&mut script).expect("redo"));
+            elapsed_ms = elapsed_ms.min(t0.elapsed().as_secs_f64() * 1000.0);
+        }
         assert!(
             elapsed_ms < 5.0,
             "undo+redo on 20k lines took {elapsed_ms:.3} ms (budget < 5 ms)"

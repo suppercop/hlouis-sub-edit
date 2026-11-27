@@ -6,6 +6,9 @@ param(
     [double]$MaxRegressionPct = 10.0,
     [string]$CeilingsPath = "",
     [switch]$FailOnCeiling,
+    # Strict mode: apply the owner_max_ns (AGENTS.md budgets) instead of CI ceilings.
+    # Use on the owner's PC only: scripts/compare-benches.ps1 -Strict
+    [switch]$Strict,
     [string]$RecordMedianJson = "",
     [string]$OutDir = "dist/bench-results"
 )
@@ -89,12 +92,22 @@ foreach ($benchDir in $benchDirs) {
     $ciMaxNs = $null
     if ($ceilingsMap.ContainsKey($relName)) {
         $entry = $ceilingsMap[$relName]
-        if ($null -ne $entry.ci_max_ns) {
-            $ciMaxNs = [double]$entry.ci_max_ns
+        # In Strict mode use owner_max_ns (AGENTS.md budgets, owner's PC only).
+        # In normal CI mode use ci_max_ns (calibrated from windows-latest runs * 1.3).
+        $effectiveMax = if ($Strict -and $null -ne $entry.owner_max_ns) {
+            [double]$entry.owner_max_ns
+        } elseif (-not $Strict -and $null -ne $entry.ci_max_ns) {
+            [double]$entry.ci_max_ns
+        } else {
+            $null
+        }
+        if ($null -ne $effectiveMax) {
+            $ciMaxNs = $effectiveMax
             if ($curMedianNs -gt $ciMaxNs) {
                 $statuses += "OVER_CEILING"
                 if ($FailOnCeiling) {
-                    $ceilingBreaches += "$relName ($(Format-DurationNs $curMedianNs) > $(Format-DurationNs $ciMaxNs))"
+                    $mode = if ($Strict) { "owner" } else { "CI" }
+                    $ceilingBreaches += "$relName ($(Format-DurationNs $curMedianNs) > $(Format-DurationNs $ciMaxNs) [$mode ceiling])"
                 }
             }
         }
@@ -108,7 +121,7 @@ foreach ($benchDir in $benchDirs) {
         CurrentMedian   = Format-DurationNs $curMedianNs
         CurrentMean     = Format-DurationNs $curMeanNs
         Delta           = if ($null -ne $deltaPct) { ("{0:+0.00;-0.00;0.00}%" -f $deltaPct) } else { "N/A" }
-        CiCeiling       = if ($null -ne $ciMaxNs) { Format-DurationNs $ciMaxNs } else { "uncalibrated" }
+        CiCeiling       = if ($null -ne $ciMaxNs) { "$(Format-DurationNs $ciMaxNs)$(if ($Strict) { ' [owner]' } else { ' [CI]' })" } else { "uncalibrated" }
         Status          = $statusStr
         BaselineNs      = $baseMedianNs
         CurrentMedianNs = $curMedianNs
@@ -119,7 +132,7 @@ foreach ($benchDir in $benchDirs) {
 }
 
 $mdLines = @(
-    "### Criterion Benchmark Results ($CurrentBaseline vs $ReferenceBaseline, regression +$MaxRegressionPct%, ceiling enforcement=$FailOnCeiling)"
+    "### Criterion Benchmark Results ($CurrentBaseline vs $ReferenceBaseline, regression +$MaxRegressionPct%, ceiling enforcement=$FailOnCeiling, strict=$Strict)"
     ""
     "| Benchmark | Baseline ($ReferenceBaseline) | Current ($CurrentBaseline) | Mean | Delta | CI Ceiling | Status |"
     "|---|---|---|---|---|---|---|"
