@@ -12,6 +12,7 @@ members = [
     "crates/audio-peaks",
     "crates/scene-detect",
     "crates/edit-ops",
+    "crates/styles-catalog",
     "crates/i18n",
     "crates/libass-sys",
     "crates/ffms2-sys",
