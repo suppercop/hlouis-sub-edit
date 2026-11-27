@@ -12,7 +12,7 @@ use crate::grid::GridState;
 use crate::theme::{ThemeMode, ThemePalette};
 use crate::video_player::{PlayerCmd, PlayerEvent, ReadyFrame, VideoPlayerHandle};
 use eframe::egui;
-use egui::{ColorImage, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Sense, Vec2};
+use egui::{FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Sense, Vec2};
 use egui_extras::{Column, TableBuilder};
 use fluent::FluentValue;
 use i18n::{I18n, Locale};
@@ -76,9 +76,97 @@ impl CliOptions {
     }
 }
 
+enum AssSource {
+    BuiltInSample,
+    File(String),
+}
+
 struct PlaybackClock {
     start_instant: Instant,
     start_pts_ms: f64,
+}
+
+struct QueueAdvanceResult {
+    due_frame: Option<ReadyFrame>,
+    recycled_buffers: Vec<Vec<u8>>,
+    popped_count: usize,
+    dropped_count: u64,
+}
+
+/// Pure playback-queue advancement with lazy Play clock anchoring and loop wrap-around handling.
+fn pop_due_playback_frame(
+    frame_queue: &mut VecDeque<ReadyFrame>,
+    playback_clock: &mut Option<PlaybackClock>,
+    current_frame: usize,
+    rendered_frames: u64,
+    frame_interval_ms: f64,
+    now: Instant,
+) -> QueueAdvanceResult {
+    let mut result = QueueAdvanceResult {
+        due_frame: None,
+        recycled_buffers: Vec::new(),
+        popped_count: 0,
+        dropped_count: 0,
+    };
+
+    let Some(clock) = playback_clock.as_mut() else {
+        if let Some(first) = frame_queue.pop_front() {
+            *playback_clock = Some(PlaybackClock {
+                start_instant: now,
+                start_pts_ms: first.pts_ms as f64,
+            });
+            result.due_frame = Some(first);
+            result.popped_count = 1;
+        }
+        return result;
+    };
+
+    let target_pts_ms = clock.start_pts_ms
+        + now
+            .saturating_duration_since(clock.start_instant)
+            .as_secs_f64()
+            * 1000.0;
+    let mut latest_due: Option<ReadyFrame> = None;
+    let mut last_frame_idx = current_frame;
+    let mut wrapped = false;
+
+    while let Some(front) = frame_queue.front() {
+        if front.frame_index < last_frame_idx && front.frame_index == 0 {
+            if latest_due.is_some() {
+                break;
+            }
+            clock.start_instant = now;
+            clock.start_pts_ms = front.pts_ms as f64;
+            latest_due = frame_queue.pop_front();
+            result.popped_count += 1;
+            wrapped = true;
+            break;
+        }
+        if (front.pts_ms as f64) <= target_pts_ms {
+            if let Some(prev) = latest_due.take() {
+                result.recycled_buffers.push(prev.rgba);
+                result.dropped_count += 1;
+            }
+            if let Some(popped) = frame_queue.pop_front() {
+                last_frame_idx = popped.frame_index;
+                result.popped_count += 1;
+                latest_due = Some(popped);
+            }
+        } else {
+            break;
+        }
+    }
+
+    if let Some(due) = latest_due.as_ref() {
+        if !wrapped {
+            let lateness = target_pts_ms - (due.pts_ms as f64);
+            if lateness > frame_interval_ms * 1.5 && rendered_frames > 0 {
+                result.dropped_count += 1;
+            }
+        }
+    }
+    result.due_frame = latest_due;
+    result
 }
 
 struct VideoTexture {
@@ -133,7 +221,7 @@ struct SpikeApp {
     player: VideoPlayerHandle,
     video_info: Option<VideoInfo>,
     video_file_name: String,
-    ass_source_label: String,
+    ass_source: AssSource,
     indexing_progress: Option<(i64, i64)>,
     playback_state: PlaybackState,
     loop_playback: bool,
@@ -164,15 +252,19 @@ impl SpikeApp {
         theme::apply_to_egui(&cc.egui_ctx, &palette);
 
         let initial_ass = sample_ass::build_sample_ass(1920, 1080);
-        let player = VideoPlayerHandle::spawn(initial_ass, cc.egui_ctx.clone());
+        let player = VideoPlayerHandle::spawn(initial_ass, cc.egui_ctx.clone())?;
 
         if cli.loop_playback {
-            player.send(PlayerCmd::SetLoop(true));
+            player
+                .send(PlayerCmd::SetLoop(true))
+                .map_err(anyhow::Error::msg)?;
         }
-        let mut ass_source_label = i18n.tr("sample-ass-name");
+        let mut ass_source = AssSource::BuiltInSample;
         if let Some(ass_path) = cli.ass {
-            ass_source_label = path_display_name(&ass_path);
-            player.send(PlayerCmd::LoadAssFile(ass_path));
+            ass_source = AssSource::File(path_display_name(&ass_path));
+            player
+                .send(PlayerCmd::LoadAssFile(ass_path))
+                .map_err(anyhow::Error::msg)?;
         }
 
         let mut video_file_name = String::new();
@@ -180,7 +272,7 @@ impl SpikeApp {
         if let Some(video_path) = cli.video {
             video_file_name = path_display_name(&video_path);
             indexing_progress = Some((0, 1));
-            player.send(PlayerCmd::OpenVideo(video_path));
+            player.open_video(video_path).map_err(anyhow::Error::msg)?;
         }
 
         let now = Instant::now();
@@ -193,7 +285,7 @@ impl SpikeApp {
             player,
             video_info: None,
             video_file_name,
-            ass_source_label,
+            ass_source,
             indexing_progress,
             playback_state: PlaybackState::Paused,
             loop_playback: cli.loop_playback,
@@ -234,11 +326,40 @@ impl SpikeApp {
         theme::apply_to_egui(ctx, &self.palette);
     }
 
+    fn send_player_cmd(&mut self, cmd: PlayerCmd) {
+        if let Err(err) = self.player.send(cmd) {
+            self.indexing_progress = None;
+            self.playback_state = PlaybackState::Paused;
+            self.playback_clock = None;
+            self.error_banner = Some(err);
+        }
+    }
+
+    fn open_video_file(&mut self, path: PathBuf) {
+        self.pause_playback();
+        self.indexing_progress = Some((0, 1));
+        self.error_banner = None;
+        if let Err(err) = self.player.open_video(path) {
+            self.indexing_progress = None;
+            self.error_banner = Some(err);
+        }
+    }
+
+    fn ass_source_display(&self) -> String {
+        match &self.ass_source {
+            AssSource::BuiltInSample => self.i18n.tr("sample-ass-name"),
+            AssSource::File(name) => name.clone(),
+        }
+    }
+
     fn process_player_events(&mut self, frame: &eframe::Frame) {
         for evt in self.player.drain_events() {
             match evt {
                 PlayerEvent::IndexingProgress { current, total } => {
                     self.indexing_progress = Some((current, total));
+                }
+                PlayerEvent::IndexingCancelled => {
+                    self.indexing_progress = None;
                 }
                 PlayerEvent::VideoReady { info, file_name } => {
                     self.indexing_progress = None;
@@ -290,44 +411,26 @@ impl SpikeApp {
     }
 
     fn advance_playback_queue(&mut self, eframe_frame: &eframe::Frame) {
-        let Some(clock) = self.playback_clock.as_mut() else {
-            return;
-        };
         let frame_interval_ms = self
             .video_info
             .as_ref()
             .map_or(41.7, |info| 1000.0 / info.fps.max(1.0));
 
-        if let Some(front) = self.frame_queue.front() {
-            if front.frame_index < self.video_metrics.current_frame && front.frame_index == 0 {
-                clock.start_instant = Instant::now();
-                clock.start_pts_ms = front.pts_ms as f64;
-            }
+        let step = pop_due_playback_frame(
+            &mut self.frame_queue,
+            &mut self.playback_clock,
+            self.video_metrics.current_frame,
+            self.video_metrics.rendered_frames,
+            frame_interval_ms,
+            Instant::now(),
+        );
+        self.player.release_frame_slots(step.popped_count);
+        for buf in step.recycled_buffers {
+            self.player.recycle_buffer(buf);
         }
+        self.video_metrics.dropped_frames += step.dropped_count;
 
-        let target_pts_ms =
-            clock.start_pts_ms + clock.start_instant.elapsed().as_secs_f64() * 1000.0;
-        let mut latest_due: Option<ReadyFrame> = None;
-
-        while let Some(front) = self.frame_queue.front() {
-            if (front.pts_ms as f64) <= target_pts_ms {
-                if let Some(prev) = latest_due.take() {
-                    self.player.recycle_buffer(prev.rgba);
-                    self.video_metrics.dropped_frames += 1;
-                }
-                let popped = self.frame_queue.pop_front();
-                self.player.release_frame_slots(1);
-                latest_due = popped;
-            } else {
-                break;
-            }
-        }
-
-        if let Some(due) = latest_due {
-            let lateness = target_pts_ms - (due.pts_ms as f64);
-            if lateness > frame_interval_ms * 1.5 && self.video_metrics.rendered_frames > 0 {
-                self.video_metrics.dropped_frames += 1;
-            }
+        if let Some(due) = step.due_frame {
             self.upload_ready_frame(&due, eframe_frame);
             self.player.recycle_buffer(due.rgba);
         }
@@ -436,11 +539,9 @@ impl SpikeApp {
         if self.video_info.is_some() {
             self.playback_state = PlaybackState::Playing;
             self.clear_frame_queue();
-            self.playback_clock = Some(PlaybackClock {
-                start_instant: Instant::now(),
-                start_pts_ms: self.video_metrics.current_pts_ms as f64,
-            });
-            self.player.send(PlayerCmd::SetPlaying(true));
+            // Anchor lazily on the first frame received after Play to avoid stale seek PTS.
+            self.playback_clock = None;
+            self.send_player_cmd(PlayerCmd::SetPlaying(true));
         }
     }
 
@@ -448,12 +549,12 @@ impl SpikeApp {
         self.playback_state = PlaybackState::Paused;
         self.playback_clock = None;
         self.clear_frame_queue();
-        self.player.send(PlayerCmd::SetPlaying(false));
+        self.send_player_cmd(PlayerCmd::SetPlaying(false));
     }
 
     fn seek_to_frame(&mut self, target: usize) {
         self.pause_playback();
-        self.player.send(PlayerCmd::SeekFrame(target));
+        self.send_player_cmd(PlayerCmd::SeekFrame(target));
     }
 
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -469,10 +570,7 @@ impl SpikeApp {
                         .add_filter(&filter_label, &["mkv", "mp4", "webm", "avi", "mov", "ts"])
                         .pick_file()
                     {
-                        self.pause_playback();
-                        self.indexing_progress = Some((0, 1));
-                        self.error_banner = None;
-                        self.player.send(PlayerCmd::OpenVideo(path));
+                        self.open_video_file(path);
                     }
                 }
 
@@ -482,8 +580,8 @@ impl SpikeApp {
                         .add_filter(&filter_label, &["ass", "ssa"])
                         .pick_file()
                     {
-                        self.ass_source_label = path_display_name(&path);
-                        self.player.send(PlayerCmd::LoadAssFile(path));
+                        self.ass_source = AssSource::File(path_display_name(&path));
+                        self.send_player_cmd(PlayerCmd::LoadAssFile(path));
                     }
                 }
 
@@ -492,9 +590,10 @@ impl SpikeApp {
                         .video_info
                         .as_ref()
                         .map_or((1920, 1080), |v| (v.width, v.height));
-                    self.ass_source_label = self.i18n.tr("sample-ass-name");
-                    self.player
-                        .send(PlayerCmd::LoadAssMemory(sample_ass::build_sample_ass(w, h)));
+                    self.ass_source = AssSource::BuiltInSample;
+                    self.send_player_cmd(PlayerCmd::LoadAssMemory(sample_ass::build_sample_ass(
+                        w, h,
+                    )));
                 }
 
                 ui.separator();
@@ -550,11 +649,6 @@ impl SpikeApp {
             });
         if selected_locale != self.i18n.locale() {
             self.i18n.set_locale(selected_locale);
-            if self.ass_source_label == "Built-in Phase 0 Sample"
-                || self.ass_source_label == "Mẫu thử nghiệm Giai đoạn 0"
-            {
-                self.ass_source_label = self.i18n.tr("sample-ass-name");
-            }
         }
     }
 
@@ -566,10 +660,11 @@ impl SpikeApp {
             .min_size(320.0)
             .show(ui, |ui| {
                 self.render_video_status(ui);
+                let ass_label = self.ass_source_display();
                 ui.label(
                     egui::RichText::new(self.i18n.tr_args(
                         "status-ass-loaded",
-                        &[("source", FluentValue::from(self.ass_source_label.as_str()))],
+                        &[("source", FluentValue::from(ass_label.as_str()))],
                     ))
                     .color(self.palette.text_muted),
                 );
@@ -679,24 +774,24 @@ impl SpikeApp {
                     .checkbox(&mut self.loop_playback, self.i18n.tr("btn-loop"))
                     .changed()
                 {
-                    self.player.send(PlayerCmd::SetLoop(self.loop_playback));
+                    self.send_player_cmd(PlayerCmd::SetLoop(self.loop_playback));
                 }
 
                 if ui.button(self.i18n.tr("btn-prev-frame")).clicked() {
                     self.pause_playback();
-                    self.player.send(PlayerCmd::StepFrame(-1));
+                    self.send_player_cmd(PlayerCmd::StepFrame(-1));
                 }
                 if ui.button(self.i18n.tr("btn-next-frame")).clicked() {
                     self.pause_playback();
-                    self.player.send(PlayerCmd::StepFrame(1));
+                    self.send_player_cmd(PlayerCmd::StepFrame(1));
                 }
                 if ui.button(self.i18n.tr("btn-prev-keyframe")).clicked() {
                     self.pause_playback();
-                    self.player.send(PlayerCmd::PrevKeyframe);
+                    self.send_player_cmd(PlayerCmd::PrevKeyframe);
                 }
                 if ui.button(self.i18n.tr("btn-next-keyframe")).clicked() {
                     self.pause_playback();
-                    self.player.send(PlayerCmd::NextKeyframe);
+                    self.send_player_cmd(PlayerCmd::NextKeyframe);
                 }
 
                 ui.label(self.i18n.tr("label-seek-frame"));
@@ -983,6 +1078,7 @@ impl SpikeApp {
         if let Some(line) = self.grid.active_line_mut() {
             let edit_resp = ui.add(
                 egui::TextEdit::multiline(&mut line.text)
+                    .id_salt(("edit_box", line.number))
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
                     .desired_rows(4)
@@ -1261,9 +1357,11 @@ fn format_ms(ms: i64) -> String {
 
 fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    let fonts_dir = PathBuf::from(windir).join("Fonts");
 
-    let mut add_font = |name: &str, path: &str, families: &[FontFamily]| -> bool {
-        if let Ok(bytes) = std::fs::read(path) {
+    let mut add_font = |name: &str, file_name: &str, families: &[FontFamily]| -> bool {
+        if let Ok(bytes) = std::fs::read(fonts_dir.join(file_name)) {
             fonts
                 .font_data
                 .insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
@@ -1281,29 +1379,20 @@ fn configure_fonts(ctx: &egui::Context) {
     // Insert Japanese fallback first so Latin/Vietnamese fonts end up ahead of it at index 0.
     let jp_loaded = add_font(
         "win_yugothic",
-        r"C:\Windows\Fonts\YuGothR.ttc",
+        "YuGothR.ttc",
         &[FontFamily::Proportional, FontFamily::Monospace],
     );
     if !jp_loaded {
         let _ = add_font(
             "win_meiryo",
-            r"C:\Windows\Fonts\meiryo.ttc",
+            "meiryo.ttc",
             &[FontFamily::Proportional, FontFamily::Monospace],
         );
     }
 
-    let _ = add_font(
-        "win_segoe_ui",
-        r"C:\Windows\Fonts\segoeui.ttf",
-        &[FontFamily::Proportional],
-    );
-    let _ = add_font(
-        "win_consolas",
-        r"C:\Windows\Fonts\consola.ttf",
-        &[FontFamily::Monospace],
-    );
+    let _ = add_font("win_segoe_ui", "segoeui.ttf", &[FontFamily::Proportional]);
+    let _ = add_font("win_consolas", "consola.ttf", &[FontFamily::Monospace]);
 
-    let _ = ColorImage::example;
     ctx.set_fonts(fonts);
 }
 
@@ -1521,5 +1610,83 @@ mod tests {
             avg_ms < 16.0,
             "50k grid frame time too high: {avg_ms:.2} ms"
         );
+    }
+
+    fn make_ready_frame(frame_index: usize, pts_ms: i64) -> ReadyFrame {
+        ReadyFrame {
+            generation: 1,
+            frame_index,
+            pts_ms,
+            width: 2,
+            height: 2,
+            rgba: vec![0; 16],
+            decode_ms: 1.0,
+            render_ms: 0.5,
+        }
+    }
+
+    #[test]
+    fn playback_queue_anchors_lazily_and_handles_loop_wraparound() {
+        let t0 = Instant::now();
+        let interval = 1000.0 / (24_000.0 / 1001.0);
+        let mut clock: Option<PlaybackClock> = None;
+        let mut queue = VecDeque::from([
+            make_ready_frame(1558, 64_981),
+            make_ready_frame(0, 0),
+            make_ready_frame(1, 42),
+        ]);
+
+        // 1. Lazy Play anchor: first frame anchors the clock to 64_981 ms (not stale 0 ms).
+        let step1 = pop_due_playback_frame(&mut queue, &mut clock, 100, 1, interval, t0);
+        assert_eq!(step1.due_frame.as_ref().map(|f| f.frame_index), Some(1558));
+        assert_eq!(step1.dropped_count, 0);
+        assert_eq!(step1.popped_count, 1);
+        assert!(clock.is_some());
+
+        // 2. Wrap-around when frame 0 is at front: re-anchors clock to 0 ms without consuming frame 1.
+        let t1 = t0 + Duration::from_millis(42);
+        let step2 = pop_due_playback_frame(&mut queue, &mut clock, 1558, 2, interval, t1);
+        assert_eq!(step2.due_frame.as_ref().map(|f| f.frame_index), Some(0));
+        assert_eq!(step2.dropped_count, 0);
+        assert_eq!(step2.popped_count, 1);
+        assert_eq!(queue.len(), 1);
+
+        // 3. Frame 1 is not due immediately at t1, and becomes due 42 ms later with 0 drops.
+        let step3_early = pop_due_playback_frame(&mut queue, &mut clock, 0, 3, interval, t1);
+        assert!(step3_early.due_frame.is_none());
+        let t2 = t1 + Duration::from_millis(42);
+        let step3 = pop_due_playback_frame(&mut queue, &mut clock, 0, 3, interval, t2);
+        assert_eq!(step3.due_frame.as_ref().map(|f| f.frame_index), Some(1));
+        assert_eq!(step3.dropped_count, 0);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn playback_queue_does_not_swallow_frame_zero_behind_end_of_file() {
+        let t0 = Instant::now();
+        let interval = 1000.0 / (24_000.0 / 1001.0);
+        let mut clock = Some(PlaybackClock {
+            start_instant: t0,
+            start_pts_ms: 64_940.0,
+        });
+        let mut queue = VecDeque::from([
+            make_ready_frame(1558, 64_981),
+            make_ready_frame(0, 0),
+            make_ready_frame(1, 42),
+        ]);
+
+        // At t0 + 50 ms (target = 64_990 ms), frame 1558 is due; frame 0 must NOT be popped in the same tick.
+        let t1 = t0 + Duration::from_millis(50);
+        let step1 = pop_due_playback_frame(&mut queue, &mut clock, 1557, 1558, interval, t1);
+        assert_eq!(step1.due_frame.as_ref().map(|f| f.frame_index), Some(1558));
+        assert_eq!(step1.dropped_count, 0);
+        assert_eq!(queue.front().map(|f| f.frame_index), Some(0));
+
+        // Next tick presents frame 0 and re-anchors the clock.
+        let t2 = t1 + Duration::from_millis(42);
+        let step2 = pop_due_playback_frame(&mut queue, &mut clock, 1558, 1559, interval, t2);
+        assert_eq!(step2.due_frame.as_ref().map(|f| f.frame_index), Some(0));
+        assert_eq!(step2.dropped_count, 0);
+        assert_eq!(queue.front().map(|f| f.frame_index), Some(1));
     }
 }

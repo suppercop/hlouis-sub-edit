@@ -1,16 +1,20 @@
 //! Background FFMS2 video indexing/decoding + libass rendering worker.
 
-use media::{FfmsVideo, VideoInfo};
+use media::{FfmsVideo, MediaError, VideoInfo};
 use render::AssSubRenderer;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Commands sent from the UI thread to the background media/render worker.
 pub enum PlayerCmd {
-    OpenVideo(PathBuf),
+    OpenVideo {
+        path: PathBuf,
+        open_id: u64,
+        cancel: Arc<AtomicBool>,
+    },
     LoadAssMemory(String),
     LoadAssFile(PathBuf),
     SeekFrame(usize),
@@ -37,6 +41,7 @@ pub struct ReadyFrame {
 /// Events emitted by the background worker to the UI thread.
 pub enum PlayerEvent {
     IndexingProgress { current: i64, total: i64 },
+    IndexingCancelled,
     VideoReady { info: VideoInfo, file_name: String },
     Frame(ReadyFrame),
     PlaybackEnded,
@@ -49,22 +54,23 @@ pub struct VideoPlayerHandle {
     cmd_tx: mpsc::Sender<PlayerCmd>,
     evt_rx: mpsc::Receiver<PlayerEvent>,
     recycle_tx: mpsc::Sender<Vec<u8>>,
-    cancel_index: Arc<AtomicBool>,
+    latest_open_id: Arc<AtomicU64>,
+    active_cancel: Mutex<Option<Arc<AtomicBool>>>,
     queued_frames: Arc<AtomicUsize>,
+    worker_dead_reported: AtomicBool,
     join_handle: Option<JoinHandle<()>>,
 }
 
 impl VideoPlayerHandle {
     /// Spawns the worker thread with an initial ASS script and repaint callback.
-    #[must_use]
-    pub fn spawn(initial_ass: String, ctx: egui::Context) -> Self {
+    pub fn spawn(initial_ass: String, ctx: egui::Context) -> anyhow::Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
         let (recycle_tx, recycle_rx) = mpsc::channel();
-        let cancel_index = Arc::new(AtomicBool::new(false));
+        let latest_open_id = Arc::new(AtomicU64::new(0));
         let queued_frames = Arc::new(AtomicUsize::new(0));
 
-        let cancel_clone = Arc::clone(&cancel_index);
+        let open_id_clone = Arc::clone(&latest_open_id);
         let queued_clone = Arc::clone(&queued_frames);
 
         let join_handle = thread::Builder::new()
@@ -74,37 +80,70 @@ impl VideoPlayerHandle {
                     &cmd_rx,
                     &evt_tx,
                     &recycle_rx,
-                    &cancel_clone,
+                    &open_id_clone,
                     &queued_clone,
                     &initial_ass,
                     &ctx,
                 );
             })
-            .ok();
+            .map_err(|err| anyhow::anyhow!("failed to spawn video worker thread: {err}"))?;
 
-        Self {
+        Ok(Self {
             cmd_tx,
             evt_rx,
             recycle_tx,
-            cancel_index,
+            latest_open_id,
+            active_cancel: Mutex::new(None),
             queued_frames,
-            join_handle,
-        }
+            worker_dead_reported: AtomicBool::new(false),
+            join_handle: Some(join_handle),
+        })
     }
 
-    /// Sends a command to the worker thread.
-    pub fn send(&self, cmd: PlayerCmd) {
-        if matches!(cmd, PlayerCmd::OpenVideo(_)) {
-            self.cancel_index.store(true, Ordering::Relaxed);
+    /// Opens a new video with its own cancellation token and monotonic open ID,
+    /// cancelling any in-flight indexing from an earlier open request.
+    pub fn open_video(&self, path: PathBuf) -> Result<(), String> {
+        let open_id = self.latest_open_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = self
+                .active_cancel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(prev) = guard.replace(Arc::clone(&cancel)) {
+                prev.store(true, Ordering::Release);
+            }
         }
-        let _ = self.cmd_tx.send(cmd);
+        self.send(PlayerCmd::OpenVideo {
+            path,
+            open_id,
+            cancel,
+        })
     }
 
-    /// Non-blocking receive of pending worker events.
+    /// Sends a command to the worker thread, returning an error if the worker has exited.
+    pub fn send(&self, cmd: PlayerCmd) -> Result<(), String> {
+        self.cmd_tx
+            .send(cmd)
+            .map_err(|_| "video worker thread is no longer running".to_owned())
+    }
+
+    /// Non-blocking receive of pending worker events, surfacing unexpected worker exit once.
     pub fn drain_events(&self) -> Vec<PlayerEvent> {
         let mut out = Vec::new();
-        while let Ok(evt) = self.evt_rx.try_recv() {
-            out.push(evt);
+        loop {
+            match self.evt_rx.try_recv() {
+                Ok(evt) => out.push(evt),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if !self.worker_dead_reported.swap(true, Ordering::AcqRel) {
+                        out.push(PlayerEvent::Error(
+                            "video worker thread terminated unexpectedly".to_owned(),
+                        ));
+                    }
+                    break;
+                }
+            }
         }
         out
     }
@@ -126,15 +165,21 @@ impl VideoPlayerHandle {
         let _ = self.recycle_tx.send(buf);
     }
 
-    /// Signals cancellation for any in-flight indexing operation.
+    /// Signals cancellation for the currently active indexing operation (if any).
     pub fn cancel_indexing(&self) {
-        self.cancel_index.store(true, Ordering::Relaxed);
+        let guard = self
+            .active_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancel) = guard.as_ref() {
+            cancel.store(true, Ordering::Release);
+        }
     }
 }
 
 impl Drop for VideoPlayerHandle {
     fn drop(&mut self) {
-        self.cancel_index.store(true, Ordering::Relaxed);
+        self.cancel_indexing();
         let _ = self.cmd_tx.send(PlayerCmd::Shutdown);
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
@@ -235,11 +280,39 @@ fn apply_ass_content(renderer: &mut AssSubRenderer, content: &AssContent) -> Res
     }
 }
 
+fn coalesce_commands(cmds: Vec<PlayerCmd>) -> Vec<PlayerCmd> {
+    let mut out: Vec<PlayerCmd> = Vec::with_capacity(cmds.len());
+    for cmd in cmds {
+        match cmd {
+            PlayerCmd::SeekFrame(target) => {
+                while matches!(
+                    out.last(),
+                    Some(PlayerCmd::SeekFrame(_) | PlayerCmd::StepFrame(_))
+                ) {
+                    out.pop();
+                }
+                out.push(PlayerCmd::SeekFrame(target));
+            }
+            PlayerCmd::StepFrame(delta) => match out.last_mut() {
+                Some(PlayerCmd::StepFrame(prev)) => {
+                    *prev = prev.saturating_add(delta);
+                }
+                Some(PlayerCmd::SeekFrame(prev_target)) => {
+                    *prev_target = prev_target.saturating_add_signed(delta);
+                }
+                _ => out.push(PlayerCmd::StepFrame(delta)),
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn worker_loop(
     cmd_rx: &mpsc::Receiver<PlayerCmd>,
     evt_tx: &mpsc::Sender<PlayerEvent>,
     recycle_rx: &mpsc::Receiver<Vec<u8>>,
-    cancel_index: &AtomicBool,
+    latest_open_id: &AtomicU64,
     queued_frames: &AtomicUsize,
     initial_ass: &str,
     ctx: &egui::Context,
@@ -282,13 +355,21 @@ fn worker_loop(
             }
         };
 
-        if let Some(c) = cmd {
-            if !handle_command(c, &mut state, evt_tx, cancel_index, queued_frames, ctx) {
-                break;
-            }
-            // Drain any additional queued commands before decoding the next playback frame.
+        if let Some(first) = cmd {
+            let mut batch = vec![first];
+            // Drain any additional queued commands and coalesce consecutive seeks/steps.
             while let Ok(next_c) = cmd_rx.try_recv() {
-                if !handle_command(next_c, &mut state, evt_tx, cancel_index, queued_frames, ctx) {
+                batch.push(next_c);
+            }
+            for next_c in coalesce_commands(batch) {
+                if !handle_command(
+                    next_c,
+                    &mut state,
+                    evt_tx,
+                    latest_open_id,
+                    queued_frames,
+                    ctx,
+                ) {
                     return;
                 }
             }
@@ -329,11 +410,71 @@ fn worker_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_open_video(
+    path: &Path,
+    open_id: u64,
+    cancel: &Arc<AtomicBool>,
+    state: &mut WorkerState,
+    evt_tx: &mpsc::Sender<PlayerEvent>,
+    latest_open_id: &AtomicU64,
+    queued_frames: &AtomicUsize,
+    ctx: &egui::Context,
+) {
+    state.playing = false;
+    state.generation = state.generation.wrapping_add(1);
+    if cancel.load(Ordering::Acquire) || open_id != latest_open_id.load(Ordering::Acquire) {
+        if open_id == latest_open_id.load(Ordering::Acquire) {
+            let _ = evt_tx.send(PlayerEvent::IndexingCancelled);
+            ctx.request_repaint();
+        }
+        return;
+    }
+    let mut last_report = Instant::now();
+    let res = FfmsVideo::open_with_progress(path, cancel, |current, total| {
+        if open_id == latest_open_id.load(Ordering::Acquire)
+            && (last_report.elapsed() >= Duration::from_millis(50) || current == total)
+        {
+            last_report = Instant::now();
+            let _ = evt_tx.send(PlayerEvent::IndexingProgress { current, total });
+            ctx.request_repaint();
+        }
+    });
+    match res {
+        Ok(video) => {
+            if open_id != latest_open_id.load(Ordering::Acquire) {
+                return;
+            }
+            let info = video.info().clone();
+            let file_name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            state.video = Some(video);
+            state.current_frame = 0;
+            let _ = evt_tx.send(PlayerEvent::VideoReady { info, file_name });
+            emit_seek_frame(state, 0, evt_tx, queued_frames, ctx);
+        }
+        Err(MediaError::Cancelled) => {
+            if open_id == latest_open_id.load(Ordering::Acquire) {
+                let _ = evt_tx.send(PlayerEvent::IndexingCancelled);
+                ctx.request_repaint();
+            }
+        }
+        Err(err) => {
+            if open_id == latest_open_id.load(Ordering::Acquire) {
+                let _ = evt_tx.send(PlayerEvent::Error(err.to_string()));
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
 fn handle_command(
     cmd: PlayerCmd,
     state: &mut WorkerState,
     evt_tx: &mpsc::Sender<PlayerEvent>,
-    cancel_index: &AtomicBool,
+    latest_open_id: &AtomicU64,
     queued_frames: &AtomicUsize,
     ctx: &egui::Context,
 ) -> bool {
@@ -345,35 +486,21 @@ fn handle_command(
         PlayerCmd::SetPlaying(play) => {
             state.playing = play && state.video.is_some();
         }
-        PlayerCmd::OpenVideo(path) => {
-            state.playing = false;
-            state.generation = state.generation.wrapping_add(1);
-            cancel_index.store(false, Ordering::Relaxed);
-            let mut last_report = Instant::now();
-            let res = FfmsVideo::open_with_progress(&path, cancel_index, |current, total| {
-                if last_report.elapsed() >= Duration::from_millis(50) || current == total {
-                    last_report = Instant::now();
-                    let _ = evt_tx.send(PlayerEvent::IndexingProgress { current, total });
-                    ctx.request_repaint();
-                }
-            });
-            match res {
-                Ok(video) => {
-                    let info = video.info().clone();
-                    let file_name = path.file_name().map_or_else(
-                        || path.display().to_string(),
-                        |n| n.to_string_lossy().into_owned(),
-                    );
-                    state.video = Some(video);
-                    state.current_frame = 0;
-                    let _ = evt_tx.send(PlayerEvent::VideoReady { info, file_name });
-                    emit_seek_frame(state, 0, evt_tx, queued_frames, ctx);
-                }
-                Err(err) => {
-                    let _ = evt_tx.send(PlayerEvent::Error(err.to_string()));
-                    ctx.request_repaint();
-                }
-            }
+        PlayerCmd::OpenVideo {
+            path,
+            open_id,
+            cancel,
+        } => {
+            handle_open_video(
+                &path,
+                open_id,
+                &cancel,
+                state,
+                evt_tx,
+                latest_open_id,
+                queued_frames,
+                ctx,
+            );
         }
         PlayerCmd::LoadAssMemory(text) => {
             state.ass_script = AssContent::Memory(text);
@@ -455,4 +582,29 @@ fn emit_seek_frame(
         }
     }
     ctx.request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_consecutive_seeks_and_steps() {
+        let cmds = vec![
+            PlayerCmd::StepFrame(1),
+            PlayerCmd::StepFrame(1),
+            PlayerCmd::StepFrame(1),
+            PlayerCmd::SeekFrame(100),
+            PlayerCmd::StepFrame(2),
+            PlayerCmd::StepFrame(-1),
+            PlayerCmd::SetLoop(true),
+            PlayerCmd::StepFrame(1),
+            PlayerCmd::StepFrame(1),
+        ];
+        let coalesced = coalesce_commands(cmds);
+        assert_eq!(coalesced.len(), 3);
+        assert!(matches!(coalesced[0], PlayerCmd::SeekFrame(101)));
+        assert!(matches!(coalesced[1], PlayerCmd::SetLoop(true)));
+        assert!(matches!(coalesced[2], PlayerCmd::StepFrame(2)));
+    }
 }

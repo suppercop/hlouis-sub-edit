@@ -146,6 +146,10 @@ fn format_from_bundle(
     let pattern = msg.value()?;
     let mut errors = Vec::new();
     let formatted = bundle.format_pattern(pattern, args, &mut errors);
+    debug_assert!(
+        errors.is_empty(),
+        "Fluent formatting error(s) for key `{key}`: {errors:?}"
+    );
     Some(formatted.into_owned())
 }
 
@@ -206,5 +210,13 @@ mod tests {
             vi_idx.contains("75%"),
             "unexpected formatted string: {vi_idx}"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Fluent formatting error")]
+    fn bad_arg_name_triggers_debug_assert() {
+        let i18n = I18n::new(Locale::En).expect("init i18n");
+        let _ = i18n.tr_args("status-indexing", &[("wrong_arg", FluentValue::from(42))]);
     }
 }

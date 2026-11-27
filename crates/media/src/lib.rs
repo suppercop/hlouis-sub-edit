@@ -132,7 +132,13 @@ mod ffi {
         }
         // SAFETY: `ic_private` points to the stack-pinned `CallbackState` during `FFMS_DoIndexing2`.
         let state = unsafe { &mut *ic_private.cast::<CallbackState<'_>>() };
-        (state.on_progress)(current, total);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (state.on_progress)(current, total);
+        }))
+        .is_err();
+        if panicked {
+            return 1;
+        }
         i32::from(state.cancel.load(Ordering::Relaxed))
     }
 
@@ -248,22 +254,35 @@ mod ffi {
             let frame = unsafe { &*frame_ptr };
             let src_ptr = frame.Data[0];
             let linesize = usize::try_from(frame.Linesize[0].max(0)).unwrap_or(0);
-            let row_bytes = (self.info.width as usize) * 4;
+            let row_bytes = (self.info.width as usize)
+                .checked_mul(4)
+                .ok_or(MediaError::InvalidMetadata)?;
             let height = self.info.height as usize;
-            if src_ptr.is_null() || linesize < row_bytes {
+            if src_ptr.is_null() || height == 0 || linesize < row_bytes {
                 return Err(MediaError::InvalidMetadata);
             }
 
-            let total_bytes = row_bytes * height;
+            let total_bytes = row_bytes
+                .checked_mul(height)
+                .ok_or(MediaError::InvalidMetadata)?;
+            let readable_bytes = (height - 1)
+                .checked_mul(linesize)
+                .and_then(|n| n.checked_add(row_bytes))
+                .ok_or(MediaError::InvalidMetadata)?;
+            let max_slice = usize::try_from(isize::MAX).unwrap_or(usize::MAX);
+            if readable_bytes > max_slice || total_bytes > max_slice {
+                return Err(MediaError::InvalidMetadata);
+            }
+
             out_rgba.resize(total_bytes, 0);
 
             if linesize == row_bytes {
-                // SAFETY: `src_ptr` points to `height * linesize == total_bytes` readable bytes.
+                // SAFETY: `src_ptr` is non-null and has `total_bytes == readable_bytes <= isize::MAX` readable bytes.
                 let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, total_bytes) };
                 out_rgba.copy_from_slice(src_slice);
             } else {
-                // SAFETY: `src_ptr` has `height` rows separated by `linesize` bytes, each >= `row_bytes`.
-                let src_all = unsafe { std::slice::from_raw_parts(src_ptr, linesize * height) };
+                // SAFETY: `src_ptr` is non-null and has at least `(height - 1) * linesize + row_bytes <= isize::MAX` readable bytes.
+                let src_all = unsafe { std::slice::from_raw_parts(src_ptr, readable_bytes) };
                 for y in 0..height {
                     let src_row = &src_all[y * linesize..y * linesize + row_bytes];
                     let dst_row = &mut out_rgba[y * row_bytes..(y + 1) * row_bytes];
@@ -329,7 +348,10 @@ mod ffi {
         let mut err_info = err.as_info();
 
         // SAFETY: `source` is valid.
-        let props: &FFMS_VideoProperties = unsafe { &*FFMS_GetVideoProperties(source.as_ptr()) };
+        let props_ptr = unsafe { FFMS_GetVideoProperties(source.as_ptr()) };
+        let props_nn = NonNull::new(props_ptr.cast_mut()).ok_or(MediaError::InvalidMetadata)?;
+        // SAFETY: `props_nn` is non-null and owned by `source`.
+        let props: &FFMS_VideoProperties = unsafe { props_nn.as_ref() };
         if props.NumFrames <= 0 {
             return Err(MediaError::InvalidMetadata);
         }
@@ -380,7 +402,10 @@ mod ffi {
         height: u32,
     ) -> Result<VideoInfo, MediaError> {
         // SAFETY: `source` is valid.
-        let props = unsafe { &*FFMS_GetVideoProperties(source.as_ptr()) };
+        let props_ptr = unsafe { FFMS_GetVideoProperties(source.as_ptr()) };
+        let props_nn = NonNull::new(props_ptr.cast_mut()).ok_or(MediaError::InvalidMetadata)?;
+        // SAFETY: `props_nn` is non-null and owned by `source`.
+        let props = unsafe { props_nn.as_ref() };
         // SAFETY: `source` is valid.
         let track = unsafe { FFMS_GetTrackFromVideo(source.as_ptr()) };
         if track.is_null() {
@@ -389,8 +414,11 @@ mod ffi {
         // SAFETY: `track` is non-null and owned by `source`.
         let track_frames = unsafe { FFMS_GetNumFrames(track) };
         let num_frames = usize::try_from(track_frames.max(0)).unwrap_or(0);
-        // SAFETY: `track` is valid; `FFMS_GetTimeBase` returns a valid pointer owned by the track.
-        let tb = unsafe { *FFMS_GetTimeBase(track) };
+        // SAFETY: `track` is valid.
+        let tb_ptr = unsafe { FFMS_GetTimeBase(track) };
+        let tb_nn = NonNull::new(tb_ptr.cast_mut()).ok_or(MediaError::InvalidMetadata)?;
+        // SAFETY: `tb_nn` is non-null and owned by `track`.
+        let tb = unsafe { *tb_nn.as_ref() };
 
         let mut keyframes = Vec::new();
         let mut frame_pts_ms = Vec::with_capacity(num_frames);
@@ -406,12 +434,7 @@ mod ffi {
                 if finfo.KeyFrame != 0 {
                     keyframes.push(idx);
                 }
-                let pts_ms = if tb.Den > 0 {
-                    let scaled = (i128::from(finfo.PTS) * i128::from(tb.Num)) / i128::from(tb.Den);
-                    i64::try_from(scaled).unwrap_or(0)
-                } else {
-                    0
-                };
+                let pts_ms = super::pts_to_ms_rounded(finfo.PTS, tb.Num, tb.Den);
                 frame_pts_ms.push(pts_ms);
             }
         }
@@ -443,6 +466,24 @@ mod ffi {
             frame_pts_ms,
         })
     }
+}
+
+/// Converts an FFMS2 track PTS (with millisecond-scaled timebase `tb_num / tb_den`)
+/// to the nearest millisecond, returning `0` for `AV_NOPTS_VALUE` (`i64::MIN`) or invalid timebases.
+#[must_use]
+pub(crate) fn pts_to_ms_rounded(pts: i64, tb_num: i64, tb_den: i64) -> i64 {
+    if pts == i64::MIN || tb_den <= 0 {
+        return 0;
+    }
+    let num = i128::from(pts) * i128::from(tb_num);
+    let den = i128::from(tb_den);
+    let half = den / 2;
+    let rounded = if num >= 0 {
+        (num + half) / den
+    } else {
+        (num - half) / den
+    };
+    i64::try_from(rounded).unwrap_or(0)
 }
 
 /// Safe FFMS2 video decoder producing tightly-packed RGBA8 frames.
@@ -529,6 +570,28 @@ mod tests {
         assert_eq!(info.prev_keyframe(48), Some(0));
         assert_eq!(info.prev_keyframe(49), Some(48));
         assert_eq!(info.prev_keyframe(199), Some(150));
+    }
+
+    #[test]
+    fn pts_to_ms_rounds_at_24000_1001_and_handles_nopts() {
+        // FFMS2 timebase for 24000/1001 fps: 1001/24 ms per frame tick.
+        assert_eq!(pts_to_ms_rounded(0, 1001, 24), 0);
+        // 41.7083... ms -> rounds to 42 ms (not truncated 41 ms).
+        assert_eq!(pts_to_ms_rounded(1, 1001, 24), 42);
+        // 83.4166... ms -> rounds to 83 ms.
+        assert_eq!(pts_to_ms_rounded(2, 1001, 24), 83);
+        // 125.125 ms -> rounds to 125 ms.
+        assert_eq!(pts_to_ms_rounded(3, 1001, 24), 125);
+        // 24 frames = exact 1001 ms.
+        assert_eq!(pts_to_ms_rounded(24, 1001, 24), 1001);
+        // 999.99 ms -> rounds to 1000 ms instead of missing a 0:00:01.00 subtitle.
+        assert_eq!(pts_to_ms_rounded(99_999, 1, 100), 1000);
+        // Negative timestamps round half away from zero.
+        assert_eq!(pts_to_ms_rounded(-1, 1001, 24), -42);
+        // AV_NOPTS_VALUE (i64::MIN) and invalid timebase return 0 safely.
+        assert_eq!(pts_to_ms_rounded(i64::MIN, 1001, 24), 0);
+        assert_eq!(pts_to_ms_rounded(10, 1001, 0), 0);
+        assert_eq!(pts_to_ms_rounded(10, 1001, -24), 0);
     }
 
     #[test]

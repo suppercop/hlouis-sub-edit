@@ -146,11 +146,21 @@ impl GridState {
             }
             self.active_row = row;
         } else if ctrl {
-            if !self.selected.remove(&row) {
+            if self.selected.contains(&row) {
+                if self.selected.len() > 1 {
+                    self.selected.remove(&row);
+                    if self.active_row == row {
+                        if let Some(&fallback) = self.selected.iter().next() {
+                            self.active_row = fallback;
+                            self.anchor_row = fallback;
+                        }
+                    }
+                }
+            } else {
                 self.selected.insert(row);
+                self.active_row = row;
+                self.anchor_row = row;
             }
-            self.active_row = row;
-            self.anchor_row = row;
         } else {
             self.selected.clear();
             self.selected.insert(row);
@@ -225,8 +235,30 @@ mod tests {
         assert!(!grid.selected.contains(&5));
         assert_eq!(grid.selected.len(), 10);
 
+        assert_eq!(grid.active_row, 10);
         grid.move_active(1, false);
-        assert_eq!(grid.active_row, 6);
+        assert_eq!(grid.active_row, 11);
         assert_eq!(grid.selected.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_click_never_leaves_empty_selection_or_unbound_active_row() {
+        let mut grid = GridState::generate(20);
+        // Row 0 is the only selected row; Ctrl+click must keep it selected.
+        grid.click_row(0, false, true);
+        assert_eq!(grid.selected.len(), 1);
+        assert!(grid.selected.contains(&0));
+        assert_eq!(grid.active_row, 0);
+
+        // Add row 4 via Ctrl+click, then Ctrl+click row 4 (active) to deselect it.
+        grid.click_row(4, false, true);
+        assert_eq!(grid.selected.len(), 2);
+        assert_eq!(grid.active_row, 4);
+
+        grid.click_row(4, false, true);
+        assert_eq!(grid.selected.len(), 1);
+        assert!(!grid.selected.contains(&4));
+        assert!(grid.selected.contains(&grid.active_row));
+        assert_eq!(grid.active_row, 0);
     }
 }
