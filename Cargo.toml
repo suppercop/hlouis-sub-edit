@@ -19,6 +19,7 @@ members = [
     "crates/ffms2-sys",
     "crates/render",
     "crates/media",
+    "crates/timing-controller",
     "crates/edit-box-ops",
     "crates/syntax-highlight",
 ]
