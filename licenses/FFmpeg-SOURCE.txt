@@ -1,0 +1,28 @@
+FFmpeg corresponding source notice
+==================================
+
+This distribution bundles unmodified FFmpeg shared libraries
+(avcodec-63.dll, avformat-63.dll, avutil-61.dll, swscale-10.dll,
+swresample-7.dll), version n9.0.2-982-g836df4e858, built by
+BtbN/FFmpeg-Builds (release/9.0, variant win64-lgpl-shared-9.0) without
+--enable-gpl and without --enable-nonfree.
+
+FFmpeg is licensed under the GNU Lesser General Public License version 3
+(LGPL-3.0, see LGPL-3.0.txt), which incorporates the GNU General Public
+License version 3 (see GPL-3.0.txt).
+
+Corresponding source:
+  - FFmpeg source at commit 836df4e858:
+    https://git.ffmpeg.org/ffmpeg.git  (mirror: https://github.com/FFmpeg/FFmpeg)
+  - Build scripts and configuration used to produce the binaries:
+    https://github.com/BtbN/FFmpeg-Builds
+  - The exact binary archive used (SHA-256
+    F7BA27E7986A2D0835881E742A682DEC17896F6DC2CDCF9E596F043D2763D894):
+    https://github.com/suppercop/hlouis-sub-edit/releases/tag/native-deps-v1
+
+You may replace these DLLs with your own build of a compatible FFmpeg
+version. hlouis-sub-edit links to FFmpeg only dynamically (through
+ffms2.dll).
+
+FriBidi (fribidi-0.dll, LGPL-2.1-or-later) is likewise unmodified and
+dynamically linked; its source is the vcpkg port listed in THIRD_PARTY.md.

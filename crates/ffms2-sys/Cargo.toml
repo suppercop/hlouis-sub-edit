@@ -1,0 +1,9 @@
+[package]
+name = "ffms2-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "ffms2"
+
+[lints]
+workspace = true

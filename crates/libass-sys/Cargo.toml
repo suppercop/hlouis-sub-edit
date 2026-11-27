@@ -1,0 +1,9 @@
+[package]
+name = "libass-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "ass"
+
+[lints]
+workspace = true
