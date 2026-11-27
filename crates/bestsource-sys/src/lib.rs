@@ -146,6 +146,49 @@ extern "C" {
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
+
+    pub fn bs_quick_open(
+        path_utf8: *const c_char,
+        track: c_int,
+        threads: c_int,
+        out: *mut *mut bs_quick,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    pub fn bs_quick_close(q: *mut bs_quick);
+    pub fn bs_quick_get_props(q: *const bs_quick, out: *mut bs_quick_props);
+    pub fn bs_quick_get_frame_rgba(
+        q: *mut bs_quick,
+        n: i64,
+        dst: *mut u8,
+        stride: isize,
+        width: c_int,
+        height: c_int,
+        pts_out: *mut i64,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+}
+
+/// Index-free decoder handle (see `bs_quick_*` in `shim/bs_shim.h`).
+#[repr(C)]
+pub struct bs_quick {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct bs_quick_props {
+    pub track: c_int,
+    pub width: c_int,
+    pub height: c_int,
+    pub num_frames_estimate: i64,
+    pub fps_num: c_int,
+    pub fps_den: c_int,
+    pub time_base_num: c_int,
+    pub time_base_den: c_int,
+    pub first_pts: i64,
+    pub duration: i64,
 }
 
 #[cfg(test)]

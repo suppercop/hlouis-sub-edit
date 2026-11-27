@@ -99,6 +99,33 @@ void bs_audio_get_props(const bs_audio *a, bs_audio_props *out);
 int bs_audio_get_packed(bs_audio *a, uint8_t *dst, int64_t start, int64_t count, char *err,
                         size_t err_len);
 
+/* ---- Quick (index-free) video: plain libavformat/libavcodec through BestSource's decoder ----
+   For an instant first frame while the real index is built. Frame numbers are derived from
+   timestamps assuming constant frame rate, so seeks are approximate (to the nearest frame at or
+   after the computed time). */
+typedef struct bs_quick bs_quick;
+
+typedef struct bs_quick_props {
+    int track;
+    int width;
+    int height;
+    int64_t num_frames_estimate; /* -1 when unknown */
+    int fps_num;
+    int fps_den;
+    int time_base_num;
+    int time_base_den;
+    int64_t first_pts; /* time base units */
+    int64_t duration;  /* time base units, 0 when unknown */
+} bs_quick_props;
+
+int bs_quick_open(const char *path_utf8, int track, int threads, bs_quick **out, char *err, size_t err_len);
+void bs_quick_close(bs_quick *q);
+void bs_quick_get_props(const bs_quick *q, bs_quick_props *out);
+/* Decodes the frame displayed at frame slot n (CFR estimate) into RGBA8. Sequential n is cheap;
+   anything else seeks to the previous keyframe and decodes forward. */
+int bs_quick_get_frame_rgba(bs_quick *q, int64_t n, uint8_t *dst, ptrdiff_t stride, int width, int height,
+                            int64_t *pts_out, char *err, size_t err_len);
+
 #ifdef __cplusplus
 }
 #endif
