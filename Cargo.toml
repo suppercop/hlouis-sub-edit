@@ -67,6 +67,7 @@ members = [
     "crates/version-check",
     "crates/perf-report",
     "crates/golden-tools",
+    "crates/ui-mkv-import",
 ]
 
 [workspace.package]
