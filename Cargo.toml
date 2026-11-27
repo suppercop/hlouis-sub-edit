@@ -19,6 +19,7 @@ members = [
     "crates/ffms2-sys",
     "crates/render",
     "crates/media",
+    "crates/commands",
     "crates/theme",
     "crates/frame-tools",
     "crates/video-geometry",
