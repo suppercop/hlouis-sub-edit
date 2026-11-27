@@ -79,11 +79,11 @@ struct ResampleState {
 
 /// Resamples `script` to the target resolution in `opts`.
 ///
-/// Updates `[Script Info]` (`PlayResX`, `PlayResY`, `LayoutResX`/`LayoutResY` when present, and
-/// `YCbCr Matrix` when requested) and returns one atomic [`EditCommand::Batch`] covering all
-/// style and event mutations.
+/// Returns one atomic [`EditCommand::Batch`] updating `[Script Info]` (`PlayResX`, `PlayResY`,
+/// `LayoutResX`/`LayoutResY` when present, and `YCbCr Matrix` when requested), all `[V4+ Styles]`,
+/// and all `[Events]`. Does not mutate `script` until the returned command is executed.
 pub fn resample_resolution(
-    script: &mut ScriptFile,
+    script: &ScriptFile,
     opts: &ResampleOptions,
 ) -> Result<EditCommand, ToolsError> {
     if opts.dest_x == 0 || opts.dest_y == 0 {
@@ -93,22 +93,33 @@ pub fn resample_resolution(
     let (src_x, src_y) = resolve_source_res(script, opts.source_override);
     let state = compute_state(src_x, src_y, opts);
 
-    // Update [Script Info] header values.
-    if let Some(info) = script.script_info_mut() {
-        info.set("PlayResX", opts.dest_x.to_string());
-        info.set("PlayResY", opts.dest_y.to_string());
-        if info.get("LayoutResX").is_some() {
-            info.set("LayoutResX", opts.dest_x.to_string());
-        }
-        if info.get("LayoutResY").is_some() {
-            info.set("LayoutResY", opts.dest_y.to_string());
-        }
-        if let Some(ref matrix) = opts.ycbcr_matrix {
-            info.set("YCbCr Matrix", matrix.clone());
-        }
-    }
-
     let mut cmds = Vec::new();
+    let width_str = opts.dest_x.to_string();
+    let height_str = opts.dest_y.to_string();
+    let info = script.script_info();
+
+    let push_info = |cmds: &mut Vec<EditCommand>, key: &str, next: String| {
+        let prev = info.and_then(|s| s.get(key)).map(str::to_owned);
+        if prev.as_deref() != Some(next.as_str()) {
+            cmds.push(EditCommand::SetScriptInfo {
+                key: key.to_owned(),
+                before: prev,
+                after: Some(next),
+            });
+        }
+    };
+
+    push_info(&mut cmds, "PlayResX", width_str.clone());
+    push_info(&mut cmds, "PlayResY", height_str.clone());
+    if info.and_then(|s| s.get("LayoutResX")).is_some() {
+        push_info(&mut cmds, "LayoutResX", width_str);
+    }
+    if info.and_then(|s| s.get("LayoutResY")).is_some() {
+        push_info(&mut cmds, "LayoutResY", height_str);
+    }
+    if let Some(ref matrix) = opts.ycbcr_matrix {
+        push_info(&mut cmds, "YCbCr Matrix", matrix.clone());
+    }
 
     // Scale all styles.
     if let Some(styles_sec) = script.styles_section() {
@@ -488,7 +499,11 @@ Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,{\\p1\\pbo10}m 0 0 l 100 0 100
         let mut opts = ResampleOptions::new(1920, 1080);
         opts.ycbcr_matrix = Some("TV.709".to_owned());
 
-        let cmd = resample_resolution(&mut script, &opts).expect("resample");
+        let cmd = resample_resolution(&script, &opts).expect("resample");
+        // Generating the command must not mutate [Script Info] prematurely.
+        assert_eq!(script.script_info().unwrap().get("PlayResX"), Some("1280"));
+        assert_eq!(script.script_info().unwrap().get("YCbCr Matrix"), None);
+
         let mut history = UndoHistory::default();
         history.execute(&mut script, cmd).expect("exec");
 
@@ -516,8 +531,12 @@ Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,{\\p1\\pbo10}m 0 0 l 100 0 100
         );
         assert_eq!(evs[1].text(), r"{\p1\pbo15}m 0 0 l 150 0 150 75{\p0}");
 
-        // Undo reverts styles and events in one step.
+        // Undo reverts [Script Info], styles, and events in one step.
         history.undo(&mut script).expect("undo");
+        assert_eq!(script.script_info().unwrap().get("PlayResX"), Some("1280"));
+        assert_eq!(script.script_info().unwrap().get("PlayResY"), Some("720"));
+        assert_eq!(script.script_info().unwrap().get("LayoutResY"), Some("720"));
+        assert_eq!(script.script_info().unwrap().get("YCbCr Matrix"), None);
         assert!((script.styles().next().unwrap().fontsize() - 40.0).abs() < 1e-6);
         assert!(script
             .events()
@@ -525,6 +544,14 @@ Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,{\\p1\\pbo10}m 0 0 l 100 0 100
             .unwrap()
             .text()
             .contains(r"\pos(640,360)"));
+
+        // Redo restores all header, style, and event mutations.
+        history.redo(&mut script).expect("redo");
+        assert_eq!(script.script_info().unwrap().get("PlayResX"), Some("1920"));
+        assert_eq!(
+            script.script_info().unwrap().get("YCbCr Matrix"),
+            Some("TV.709")
+        );
     }
 
     #[test]
@@ -547,7 +574,7 @@ Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\fscx100\\pos(320,240)}Wide
         let mut script = parse_ass(raw).value;
         let mut opts = ResampleOptions::new(1920, 1080);
         opts.ar_mode = AspectRatioMode::Stretch;
-        let cmd = resample_resolution(&mut script, &opts).expect("stretch");
+        let cmd = resample_resolution(&script, &opts).expect("stretch");
         cmd.apply(&mut script).expect("apply");
 
         let st = script.styles().next().unwrap();

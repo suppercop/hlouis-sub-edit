@@ -158,6 +158,32 @@ impl ScriptFile {
         })
     }
 
+    /// Ensures a `[Script Info]` section exists and returns a mutable reference to it.
+    pub fn ensure_script_info_mut(&mut self) -> &mut KeyValueSection {
+        let pos = self
+            .sections
+            .iter()
+            .position(|s| matches!(s, Section::ScriptInfo(_)));
+        let idx = if let Some(i) = pos {
+            i
+        } else {
+            let insert_at =
+                usize::from(matches!(self.sections.first(), Some(Section::Preamble(_))));
+            self.sections.insert(
+                insert_at,
+                Section::ScriptInfo(KeyValueSection {
+                    header: "[Script Info]".to_owned(),
+                    entries: Vec::new(),
+                }),
+            );
+            insert_at
+        };
+        match &mut self.sections[idx] {
+            Section::ScriptInfo(sec) => sec,
+            _ => unreachable!(),
+        }
+    }
+
     /// Returns a reference to the `[Aegisub Project Garbage]` section, if present.
     #[must_use]
     pub fn aegisub_garbage(&self) -> Option<&KeyValueSection> {
@@ -340,6 +366,17 @@ impl KeyValueSection {
                 value: val_s,
             },
         );
+    }
+
+    /// Removes the first entry matching `key` (case-insensitive), returning its previous value.
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        let pos = self.entries.iter().position(
+            |e| matches!(e, KeyValueEntry::KeyValue { key: k, .. } if k.eq_ignore_ascii_case(key)),
+        )?;
+        match self.entries.remove(pos) {
+            KeyValueEntry::KeyValue { value, .. } => Some(value),
+            _ => None,
+        }
     }
 }
 

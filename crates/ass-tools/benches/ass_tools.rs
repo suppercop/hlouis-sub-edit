@@ -154,8 +154,7 @@ fn bench_resample_and_karaoke(c: &mut Criterion) {
     c.bench_function("resample_resolution_20k_tags_drawings", |b| {
         let opts = ResampleOptions::new(1920, 1080);
         b.iter(|| {
-            let mut copy = resample_script.clone();
-            let cmd = resample_resolution(&mut copy, black_box(&opts));
+            let cmd = resample_resolution(black_box(&resample_script), black_box(&opts));
             black_box(cmd).expect("resample")
         });
     });

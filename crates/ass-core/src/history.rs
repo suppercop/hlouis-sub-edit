@@ -37,6 +37,12 @@ pub enum EditCommand {
         before: Box<AssStyle>,
         after: Box<AssStyle>,
     },
+    /// Set, update, or remove a `[Script Info]` key.
+    SetScriptInfo {
+        key: String,
+        before: Option<String>,
+        after: Option<String>,
+    },
     /// Group multiple commands into a single undo/redo step.
     Batch(Vec<EditCommand>),
 }
@@ -97,6 +103,10 @@ impl EditCommand {
                     .and_then(|sec| sec.get_style_mut(*index))
                     .ok_or(AssError::StyleIndexOutOfRange(*index))?;
                 st.clone_from(after);
+                Ok(())
+            }
+            Self::SetScriptInfo { key, after, .. } => {
+                apply_script_info_value(script, key, after.as_deref());
                 Ok(())
             }
             Self::Batch(cmds) => {
@@ -165,6 +175,10 @@ impl EditCommand {
                 st.clone_from(before);
                 Ok(())
             }
+            Self::SetScriptInfo { key, before, .. } => {
+                apply_script_info_value(script, key, before.as_deref());
+                Ok(())
+            }
             Self::Batch(cmds) => {
                 for cmd in cmds.iter().rev() {
                     cmd.revert(script)?;
@@ -192,9 +206,25 @@ impl EditCommand {
             Self::ModifyStyle { before, after, .. } => {
                 style_heap_bytes(before) + style_heap_bytes(after)
             }
+            Self::SetScriptInfo { key, before, after } => {
+                key.capacity()
+                    + before.as_ref().map_or(0, String::capacity)
+                    + after.as_ref().map_or(0, String::capacity)
+            }
             Self::Batch(cmds) => cmds.iter().map(Self::approx_bytes).sum(),
         };
         base.saturating_add(extra)
+    }
+}
+
+fn apply_script_info_value(script: &mut ScriptFile, key: &str, value: Option<&str>) {
+    match value {
+        Some(v) => script.ensure_script_info_mut().set(key, v),
+        None => {
+            if let Some(info) = script.script_info_mut() {
+                let _ = info.remove(key);
+            }
+        }
     }
 }
 
@@ -520,6 +550,60 @@ mod tests {
         assert!(
             elapsed_ms < 5.0,
             "undo+redo on 20k lines took {elapsed_ms:.3} ms (budget < 5 ms)"
+        );
+    }
+
+    #[test]
+    fn set_script_info_supports_insert_update_remove_and_undo_redo() {
+        let mut script = ScriptFile::new_default();
+        let mut history = UndoHistory::default();
+
+        history
+            .execute(
+                &mut script,
+                EditCommand::SetScriptInfo {
+                    key: "YCbCr Matrix".to_owned(),
+                    before: None,
+                    after: Some("TV.709".to_owned()),
+                },
+            )
+            .expect("insert");
+        assert_eq!(
+            script.script_info().and_then(|s| s.get("YCbCr Matrix")),
+            Some("TV.709")
+        );
+
+        history
+            .execute(
+                &mut script,
+                EditCommand::SetScriptInfo {
+                    key: "PlayResX".to_owned(),
+                    before: Some("1920".to_owned()),
+                    after: Some("1280".to_owned()),
+                },
+            )
+            .expect("update");
+        assert_eq!(
+            script.script_info().and_then(|s| s.get("PlayResX")),
+            Some("1280")
+        );
+
+        assert!(history.undo(&mut script).expect("undo update"));
+        assert_eq!(
+            script.script_info().and_then(|s| s.get("PlayResX")),
+            Some("1920")
+        );
+
+        assert!(history.undo(&mut script).expect("undo insert"));
+        assert_eq!(
+            script.script_info().and_then(|s| s.get("YCbCr Matrix")),
+            None
+        );
+
+        assert!(history.redo(&mut script).expect("redo insert"));
+        assert_eq!(
+            script.script_info().and_then(|s| s.get("YCbCr Matrix")),
+            Some("TV.709")
         );
     }
 }
