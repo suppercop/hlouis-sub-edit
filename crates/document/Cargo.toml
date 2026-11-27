@@ -1,0 +1,21 @@
+[package]
+name = "document"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+ass-core = { path = "../ass-core" }
+autosave = { path = "../autosave" }
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "document"
+harness = false

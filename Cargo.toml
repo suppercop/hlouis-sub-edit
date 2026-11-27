@@ -39,6 +39,13 @@ members = [
     "crates/edit-box-ops",
     "crates/syntax-highlight",
     "crates/frame-check",
+    "crates/document",
+    "crates/playback",
+    "crates/frame-cache",
+    "crates/perf-metrics",
+    "crates/mkv-import",
+    "crates/dialogs-model",
+    "crates/i18n-catalog",
 ]
 
 [workspace.package]
