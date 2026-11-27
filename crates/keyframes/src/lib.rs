@@ -21,6 +21,8 @@ pub enum KeyframeError {
     UnrecognizedFormat,
     #[error("invalid keyframe line {line}: {message}")]
     InvalidKeyframeLine { line: usize, message: String },
+    #[error("the keyframe file was recognised as {format} but contains no keyframes")]
+    NoKeyframes { format: &'static str },
     #[error("invalid timecode file: {0}")]
     InvalidTimecodes(String),
     #[error("invalid framerate {0}/{1}")]

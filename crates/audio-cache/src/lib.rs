@@ -133,7 +133,15 @@ impl<S: PcmSample> Drop for CacheInner<S> {
     fn drop(&mut self) {
         self.spill_file = None;
         if let Some(ref p) = self.spill_path {
-            let _ = std::fs::remove_file(p);
+            // Drop cannot return an error; a leaked spill file is reported rather than ignored.
+            if let Err(e) = std::fs::remove_file(p) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "audio-cache: could not remove spill file {}: {e}",
+                        p.display()
+                    );
+                }
+            }
         }
     }
 }

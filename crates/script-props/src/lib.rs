@@ -158,10 +158,28 @@ impl ScriptProperties {
     /// Reads all Script Properties from a [`ScriptFile`]'s `[Script Info]` section.
     #[must_use]
     pub fn from_script(script: &ScriptFile) -> Self {
+        Self::from_script_with_warnings(script).0
+    }
+
+    /// Like [`ScriptProperties::from_script`] but also reports every resolution value that was
+    /// present yet unparseable (and therefore replaced by a default).
+    #[must_use]
+    pub fn from_script_with_warnings(script: &ScriptFile) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
         let mut props = Self::default();
         let Some(info) = script.script_info() else {
-            return props;
+            warnings.push("the script has no [Script Info] section; defaults were used".to_owned());
+            return (props, warnings);
         };
+        for key in ["PlayResX", "PlayResY", "LayoutResX", "LayoutResY"] {
+            if let Some(v) = info.get(key) {
+                if v.trim().parse::<u32>().is_err() {
+                    warnings.push(format!(
+                        "`{key}: {v}` is not a valid resolution; it was ignored"
+                    ));
+                }
+            }
+        }
         if let Some(v) = info.get("Title") {
             v.clone_into(&mut props.title);
         }
@@ -216,7 +234,7 @@ impl ScriptProperties {
         if let Some(v) = info.get("Kerning") {
             props.kerning = v.trim().eq_ignore_ascii_case("yes");
         }
-        props
+        (props, warnings)
     }
 
     /// Sets `PlayResX`/`PlayResY` from the loaded video's dimensions ("From video" button).
@@ -539,5 +557,20 @@ PlayResY: 720
             .is_some_and(|i| i.get("Kerning").is_none()));
         assert!(history.redo(&mut script).expect("redo"));
         assert_eq!(ScriptProperties::from_script(&script).play_res_x, 1920);
+    }
+
+    #[test]
+    fn invalid_resolution_is_reported() {
+        let script = ass_core::parse_ass(
+            "[Script Info]
+PlayResX: wide
+PlayResY: 480
+",
+        )
+        .value;
+        let (props, warnings) = ScriptProperties::from_script_with_warnings(&script);
+        assert_eq!(props.play_res_y, 480);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("PlayResX"));
     }
 }
