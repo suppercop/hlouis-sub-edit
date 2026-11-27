@@ -16,6 +16,7 @@ i18n = { path = "../i18n" }
 media = { path = "../media" }
 render = { path = "../render" }
 rfd.workspace = true
+settings = { path = "../settings" }
 wgpu.workspace = true
 windows-sys.workspace = true
 

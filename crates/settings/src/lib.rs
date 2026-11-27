@@ -169,6 +169,10 @@ pub struct VideoPrefs {
     pub fast_jump_step: i64,
     pub check_script_res: u8,
     pub detached_video: bool,
+    /// Opt-in idle-time pre-indexing of sibling video files in the same folder (default off).
+    pub idle_preindex_siblings: bool,
+    /// Persistent `BestSource` index cache size cap in MiB (default 2048 = 2 GiB).
+    pub index_cache_max_mb: u64,
 }
 
 impl Default for VideoPrefs {
@@ -180,6 +184,8 @@ impl Default for VideoPrefs {
             fast_jump_step: 10,
             check_script_res: 2,
             detached_video: false,
+            idle_preindex_siblings: false,
+            index_cache_max_mb: 2048,
         }
     }
 }
@@ -412,6 +418,7 @@ impl AppSettings {
         self.video.default_zoom_idx = self.video.default_zoom_idx.min(20);
         self.video.fast_jump_step = self.video.fast_jump_step.clamp(1, 1000);
         self.video.check_script_res = self.video.check_script_res.min(3);
+        self.video.index_cache_max_mb = self.video.index_cache_max_mb.clamp(128, 65_536);
         self.timing.default_duration_ms = self.timing.default_duration_ms.clamp(100, 60_000);
         self.timing.adjacent_bias = self.timing.adjacent_bias.clamp(0.0, 1.0);
         self.autosave.interval_seconds = self.autosave.interval_seconds.clamp(5, 3600);
@@ -533,8 +540,15 @@ mod tests {
         assert_eq!(loaded.autosave.interval_seconds, 5);
         assert!(loaded.unknown.contains_key("future_plugin"));
 
+        assert!(!loaded.video.idle_preindex_siblings);
+        assert_eq!(loaded.video.index_cache_max_mb, 2048);
+
         let saved = loaded.save_json().expect("save");
         assert!(saved.contains("future_plugin"));
+
+        let clamped =
+            AppSettings::load_json(r#"{"video":{"index_cache_max_mb":1}}"#).expect("clamp");
+        assert_eq!(clamped.video.index_cache_max_mb, 128);
 
         let hits = Rc::new(Cell::new(0u32));
         let hits_clone = Rc::clone(&hits);

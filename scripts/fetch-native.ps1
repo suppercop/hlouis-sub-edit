@@ -283,8 +283,56 @@ if ($Force -or (-not (Test-Path $ffmsOutDll)) -or (-not (Test-Path $ffmsOutLib))
     Set-Content -Path $ffmsStampPath -Value $desiredStamp -Encoding ASCII
 }
 
+# 4b. Download pinned BestSource (R23, MIT) + its two small deps: libp2p (WTFPL, pixel packing)
+#     and xxHash (BSD-2-Clause, header-only use). The sources are staged under .native/src and
+#     compiled by crates/bestsource-sys/build.rs with the `cc` crate against the FFmpeg above.
+$SrcOut = Join-Path $OutputDir "src"
+New-Item -ItemType Directory -Force -Path $SrcOut | Out-Null
+$bsSources = @(
+    @{ Name = "bestsource"; Url = "https://github.com/vapoursynth/bestsource/archive/refs/tags/R23.tar.gz"; Sha = "1CBC9586BD83668BE130B2D69FAA46448D3F6A2E2C075DAE2977A87358E8986B"; Archive = "bestsource-R23.tar.gz"; Dir = "bestsource-R23" },
+    @{ Name = "libp2p"; Url = "https://github.com/sekrit-twc/libp2p/archive/869fa993041f9f3af7d9ac8b10158920c6ddce66.tar.gz"; Sha = "CACEF2683A19A8B288CF567544B507F7F06DD66160DB566BF3349E5EE0B73D90"; Archive = "libp2p-869fa993.tar.gz"; Dir = "libp2p-869fa993041f9f3af7d9ac8b10158920c6ddce66" },
+    @{ Name = "xxhash"; Url = "https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.3.tar.gz"; Sha = "AAE608DFE8213DFD05D909A57718EF82F30722C392344583D3F39050C7F29A80"; Archive = "xxHash-0.8.3.tar.gz"; Dir = "xxHash-0.8.3" }
+)
+foreach ($s in $bsSources) {
+    $archivePath = Join-Path $DownloadsDir $s.Archive
+    Invoke-PinnedDownload -Url $s.Url -DestPath $archivePath -ExpectedSha256 $s.Sha
+    $dest = Join-Path $SrcOut $s.Name
+    $stamp = Join-Path $SrcOut "$($s.Name).stamp"
+    $current = if (Test-Path $stamp) { (Get-Content -Raw $stamp).Trim() } else { "" }
+    if ($Force -or (-not (Test-Path $dest)) -or ($current -ne $s.Sha)) {
+        Write-Host "[native] Extracting $($s.Archive) to $dest ..."
+        $extracted = Join-Path $WorkDir $s.Dir
+        if (Test-Path $extracted) { Remove-Item -Recurse -Force $extracted }
+        if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+        & tar.exe -xf $archivePath -C $WorkDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "tar.exe failed extracting $archivePath"
+        }
+        Move-Item $extracted $dest
+        Set-Content -Path $stamp -Value $s.Sha -Encoding ASCII
+    }
+}
+
 # 5. Stage headers, import libraries, runtime DLLs, and licenses into .native/
 Write-Host "[native] Staging headers, libs, DLLs, and license notices into $OutputDir ..."
+
+# FFmpeg headers + import libraries (bestsource-sys compiles BestSource against them)
+foreach ($dir in @("libavcodec", "libavformat", "libavutil", "libswscale", "libswresample")) {
+    $destInc = Join-Path $IncludeOut $dir
+    if (Test-Path $destInc) { Remove-Item -Recurse -Force $destInc }
+    Copy-Item -Recurse -Force (Join-Path $ffmpegRoot "include\$dir") $destInc
+}
+foreach ($libName in @("avcodec.lib", "avformat.lib", "avutil.lib", "swscale.lib", "swresample.lib")) {
+    Copy-Item -Force (Join-Path $ffmpegRoot "lib\$libName") $LibOut
+}
+
+# The same LGPL ffmpeg.exe/ffprobe.exe, used by tests/benches to generate and probe clips
+# (kept off PATH on purpose)
+$ToolsOut = Join-Path $OutputDir "tools"
+New-Item -ItemType Directory -Force -Path $ToolsOut | Out-Null
+Copy-Item -Force (Join-Path $ffmpegRoot "bin\ffmpeg.exe") $ToolsOut
+Copy-Item -Force (Join-Path $ffmpegRoot "bin\ffprobe.exe") $ToolsOut
+Get-ChildItem (Join-Path $ffmpegRoot "bin") -Filter "*.dll" | ForEach-Object { Copy-Item -Force $_.FullName $ToolsOut }
 
 # Headers
 $assIncludeOut = Join-Path $IncludeOut "ass"
