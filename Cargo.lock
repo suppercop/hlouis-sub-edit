@@ -2450,6 +2450,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mkv-import"
+version = "0.1.0"
+dependencies = [
+ "ass-core",
+ "criterion",
+ "mkv-subs",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "mkv-subs"
 version = "0.1.0"
 dependencies = [

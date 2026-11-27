@@ -42,6 +42,7 @@ members = [
     "crates/playback",
     "crates/frame-cache",
     "crates/perf-metrics",
+    "crates/mkv-import",
 ]
 
 [workspace.package]
