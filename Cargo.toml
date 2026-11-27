@@ -41,6 +41,7 @@ members = [
     "crates/document",
     "crates/playback",
     "crates/frame-cache",
+    "crates/perf-metrics",
 ]
 
 [workspace.package]
