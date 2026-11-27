@@ -1,10 +1,34 @@
-//! Safe `FFMS2` video indexing and frame-accurate decoding wrapper.
+//! Video/audio providers behind common traits: `BestSource` (default) and `FFMS2` (fast-open
+//! fallback), selectable at runtime.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
+
+mod bestsource;
+mod index_store;
+mod preindex;
+mod provider;
+mod quick;
+
+pub use bestsource::{
+    track_types, BestSourceAudio, BestSourceOptions, BestSourceProvider, IndexCache, PlanarFormat,
+    PlanarFrame,
+};
+pub use ffi::bestsource::PartialIndex;
+pub use ffi::win::{
+    process_cpu_time, process_memory_bytes, set_current_thread_priority, ThreadPriority,
+};
+pub use index_store::IndexStore;
+pub use preindex::{list_sibling_videos, PreindexHandle, PreindexProgress};
+pub use provider::{
+    background_decode_threads, open_video, AudioInfo, AudioProvider, AudioUpgradeStatus, FastOpen,
+    HybridOptions, HybridVideo, IndexPhase, IndexProgress, ProviderKind, UpgradeStatus,
+    VideoProvider,
+};
+pub use quick::QuickVideo;
 
 /// Errors returned by the FFMS2 video source.
 #[derive(Debug, Error)]
@@ -17,6 +41,8 @@ pub enum MediaError {
     Cancelled,
     #[error("FFMS2 error: {0}")]
     Ffms(String),
+    #[error("BestSource error: {0}")]
+    BestSource(String),
     #[error("video file has no usable video stream or invalid dimensions")]
     InvalidMetadata,
     #[error("requested frame {frame} out of range (total {total})")]
@@ -61,6 +87,9 @@ impl VideoInfo {
 }
 
 mod ffi {
+    pub(crate) mod bestsource;
+    pub(crate) mod win;
+
     use super::{MediaError, VideoInfo};
     use ffms2_sys::{
         FFMS_CreateIndexer, FFMS_CreateVideoSource, FFMS_DestroyIndex, FFMS_DestroyVideoSource,

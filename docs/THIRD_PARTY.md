@@ -16,8 +16,11 @@ All native libraries are fetched and built out-of-tree by [`scripts/fetch-native
 | **zlib** | `1.4` | zlib License | Dynamic (DLL, dep of `freetype`, `libpng`, `ffms2`) | `libz.dll` | vcpkg (`madler/zlib`) |
 | **bzip2** | `1.0.8` (vcpkg port `1.0.8#6`) | bzip2-1.0.6 (BSD-style) | Dynamic (DLL, dep of `freetype`) | `bz2.dll` | vcpkg (`bzip2`) |
 | **Brotli** | `1.2.1` | MIT | Dynamic (DLL, dep of `freetype`) | `brotlicommon.dll`, `brotlidec.dll` | vcpkg (`google/brotli`) |
-| **FFmpeg** | `n9.0.2-982-g836df4e858` (`win64-lgpl-shared-9.0`) | LGPL-3.0 (no `--enable-gpl`, no `--enable-nonfree`) | Dynamic (DLL, dep of `ffms2`) | `avcodec-63.dll`, `avformat-63.dll`, `avutil-61.dll`, `swscale-10.dll`, `swresample-7.dll` | [`native-deps-v1`](https://github.com/suppercop/hlouis-sub-edit/releases/tag/native-deps-v1) prerelease mirror of `BtbN/FFmpeg-Builds` (`release/9.0`, SHA-256 verified) |
+| **FFmpeg** | `n9.0.2-982-g836df4e858` (`win64-lgpl-shared-9.0`) | LGPL-3.0 (no `--enable-gpl`, no `--enable-nonfree`) | Dynamic (DLL, dep of `ffms2` and BestSource) | `avcodec-63.dll`, `avformat-63.dll`, `avutil-61.dll`, `swscale-10.dll`, `swresample-7.dll` | [`native-deps-v1`](https://github.com/suppercop/hlouis-sub-edit/releases/tag/native-deps-v1) prerelease mirror of `BtbN/FFmpeg-Builds` (`release/9.0`, SHA-256 verified) |
 | **FFMS2** | `5.1.2` (commit `3af2ef2ae47bc30b64597c9e419e5b19c4bda7d8`) | MIT | Dynamic (DLL, compiled from source with MSVC) | `ffms2.dll` | `FFMS/ffms2` (SHA-256 verified) |
+| **BestSource** | `R23` (tag `R23`, commit `bca32dac44794d93f3e580f9573c58c4a0e7671f`) | MIT | Static (compiled from source by `crates/bestsource-sys/build.rs` with `cc`, CPU decoding only, no Vulkan) | none (inside `hlouis-sub-edit.exe`) | `vapoursynth/bestsource` (SHA-256 verified) |
+| **libp2p** | commit `869fa993041f9f3af7d9ac8b10158920c6ddce66` | WTFPL-2.0 | Static (dep of BestSource) | none | `sekrit-twc/libp2p` (SHA-256 verified) |
+| **xxHash** | `v0.8.3` | BSD-2-Clause | Static, header-only (`XXH_INLINE_ALL`, dep of BestSource) | none | `Cyan4973/xxHash` (SHA-256 verified) |
 
 ## Verification Notes
 
@@ -27,3 +30,4 @@ All native libraries are fetched and built out-of-tree by [`scripts/fetch-native
 - `libass` on Windows uses the system **DirectWrite** font provider (`ASS_FONTPROVIDER_AUTODETECT`), avoiding `fontconfig` and its transitive dependencies.
 - Release artifacts bundle license notices in `licenses/` alongside `LICENSE` and this file, including the full **GPL-3.0** text (LGPL-3.0 is a set of additional permissions on top of GPL-3.0 and requires both texts), the **LGPL-3.0** text, and [`FFmpeg-SOURCE.txt`](../licenses/FFmpeg-SOURCE.txt) describing where to obtain the corresponding FFmpeg source. These files live in the repo's [`licenses/`](../licenses/) folder and are copied into the bundle by the CI "Stage release bundle" step.
 - **Before any public release:** attach the exact FFmpeg source tarball for commit `836df4e858` (and the FriBidi `1.0.18` source) as assets on the `native-deps-v1` release, so the source is offered from the same place as the binaries.
+- **BestSource** is compiled into the executable (MIT, compatible with BSD-3-Clause); it links FFmpeg only through the LGPL DLLs above. Its licence text and those of libp2p and xxHash ship in `licenses/` (`BestSource-MIT.txt`, `libp2p-WTFPL.txt`, `xxHash-BSD-2-Clause.txt`).
