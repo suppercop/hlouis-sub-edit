@@ -1064,6 +1064,24 @@ pub const COMMANDS: &[CommandMeta] = &[
         ftl_help: "cmd-tool-visual-vector-clip-help",
         aegisub_source: "command/vis_tool.cpp",
     },
+    CommandMeta {
+        id: "hlouis/select_by_style",
+        ftl_name: "cmd-hlouis-select-by-style",
+        ftl_help: "cmd-hlouis-select-by-style-help",
+        aegisub_source: "hlouis-tools",
+    },
+    CommandMeta {
+        id: "hlouis/select_by_style_dialog",
+        ftl_name: "cmd-hlouis-select-by-style-dialog",
+        ftl_help: "cmd-hlouis-select-by-style-dialog-help",
+        aegisub_source: "hlouis-tools",
+    },
+    CommandMeta {
+        id: "hlouis/clean_whitespace",
+        ftl_name: "cmd-hlouis-clean-whitespace",
+        ftl_help: "cmd-hlouis-clean-whitespace-help",
+        aegisub_source: "hlouis-tools",
+    },
 ];
 
 /// Menu item entry (either a command ID or a separator).
@@ -1455,6 +1473,24 @@ impl CommandRegistry {
                 KeyChord::CTRL,
                 "U",
                 "edit/style/underline",
+            ),
+            (
+                HotkeyContext::SubtitleGrid,
+                KeyChord::CTRL | KeyChord::ALT,
+                "S",
+                "hlouis/select_by_style",
+            ),
+            (
+                HotkeyContext::SubtitleGrid,
+                KeyChord::CTRL | KeyChord::ALT | KeyChord::SHIFT,
+                "S",
+                "hlouis/select_by_style_dialog",
+            ),
+            (
+                HotkeyContext::SubtitleGrid,
+                KeyChord::CTRL | KeyChord::ALT,
+                "W",
+                "hlouis/clean_whitespace",
             ),
         ];
         for &(ctx, mods, key, cmd) in defaults {

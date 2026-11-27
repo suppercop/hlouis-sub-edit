@@ -49,6 +49,7 @@ members = [
     "crates/mkv-import",
     "crates/dialogs-model",
     "crates/i18n-catalog",
+    "crates/hlouis-tools",
 ]
 
 [workspace.package]
