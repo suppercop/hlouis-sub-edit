@@ -44,6 +44,7 @@ members = [
     "crates/perf-metrics",
     "crates/mkv-import",
     "crates/dialogs-model",
+    "crates/i18n-catalog",
 ]
 
 [workspace.package]
