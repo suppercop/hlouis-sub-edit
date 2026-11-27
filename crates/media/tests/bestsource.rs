@@ -2,9 +2,10 @@
 //! `ffmpeg.exe` (`.native/tools`, or `HLOUIS_FFMPEG`). No media is committed.
 
 use media::{
-    AudioProvider, BestSourceAudio, BestSourceOptions, BestSourceProvider, FastOpen, FfmsVideo,
-    HybridOptions, HybridVideo, IndexCache, IndexStore, MediaError, PlanarFrame, ProviderKind,
-    QuickVideo, ThreadPriority, UpgradeStatus, VideoProvider,
+    AudioProvider, AudioUpgradeStatus, BestSourceAudio, BestSourceOptions, BestSourceProvider,
+    FastOpen, FfmsVideo, HybridOptions, HybridVideo, IndexCache, IndexPhase, IndexStore,
+    MediaError, PartialIndex, PlanarFrame, PreindexHandle, ProviderKind, QuickVideo,
+    ThreadPriority, UpgradeStatus, VideoProvider,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -387,6 +388,8 @@ fn hybrid_opts(fast: FastOpen, store: Option<IndexStore>) -> HybridOptions {
     HybridOptions {
         fast,
         bestsource: no_cache(),
+        audio_track: -1,
+        index_audio: true,
         store,
         priority: ThreadPriority::BelowNormal,
     }
@@ -465,4 +468,329 @@ fn track_list_reports_video_and_audio() {
     let Some(clip) = cfr_clip() else { return };
     let types = media::track_types(clip).expect("track list");
     assert_eq!(types, vec![0, 1]);
+}
+
+#[test]
+fn progressive_exact_seeking_matches_bestsource_and_switches_seamlessly() {
+    let Some(cfr) = cfr_clip() else { return };
+    let Some(vfr) = vfr_clip() else { return };
+    for (clip, check_frame) in [(cfr, 60usize), (vfr, 72usize)] {
+        let mut bs_truth = open_bs(clip);
+        let mut truth_rgba = Vec::new();
+        let truth_pts = bs_truth
+            .decode_frame_into(check_frame, &mut truth_rgba)
+            .expect("truth decode");
+
+        let partial = PartialIndex::new().expect("partial index");
+        let mut q =
+            QuickVideo::open_with_partial(clip, -1, 2, Some(partial.clone())).expect("quick");
+        assert!(!q.is_frame_exact());
+        assert!(!q.is_frame_exact_at(check_frame));
+
+        let cancel = AtomicBool::new(false);
+        let saw_partial_exact = std::sync::atomic::AtomicBool::new(false);
+        let mut q_rgba = Vec::new();
+        let _bs = BestSourceProvider::open_with_partial_and_progress(
+            clip,
+            &no_cache(),
+            Some(&partial),
+            &cancel,
+            |_cur, _tot| {
+                if !saw_partial_exact.load(Ordering::Relaxed) && partial.is_exact_at(check_frame) {
+                    assert!(q.is_frame_exact_at(check_frame));
+                    let pts = q
+                        .decode_frame_into(check_frame, &mut q_rgba)
+                        .expect("progressive exact decode");
+                    assert_eq!(
+                        pts, truth_pts,
+                        "progressive PTS mismatch at frame {check_frame}"
+                    );
+                    assert_eq!(
+                        checksum(&q_rgba),
+                        checksum(&truth_rgba),
+                        "progressive pixel mismatch at frame {check_frame}"
+                    );
+                    saw_partial_exact.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .expect("index with partial");
+        assert!(saw_partial_exact.load(Ordering::Relaxed));
+        assert!(q.is_frame_exact_at(check_frame));
+        assert!(q.next_keyframe(0).is_some());
+    }
+}
+
+#[test]
+fn hybrid_video_becomes_exact_before_or_while_audio_indexes_and_handles_no_audio() {
+    let Some(cfr) = cfr_clip() else { return };
+    let Some(vfr) = vfr_clip() else { return };
+    let store = IndexStore::new(
+        work_dir().join("video-first-store"),
+        IndexStore::DEFAULT_MAX_BYTES,
+    );
+    let cancel = AtomicBool::new(false);
+    let mut h = HybridVideo::open(
+        cfr,
+        &hybrid_opts(FastOpen::Quick, Some(store.clone())),
+        &cancel,
+        |_, _| {},
+    )
+    .expect("hybrid open");
+
+    let mut video_switched = false;
+    let mut saw_audio_phase = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if video_switched {
+            if let Some(p) = h.index_progress() {
+                if p.phase == IndexPhase::Audio {
+                    saw_audio_phase = true;
+                }
+            }
+            match h.poll_audio() {
+                AudioUpgradeStatus::Ready => break,
+                AudioUpgradeStatus::Failed(e) => panic!("audio upgrade failed: {e}"),
+                AudioUpgradeStatus::NoAudio => panic!("expected audio track on cfr clip"),
+                AudioUpgradeStatus::Pending => {}
+            }
+        } else {
+            match h.poll_upgrade() {
+                UpgradeStatus::Switched => {
+                    video_switched = true;
+                    assert_eq!(h.kind(), ProviderKind::BestSource);
+                    assert!(h.is_frame_exact());
+                    if let Some(p) = h.index_progress() {
+                        if p.phase == IndexPhase::Audio {
+                            saw_audio_phase = true;
+                        }
+                    }
+                }
+                UpgradeStatus::Failed(e) => panic!("video upgrade failed: {e}"),
+                UpgradeStatus::Pending | UpgradeStatus::Done => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(video_switched, "video must switch to exact");
+    let _ = saw_audio_phase;
+    let mut aud = h.take_audio().expect("audio provider ready");
+    let mut pcm = Vec::new();
+    aud.samples_into(0, 1024, &mut pcm)
+        .expect("read audio samples");
+    assert_eq!(pcm.len(), 1024 * aud.audio_info().frame_bytes());
+    drop(h);
+
+    // Silent VFR clip reports NoAudio cleanly (never an error).
+    let mut hv = HybridVideo::open(
+        vfr,
+        &hybrid_opts(FastOpen::Quick, Some(store)),
+        &cancel,
+        |_, _| {},
+    )
+    .expect("open silent vfr");
+    assert!(matches!(hv.wait_upgrade(), UpgradeStatus::Switched));
+    assert!(matches!(hv.poll_audio(), AudioUpgradeStatus::NoAudio));
+}
+
+#[test]
+fn corrupt_cache_files_rebuild_safely_and_never_crash() {
+    let Some(clip) = cfr_clip() else { return };
+    let store_dir = work_dir().join("corrupt-store");
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let store = IndexStore::new(store_dir, IndexStore::DEFAULT_MAX_BYTES);
+    let cancel = AtomicBool::new(false);
+
+    // First build valid video + audio cache entries.
+    let mut h = HybridVideo::open(
+        clip,
+        &hybrid_opts(FastOpen::Quick, Some(store.clone())),
+        &cancel,
+        |_, _| {},
+    )
+    .expect("initial open");
+    assert!(matches!(h.wait_upgrade(), UpgradeStatus::Switched));
+    drop(h);
+
+    let entries = store.entries_for(clip).expect("entries");
+    assert_ne!(entries.len(), 0);
+
+    // Corrupt every .bsindex with 0 bytes, truncated bytes, and random garbage.
+    for payload in [Vec::new(), b"BS2V\x00\x00".to_vec(), vec![0xDEu8; 256]] {
+        for p in &entries {
+            std::fs::write(p, &payload).expect("write corrupt cache");
+        }
+        // BestSourceProvider direct open rebuilds cleanly.
+        let opts = BestSourceOptions {
+            cache: store.cache_for(clip).expect("cache"),
+            ..BestSourceOptions::default()
+        };
+        let bs = BestSourceProvider::open_with_progress(clip, &opts, &cancel, |_, _| {})
+            .expect("rebuild from corrupt cache");
+        assert_eq!(bs.info().num_frames, CFR_FRAMES);
+        drop(bs);
+
+        // Corrupt again and test HybridVideo: must NOT hang or crash, opens Quick first and rebuilds!
+        for p in &entries {
+            std::fs::write(p, &payload).expect("write corrupt cache");
+        }
+        let mut h2 = HybridVideo::open(
+            clip,
+            &hybrid_opts(FastOpen::Quick, Some(store.clone())),
+            &cancel,
+            |_, _| {},
+        )
+        .expect("hybrid open with corrupt cache");
+        assert_eq!(h2.kind(), ProviderKind::Quick);
+        assert!(matches!(h2.wait_upgrade(), UpgradeStatus::Switched));
+        assert_eq!(h2.kind(), ProviderKind::BestSource);
+        assert!(matches!(h2.poll_audio(), AudioUpgradeStatus::Ready));
+    }
+}
+
+#[test]
+fn sibling_preindexer_pauses_resumes_and_respects_cache_cap() {
+    let Some(clip) = cfr_clip() else { return };
+    let dir = work_dir().join("siblings");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ep1 = dir.join("ep01.mkv");
+    let ep2 = dir.join("ep02.mkv");
+    let ep3 = dir.join("ep03.mkv");
+    std::fs::copy(clip, &ep1).unwrap();
+    std::fs::copy(clip, &ep2).unwrap();
+    std::fs::copy(clip, &ep3).unwrap();
+    std::fs::write(dir.join("readme.txt"), b"ignore me").unwrap();
+
+    let store = IndexStore::new(
+        work_dir().join("sibling-store"),
+        IndexStore::DEFAULT_MAX_BYTES,
+    );
+    let cancel = AtomicBool::new(false);
+    // Index ep1 first as the currently open video.
+    let mut h1 = HybridVideo::open(
+        &ep1,
+        &hybrid_opts(FastOpen::Quick, Some(store.clone())),
+        &cancel,
+        |_, _| {},
+    )
+    .expect("open ep1");
+    h1.wait_upgrade();
+    drop(h1);
+    assert!(store.has_index(&ep1));
+    assert!(!store.has_index(&ep2));
+
+    // Start pre-indexer initially paused, ensure it stays paused, then unpause to finish.
+    let pre = PreindexHandle::start(&ep1, store.clone(), 2, true).expect("start preindexer");
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    assert!(pre.snapshot().paused);
+    assert!(!pre.is_finished());
+
+    pre.set_paused(false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !pre.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(pre.is_finished());
+    drop(pre);
+    assert!(store.has_index(&ep2));
+    assert!(store.has_index(&ep3));
+
+    // Opening ep2 now loads directly from the pre-indexed cache.
+    let h2 = HybridVideo::open(
+        &ep2,
+        &hybrid_opts(FastOpen::Quick, Some(store.clone())),
+        &cancel,
+        |_, _| {},
+    )
+    .expect("open preindexed ep2");
+    assert_eq!(h2.kind(), ProviderKind::BestSource);
+    assert!(!h2.is_indexing());
+    drop(h2);
+
+    // Tight cache cap: keep ep1 protected and respect total_bytes <= cap.
+    let ep1_bytes: u64 = store
+        .entries_for(&ep1)
+        .unwrap()
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    let mut tight_store = store.clone();
+    tight_store.set_max_bytes(ep1_bytes + 512);
+    let _ = tight_store.enforce_limit_preserving(Some(&ep1));
+    assert!(tight_store.has_index(&ep1));
+    assert!(tight_store.total_bytes().unwrap() <= ep1_bytes + 512);
+}
+
+#[test]
+fn bestsource_error_paths_fall_back_with_visible_message() {
+    let dir = work_dir().join("fallback");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Unopenable invalid file returns descriptive error (never silent).
+    let garbage = dir.join("not_a_video.mkv");
+    std::fs::write(&garbage, b"this is not valid media").unwrap();
+    let cancel = AtomicBool::new(false);
+    let Err(err) = HybridVideo::open(
+        &garbage,
+        &hybrid_opts(FastOpen::Quick, None),
+        &cancel,
+        |_, _| {},
+    ) else {
+        panic!("garbage file must error");
+    };
+    assert_ne!(err.to_string(), "");
+
+    // 2. Broken audio track in a valid video container surfaces AudioUpgradeStatus::Failed visibly.
+    let Some(cfr) = cfr_clip() else { return };
+    let mut bad_audio_opts = hybrid_opts(FastOpen::Quick, None);
+    bad_audio_opts.audio_track = 999; // invalid explicit stream index
+    let mut h = HybridVideo::open(cfr, &bad_audio_opts, &cancel, |_, _| {})
+        .expect("open with bad audio track");
+    assert!(matches!(h.wait_upgrade(), UpgradeStatus::Switched));
+    match h.poll_audio() {
+        AudioUpgradeStatus::Failed(e) => assert_ne!(e.to_string(), ""),
+        other => panic!("expected visible audio failure, got {other:?}"),
+    }
+
+    // 3. Invalid video track: QuickVideo fails -> falls back to FFMS2 with visible notice,
+    // and background BestSource failure surfaces UpgradeStatus::Failed while staying on FFMS2.
+    let mut bad_track_opts = hybrid_opts(FastOpen::Quick, None);
+    bad_track_opts.bestsource.track = 999;
+    let mut h_ff = HybridVideo::open(cfr, &bad_track_opts, &cancel, |_, _| {})
+        .expect("fallback to FFMS2 when quick track fails");
+    assert_eq!(h_ff.kind(), ProviderKind::Ffms2);
+    assert!(
+        h_ff.take_fallback_notice().is_some(),
+        "fallback to FFMS2 must emit visible notice"
+    );
+    match h_ff.wait_upgrade() {
+        UpgradeStatus::Failed(e) => assert_ne!(e.to_string(), ""),
+        other => panic!("expected visible BestSource track failure, got {other:?}"),
+    }
+    assert_eq!(h_ff.kind(), ProviderKind::Ffms2);
+
+    // 4. Quick succeeds while BestSource fails (unwritable fatal cache file path): stays on
+    // QuickVideo with visible UpgradeStatus::Failed message and continues decoding frames.
+    let mut unwritable_opts = hybrid_opts(FastOpen::Quick, None);
+    unwritable_opts.bestsource.cache = IndexCache::File(cfr.join("impossible_subdir"));
+    let mut h_q = HybridVideo::open(cfr, &unwritable_opts, &cancel, |_, _| {})
+        .expect("open quick before bestsource cache write failure");
+    assert_eq!(h_q.kind(), ProviderKind::Quick);
+    match h_q.wait_upgrade() {
+        UpgradeStatus::Failed(e) => assert_ne!(e.to_string(), ""),
+        other => panic!("expected visible BestSource failure, got {other:?}"),
+    }
+    assert_eq!(h_q.kind(), ProviderKind::Quick);
+    let mut buf = Vec::new();
+    h_q.decode_frame_into(0, &mut buf)
+        .expect("quick still decodes after fallback");
+    assert_ne!(buf.len(), 0);
+
+    // 5. open_cached_only on missing cache fails cleanly.
+    let copy = dir.join("ep_disappears.mkv");
+    std::fs::copy(cfr, &copy).unwrap();
+    let miss = BestSourceProvider::open_cached_only(&copy, &no_cache());
+    assert!(matches!(miss, Err(MediaError::BestSource(_))));
 }
