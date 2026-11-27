@@ -13,7 +13,8 @@ use hlouis_sub_edit::sample_ass;
 use hlouis_sub_edit::syntax;
 use hlouis_sub_edit::theme::{self, ThemeMode, ThemePalette};
 use i18n::{I18n, Locale};
-use media::VideoInfo;
+use media::{IndexPhase, PreindexProgress, VideoInfo};
+use settings::AppSettings;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant};
 enum ExactIndexUi {
     None,
     Indexing {
+        phase: IndexPhase,
         fraction: f32,
         eta_secs: Option<u64>,
     },
@@ -229,6 +231,7 @@ struct CachedEditGalley {
 
 struct SpikeApp {
     i18n: I18n,
+    settings: AppSettings,
     theme_mode: ThemeMode,
     palette: ThemePalette,
     last_theme_check: Instant,
@@ -240,6 +243,9 @@ struct SpikeApp {
     ass_source: AssSource,
     indexing_progress: Option<(i64, i64)>,
     exact_index: ExactIndexUi,
+    audio_index_error: Option<String>,
+    provider_notice: Option<String>,
+    preindex_status: Option<PreindexProgress>,
     playback_state: PlaybackState,
     loop_playback: bool,
     log_metrics: bool,
@@ -266,12 +272,18 @@ impl SpikeApp {
         configure_fonts(&cc.egui_ctx);
 
         let i18n = I18n::new(cli.lang.unwrap_or(Locale::En))?;
+        let settings = load_app_settings();
         let theme_mode = cli.theme.unwrap_or(ThemeMode::FollowWindows);
         let palette = theme::resolve_palette(theme_mode);
         theme::apply_to_egui(&cc.egui_ctx, &palette);
 
         let initial_ass = sample_ass::build_sample_ass(1920, 1080);
-        let player = VideoPlayerHandle::spawn(initial_ass, cc.egui_ctx.clone())?;
+        let player = VideoPlayerHandle::spawn(
+            initial_ass,
+            settings.video.idle_preindex_siblings,
+            settings.video.index_cache_max_mb,
+            cc.egui_ctx.clone(),
+        )?;
 
         if cli.loop_playback {
             player
@@ -298,6 +310,7 @@ impl SpikeApp {
         let mem = ffi::process_memory_mib().unwrap_or_default();
         Ok(Self {
             i18n,
+            settings,
             theme_mode,
             palette,
             last_theme_check: now,
@@ -309,6 +322,9 @@ impl SpikeApp {
             ass_source,
             indexing_progress,
             exact_index: ExactIndexUi::None,
+            audio_index_error: None,
+            provider_notice: None,
+            preindex_status: None,
             playback_state: PlaybackState::Paused,
             loop_playback: cli.loop_playback,
             log_metrics: cli.log_metrics,
@@ -378,70 +394,107 @@ impl SpikeApp {
 
     fn process_player_events(&mut self, frame: &eframe::Frame) {
         for evt in self.player.drain_events() {
-            match evt {
-                PlayerEvent::IndexingProgress { current, total } => {
-                    self.indexing_progress = Some((current, total));
-                }
-                PlayerEvent::IndexingCancelled => {
-                    self.indexing_progress = None;
-                }
-                PlayerEvent::ExactIndexing { fraction, eta_secs } => {
-                    self.exact_index = ExactIndexUi::Indexing { fraction, eta_secs };
-                }
-                PlayerEvent::ExactReady { info } => {
-                    self.exact_index = ExactIndexUi::None;
-                    self.video_info = Some(info);
-                }
-                PlayerEvent::ExactIndexFailed(msg) => {
-                    self.exact_index = ExactIndexUi::Failed(msg);
-                }
-                PlayerEvent::VideoReady { info, file_name } => {
-                    self.indexing_progress = None;
-                    self.exact_index = ExactIndexUi::None;
-                    self.error_banner = None;
-                    self.video_file_name = file_name;
-                    self.video_info = Some(info);
-                    self.clear_frame_queue();
-                    self.video_metrics = VideoMetrics::default();
-                    "0".clone_into(&mut self.seek_input);
-                    if self.pending_autoplay {
-                        self.pending_autoplay = false;
-                        self.start_playback();
-                    }
-                }
-                PlayerEvent::Frame(ready) => {
-                    if ready.generation > self.latest_generation {
-                        self.latest_generation = ready.generation;
-                        self.clear_frame_queue();
-                    }
-                    if ready.generation < self.latest_generation {
-                        self.player.release_frame_slots(1);
-                        self.player.recycle_buffer(ready.rgba);
-                        continue;
-                    }
-                    if self.playback_state == PlaybackState::Playing {
-                        self.frame_queue.push_back(ready);
-                    } else {
-                        self.upload_ready_frame(&ready, frame);
-                        self.player.release_frame_slots(1);
-                        self.player.recycle_buffer(ready.rgba);
-                    }
-                }
-                PlayerEvent::PlaybackEnded => {
-                    self.playback_state = PlaybackState::Paused;
-                    self.playback_clock = None;
-                }
-                PlayerEvent::AssError(msg) | PlayerEvent::Error(msg) => {
-                    self.indexing_progress = None;
-                    self.playback_state = PlaybackState::Paused;
-                    self.playback_clock = None;
-                    self.error_banner = Some(msg);
-                }
-            }
+            self.handle_player_event(evt, frame);
         }
 
         if self.playback_state == PlaybackState::Playing {
             self.advance_playback_queue(frame);
+        }
+    }
+
+    fn clear_exact_phase_ui(&mut self, expected: IndexPhase) {
+        if matches!(
+            self.exact_index,
+            ExactIndexUi::Indexing { phase, .. } if phase == expected
+        ) {
+            self.exact_index = ExactIndexUi::None;
+        }
+    }
+
+    fn handle_player_event(&mut self, evt: PlayerEvent, frame: &eframe::Frame) {
+        match evt {
+            PlayerEvent::IndexingProgress { current, total } => {
+                self.indexing_progress = Some((current, total));
+            }
+            PlayerEvent::IndexingCancelled => {
+                self.indexing_progress = None;
+            }
+            PlayerEvent::ExactIndexing {
+                phase,
+                fraction,
+                eta_secs,
+            } => {
+                self.exact_index = ExactIndexUi::Indexing {
+                    phase,
+                    fraction,
+                    eta_secs,
+                };
+            }
+            PlayerEvent::ExactReady { info } => {
+                self.clear_exact_phase_ui(IndexPhase::Video);
+                self.video_info = Some(info);
+            }
+            PlayerEvent::ExactAudioReady => {
+                self.clear_exact_phase_ui(IndexPhase::Audio);
+            }
+            PlayerEvent::ExactAudioFailed(msg) => {
+                self.clear_exact_phase_ui(IndexPhase::Audio);
+                self.audio_index_error = Some(msg);
+            }
+            PlayerEvent::ExactIndexFailed(msg) => {
+                self.exact_index = ExactIndexUi::Failed(msg);
+            }
+            PlayerEvent::ProviderNotice(msg) => {
+                self.provider_notice = Some(msg);
+            }
+            PlayerEvent::PreindexStatus(status) => {
+                self.preindex_status = status;
+            }
+            PlayerEvent::VideoReady { info, file_name } => {
+                self.indexing_progress = None;
+                self.exact_index = ExactIndexUi::None;
+                self.audio_index_error = None;
+                self.provider_notice = None;
+                self.preindex_status = None;
+                self.error_banner = None;
+                self.video_file_name = file_name;
+                self.video_info = Some(info);
+                self.clear_frame_queue();
+                self.video_metrics = VideoMetrics::default();
+                "0".clone_into(&mut self.seek_input);
+                if self.pending_autoplay {
+                    self.pending_autoplay = false;
+                    self.start_playback();
+                }
+            }
+            PlayerEvent::Frame(ready) => {
+                if ready.generation > self.latest_generation {
+                    self.latest_generation = ready.generation;
+                    self.clear_frame_queue();
+                }
+                if ready.generation < self.latest_generation {
+                    self.player.release_frame_slots(1);
+                    self.player.recycle_buffer(ready.rgba);
+                    return;
+                }
+                if self.playback_state == PlaybackState::Playing {
+                    self.frame_queue.push_back(ready);
+                } else {
+                    self.upload_ready_frame(&ready, frame);
+                    self.player.release_frame_slots(1);
+                    self.player.recycle_buffer(ready.rgba);
+                }
+            }
+            PlayerEvent::PlaybackEnded => {
+                self.playback_state = PlaybackState::Paused;
+                self.playback_clock = None;
+            }
+            PlayerEvent::AssError(msg) | PlayerEvent::Error(msg) => {
+                self.indexing_progress = None;
+                self.playback_state = PlaybackState::Paused;
+                self.playback_clock = None;
+                self.error_banner = Some(msg);
+            }
         }
     }
 
@@ -635,8 +688,38 @@ impl SpikeApp {
                 self.render_theme_selector(ui, &ctx);
                 ui.separator();
                 self.render_language_selector(ui);
+                ui.separator();
+                self.render_index_settings(ui);
             });
         });
+    }
+
+    fn render_index_settings(&mut self, ui: &mut egui::Ui) {
+        let mut preindex = self.settings.video.idle_preindex_siblings;
+        let mut cap_mb = self.settings.video.index_cache_max_mb;
+        let pre_changed = ui
+            .checkbox(&mut preindex, self.i18n.tr("pref-preindex-siblings"))
+            .changed();
+        ui.label(self.i18n.tr("pref-cache-cap"));
+        egui::ComboBox::from_id_salt("cache_cap_combo")
+            .selected_text(format_cache_cap(cap_mb))
+            .width(78.0)
+            .show_ui(ui, |ui| {
+                for mb in [512_u64, 1024, 2048, 4096, 8192] {
+                    ui.selectable_value(&mut cap_mb, mb, format_cache_cap(mb));
+                }
+            });
+        let cap_changed = cap_mb != self.settings.video.index_cache_max_mb;
+        if pre_changed || cap_changed {
+            self.settings.video.idle_preindex_siblings = preindex;
+            self.settings.video.index_cache_max_mb = cap_mb;
+            self.settings.validate_and_clamp();
+            save_app_settings(&self.settings);
+            self.send_player_cmd(PlayerCmd::UpdateIndexSettings {
+                idle_preindex_siblings: self.settings.video.idle_preindex_siblings,
+                index_cache_max_mb: self.settings.video.index_cache_max_mb,
+            });
+        }
     }
 
     fn render_theme_selector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -790,28 +873,51 @@ impl SpikeApp {
 
     /// Background frame-exact indexing is never silent: progress + ETA, or why it failed.
     fn render_exact_index_status(&self, ui: &mut egui::Ui) {
+        if let Some(msg) = &self.provider_notice {
+            ui.colored_label(
+                self.palette.cps_warning,
+                self.i18n.tr_args(
+                    "status-provider-fallback",
+                    &[("message", FluentValue::from(msg.as_str()))],
+                ),
+            );
+        }
         match &self.exact_index {
             ExactIndexUi::None => {}
-            ExactIndexUi::Indexing { fraction, eta_secs } => {
+            ExactIndexUi::Indexing {
+                phase,
+                fraction,
+                eta_secs,
+            } => {
                 let percent = FluentValue::from(f64::from((fraction * 100.0).round()));
+                let (key_plain, key_s, key_m) = match phase {
+                    IndexPhase::Video => (
+                        "status-exact-indexing",
+                        "status-exact-indexing-eta-s",
+                        "status-exact-indexing-eta-min",
+                    ),
+                    IndexPhase::Audio => (
+                        "status-audio-indexing",
+                        "status-audio-indexing-eta-s",
+                        "status-audio-indexing-eta-min",
+                    ),
+                };
                 let text = match eta_secs {
                     Some(s) if *s >= 90 => self.i18n.tr_args(
-                        "status-exact-indexing-eta-min",
+                        key_m,
                         &[
                             ("percent", percent),
                             ("minutes", FluentValue::from(s.div_ceil(60))),
                         ],
                     ),
                     Some(s) => self.i18n.tr_args(
-                        "status-exact-indexing-eta-s",
+                        key_s,
                         &[
                             ("percent", percent),
                             ("seconds", FluentValue::from((*s).max(1))),
                         ],
                     ),
-                    None => self
-                        .i18n
-                        .tr_args("status-exact-indexing", &[("percent", percent)]),
+                    None => self.i18n.tr_args(key_plain, &[("percent", percent)]),
                 };
                 ui.add(
                     egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
@@ -820,11 +926,66 @@ impl SpikeApp {
                 );
             }
             ExactIndexUi::Failed(msg) => {
-                ui.label(self.i18n.tr_args(
-                    "status-exact-index-failed",
-                    &[("message", FluentValue::from(msg.as_str()))],
-                ));
+                ui.colored_label(
+                    self.palette.error_text,
+                    self.i18n.tr_args(
+                        "status-exact-index-failed",
+                        &[("message", FluentValue::from(msg.as_str()))],
+                    ),
+                );
             }
+        }
+        if let Some(msg) = &self.audio_index_error {
+            ui.colored_label(
+                self.palette.cps_warning,
+                self.i18n.tr_args(
+                    "status-audio-index-failed",
+                    &[("message", FluentValue::from(msg.as_str()))],
+                ),
+            );
+        }
+        self.render_preindex_status(ui);
+    }
+
+    fn render_preindex_status(&self, ui: &mut egui::Ui) {
+        let Some(pre) = &self.preindex_status else {
+            return;
+        };
+        if let Some(err) = &pre.last_error {
+            ui.colored_label(
+                self.palette.cps_warning,
+                self.i18n.tr_args(
+                    "status-preindex-failed",
+                    &[("message", FluentValue::from(err.as_str()))],
+                ),
+            );
+        } else if pre.paused {
+            ui.label(
+                egui::RichText::new(self.i18n.tr_args(
+                    "status-preindex-paused",
+                    &[
+                        ("done", fv_usize(pre.completed_files)),
+                        ("total", fv_usize(pre.total_files)),
+                    ],
+                ))
+                .small()
+                .color(self.palette.text_muted),
+            );
+        } else if let Some(file) = &pre.current_file {
+            let pct = f64::from((pre.current_fraction * 100.0).round());
+            ui.label(
+                egui::RichText::new(self.i18n.tr_args(
+                    "status-preindex-progress",
+                    &[
+                        ("done", fv_usize(pre.completed_files)),
+                        ("total", fv_usize(pre.total_files)),
+                        ("file", FluentValue::from(file.as_str())),
+                        ("percent", FluentValue::from(pct)),
+                    ],
+                ))
+                .small()
+                .color(self.palette.text_muted),
+            );
         }
     }
 
@@ -1289,6 +1450,43 @@ fn path_display_name(path: &Path) -> String {
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     )
+}
+
+fn format_cache_cap(mb: u64) -> String {
+    if mb >= 1024 && mb.is_multiple_of(1024) {
+        format!("{} GB", mb / 1024)
+    } else {
+        format!("{mb} MB")
+    }
+}
+
+fn settings_file_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .map(PathBuf::from)?;
+    Some(base.join("hlouis-sub-edit").join("settings.json"))
+}
+
+fn load_app_settings() -> AppSettings {
+    let Some(path) = settings_file_path() else {
+        return AppSettings::default();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|json| AppSettings::load_json(&json).ok())
+        .unwrap_or_default()
+}
+
+fn save_app_settings(settings: &AppSettings) {
+    let Some(path) = settings_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = settings.save_json() {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 fn fv_usize(n: usize) -> FluentValue<'static> {

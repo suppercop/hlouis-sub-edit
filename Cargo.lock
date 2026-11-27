@@ -1948,6 +1948,7 @@ dependencies = [
  "media",
  "render",
  "rfd",
+ "settings",
  "wgpu",
  "windows-sys 0.61.2",
 ]
