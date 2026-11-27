@@ -52,6 +52,7 @@ members = [
     "crates/hlouis-tools",
     "crates/template-doctor",
     "crates/ui-theme",
+    "crates/ui-grid",
 ]
 
 [workspace.package]
