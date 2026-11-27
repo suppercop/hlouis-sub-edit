@@ -312,7 +312,11 @@ pub fn lint_script_into(script: &ScriptFile, out: &mut Vec<Diagnostic>) {
     for ev in ev_sec.events() {
         if ev.kind() == EventKind::Comment {
             let eff = ev.effect().trim_start();
-            if eff.len() >= 4 && eff[..4].eq_ignore_ascii_case("code") {
+            if eff
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|b| b.eq_ignore_ascii_case(b"code"))
+            {
                 collect_defined_functions(ev.text(), &mut user_defined);
             }
         }
@@ -1268,21 +1272,21 @@ fn lint_lua_code(
             continue;
         }
         if i + 1 < len {
-            let pair = &code[i..i + 2];
+            let pair = &bytes[i..i + 2];
             let (code_id, repl, en, vi) = match pair {
-                "!=" => (
+                b"!=" => (
                     "E_LUA_C_NEQ",
                     "~=",
                     "Lua uses `~=` instead of `!=`.",
                     "Lua dùng `~=` thay cho `!=`.",
                 ),
-                "&&" => (
+                b"&&" => (
                     "E_LUA_C_AND",
                     " and ",
                     "Lua uses `and` instead of `&&`.",
                     "Lua dùng `and` thay cho `&&`.",
                 ),
-                "||" => (
+                b"||" => (
                     "E_LUA_C_OR",
                     " or ",
                     "Lua uses `or` instead of `||`.",
