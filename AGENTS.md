@@ -112,6 +112,15 @@ Only create crates when a phase needs them.
 9. One branch per phase (`phase-0`, `phase-1`, ...). Small, meaningful commits. Open a PR to `main` when the phase is done; never push directly to `main`.
 10. If a requirement in the brief is impossible or unclear, do not silently skip it: write it under "Open issues" in the phase report.
 
+## Never-silent errors (hard rule, owner decision 2026-11-27)
+
+- Every import / export / open / save / autosave / recovery path returns a **typed error with a human-readable reason** (English text in the error's `Display` now; en + vi via `i18n-catalog` once it exists). The UI must show it; never swallow it.
+- A function that can "succeed" with **0 items** (MKV track with 0 events, empty keyframe file, font check with nothing found, ...) must say so explicitly: return a typed error, or a report/warning value the UI shows.
+- Forbidden on parse/IO results unless justified in a comment: `unwrap_or_default()`, `unwrap_or(..)` fallbacks, `let _ =` on a `Result`, `.ok()` that discards the error, returning an empty `Vec`/`None` on failure without a reason. Values that are present but invalid are reported (warning list), not replaced silently.
+- Every new such path gets a test that asserts the error/warning is produced.
+- Every new parser gets a fuzz target in `fuzz/` (cargo-fuzz); CI fuzzing is added separately.
+- Timing-affecting changes must keep `frame-check` (see `crates/frame-check`) clean: the event's first/last visible frame according to our timing code must match what libass renders.
+
 ## Definition of done for every phase
 
 - All acceptance criteria in the phase brief are met, or listed as open issues with reasons.

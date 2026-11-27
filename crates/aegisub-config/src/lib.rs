@@ -22,6 +22,23 @@ pub enum ConfigImportError {
     /// Invalid JSON syntax.
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
+    /// Valid JSON whose top level is not an object, so nothing could be imported.
+    #[error("{file} must contain a JSON object at the top level, found {found}")]
+    NotAnObject {
+        file: &'static str,
+        found: &'static str,
+    },
+}
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// RGBA color parsed from Aegisub's `rgb(r, g, b)`, `rgba(r, g, b, a)`, or `#RRGGBB` strings.
@@ -405,9 +422,16 @@ pub fn import_aegisub_files(
 /// Imports only `config.json` into [`ImportedSettings`] (hotkeys left empty).
 ///
 /// # Errors
-/// Returns [`ConfigImportError::Json`] if `config_json` is invalid JSON.
+/// Returns [`ConfigImportError::Json`] if `config_json` is invalid JSON and
+/// [`ConfigImportError::NotAnObject`] if its top level is not an object.
 pub fn import_config_json(config_json: &str) -> Result<ImportedSettings, ConfigImportError> {
     let root: Value = serde_json::from_str(config_json)?;
+    if !root.is_object() {
+        return Err(ConfigImportError::NotAnObject {
+            file: "config.json",
+            found: json_kind(&root),
+        });
+    }
     let mut out = ImportedSettings::default();
 
     if let Some(obj) = root.as_object() {
@@ -488,7 +512,10 @@ pub fn import_hotkey_json(hotkey_json: &str) -> Result<HotkeySettings, ConfigImp
     let mut out = HotkeySettings::default();
 
     let Some(contexts) = root.as_object() else {
-        return Ok(out);
+        return Err(ConfigImportError::NotAnObject {
+            file: "hotkey.json",
+            found: json_kind(&root),
+        });
     };
 
     for (ctx_name, ctx_val) in contexts {
@@ -862,5 +889,18 @@ mod tests {
         assert_eq!(imported.autosave.interval_seconds, 60);
         assert!(imported.hotkeys.by_context.is_empty());
         assert_eq!(imported.hotkeys.unmapped.len(), 0);
+    }
+
+    #[test]
+    fn non_object_json_is_an_error_not_empty_settings() {
+        assert!(matches!(
+            import_config_json("[]"),
+            Err(ConfigImportError::NotAnObject {
+                file: "config.json",
+                ..
+            })
+        ));
+        let err = import_hotkey_json("42").unwrap_err();
+        assert!(err.to_string().contains("hotkey.json"));
     }
 }

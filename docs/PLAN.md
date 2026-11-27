@@ -26,6 +26,12 @@ Aegisub 3.5.1 "Open Subtitles from Video" silently returns an empty script for M
 - Never fail silently: a track yielding 0 events reports why.
 - Regression tests: the owner's file (path via env var, not committed) and a generated MKV with ≥ 64 subtitle tracks (ASS, SRT, zlib-compressed, header-stripped).
 
+## Robustness rules (owner decision 2026-11-27)
+
+1. **Never-silent errors.** Every import/export/open/save/autosave/recovery path returns a typed error with a human-readable reason (en + vi via `i18n-catalog`) that the UI shows. Anything that can "succeed" with 0 items (MKV track with 0 events, empty keyframe file, font check with nothing found) reports that explicitly. See AGENTS.md.
+2. **Fuzzing in CI** (planned): every parser has a `cargo-fuzz` target; 60 s per target on PRs touching parser crates, 10 min nightly.
+3. **Frame-accuracy self-check** (`frame-check`): for each event, first/last visible frame per our timing code is compared with libass's actual rendering, so "signs disappear ~40 ms early in players" cannot happen silently. Runs in CI on generated CFR and VFR clips; usable on real files.
+
 ## UI direction (owner preference)
 The owner prefers the **classic Aegisub 3.2.2 look and layout** over the 3.4/3.5 UI, and has tuned their own Aegisub 3.5.1 to look like 3.2.2. Use that as the reference: same panel arrangement (video top-left, audio top-right, edit box under audio, grid at the bottom), compact toolbar, classic grid/edit-box density and colours as the Light theme default. New features (pan/zoom, new audio marker, dark theme) are added without changing that layout. The owner's Aegisub config and hotkeys (%APPDATA%\Aegisub\config.json, hotkey.json) are the reference for default layout options and hotkeys; import them where they map.
 

@@ -296,7 +296,7 @@ pub fn resample_resolution(
         return Err(ToolsError::InvalidResolution(opts.dest_x, opts.dest_y));
     }
 
-    let (src_x, src_y) = resolve_source_res(script, opts.source_override);
+    let (src_x, src_y) = resolve_source_res(script, opts.source_override)?;
     let mut state = compute_state(src_x, src_y, opts);
     state.color_conv = resolve_color_converter(script, opts);
 
@@ -402,25 +402,30 @@ pub fn resample_resolution(
     Ok(EditCommand::Batch(cmds))
 }
 
-fn resolve_source_res(script: &ScriptFile, override_res: Option<(u32, u32)>) -> (u32, u32) {
+/// Resolves the source resolution. A *missing* `PlayRes` key falls back to Aegisub's 640x480
+/// default; a key that is present but invalid is an error (never silently replaced).
+fn resolve_source_res(
+    script: &ScriptFile,
+    override_res: Option<(u32, u32)>,
+) -> Result<(u32, u32), ToolsError> {
     if let Some((x, y)) = override_res {
         if x > 0 && y > 0 {
-            return (x, y);
+            return Ok((x, y));
         }
     }
-    let sx = script
-        .script_info()
-        .and_then(|s| s.get("PlayResX"))
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(640);
-    let sy = script
-        .script_info()
-        .and_then(|s| s.get("PlayResY"))
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(480);
-    (sx, sy)
+    let read = |key: &'static str, default: u32| -> Result<u32, ToolsError> {
+        match script.script_info().and_then(|s| s.get(key)) {
+            None => Ok(default),
+            Some(v) => match v.trim().parse::<u32>() {
+                Ok(n) if n > 0 => Ok(n),
+                _ => Err(ToolsError::InvalidSourceResolution {
+                    key,
+                    value: v.to_owned(),
+                }),
+            },
+        }
+    };
+    Ok((read("PlayResX", 640)?, read("PlayResY", 480)?))
 }
 
 fn compute_state(src_x: u32, src_y: u32, opts: &ResampleOptions) -> ResampleState {
@@ -1258,5 +1263,33 @@ Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\\p1}m 0 0 l 100 50{\\p0}
             .expect("apply");
         let st_evs: Vec<_> = script_st.events().collect();
         assert_eq!(st_evs[1].text(), r"{\p1}m 0 0 l 225 112.5{\p0}");
+    }
+
+    #[test]
+    fn invalid_play_res_is_an_error_not_a_silent_default() {
+        let script = parse_ass(
+            "[Script Info]
+ScriptType: v4.00+
+PlayResX: abc
+PlayResY: 480
+",
+        )
+        .value;
+        let err = resample_resolution(&script, &ResampleOptions::new(1920, 1080)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ToolsError::InvalidSourceResolution {
+                    key: "PlayResX",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("PlayResX"));
+        // An explicit override still works.
+        let mut opts = ResampleOptions::new(1920, 1080);
+        opts.source_override = Some((640, 480));
+        assert!(resample_resolution(&script, &opts).is_ok());
     }
 }
