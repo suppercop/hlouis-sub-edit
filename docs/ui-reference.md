@@ -42,3 +42,7 @@ Source: owner's Aegisub 3.5.1 `config.json` / `hotkey.json`, tuned to look like 
 - **Right, under audio: edit box.** Row 1: Comment checkbox, Style dropdown + Edit button, Actor, Effect, character count. Row 2: Layer spinner, Start, End, Duration, Margin L/R/V. Row 3: B, I, U, S, fn, four colour buttons, commit tick, Time/Frame radio, Show Original. Then the multiline text box filling the rest.
 - **Bottom, full width: subtitle grid** with columns `#`, `L`, Start, End, CPS, Style, Effect, Text; light-blue header, green `#` column, comment lines tinted lavender, hidden tags shown as a symbol.
 - The owner's scripts are heavy **karaoke-template** files (`code once`, `template pre-line/syl/char ... loop N`, `!retime(...)!`) — Templater fidelity and grid performance on long template lines matter.
+
+## Owner decisions (2026-11-27)
+- Panel proportions: default as in the screenshot (video ≈52% width, grid ≈1/3 height); panels are resizable and sizes are remembered between sessions.
+- Grid columns Actor and Margin L/R/V hidden by default; re-enable via right-click on the grid header.
