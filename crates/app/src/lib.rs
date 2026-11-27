@@ -1,6 +1,9 @@
 //! Shared modules for the `hlouis-sub-edit` application binary and benchmarks.
 
+pub mod bench_ui;
+pub mod ffi;
 pub mod grid;
+pub mod metrics;
 pub mod sample_ass;
 pub mod syntax;
 pub mod theme;
@@ -11,7 +14,7 @@ use egui_extras::{Column, TableBuilder, TableRow};
 use std::sync::Arc;
 
 const ROW_CACHE_SLOTS: usize = 256;
-const SHARED_TEXT_SLOTS: usize = 128;
+const SHARED_TEXT_SLOTS: usize = 256;
 
 type CachedCellEntry = Option<(i32, Arc<egui::Galley>)>;
 type CachedRowCols = [CachedCellEntry; 6];
@@ -120,6 +123,8 @@ fn hash_shared_key(col_idx: usize, width_key: i32, text: &str) -> usize {
 struct RowPaintMeta {
     palette_sig: u64,
     dpi_bits: u32,
+    body_font: egui::FontId,
+    mono_font: egui::FontId,
 }
 
 #[derive(Clone, Copy)]
@@ -166,7 +171,7 @@ fn paint_cell_text(
         };
 
         let cached_galley = if let (Some(c), Some(m)) = (cache.as_deref_mut(), spec.meta) {
-            if matches!(spec.col_idx, 3 | 4) {
+            if matches!(spec.col_idx, 1..=4) {
                 let key = SharedCellKey {
                     col_idx: spec.col_idx,
                     width_key,
@@ -189,23 +194,41 @@ fn paint_cell_text(
         let galley = if let Some(hit) = cached_galley {
             hit
         } else {
-            let mut rich = egui::RichText::new(spec.text).color(style.color);
-            if style.monospace {
-                rich = rich.monospace();
-            }
-            let (wrap_mode, max_w) = if style.truncate {
-                (egui::TextWrapMode::Truncate, rect.width().max(1.0))
+            let built = if let Some(m) = spec.meta {
+                let font_id = if style.monospace {
+                    m.mono_font.clone()
+                } else {
+                    m.body_font.clone()
+                };
+                if style.truncate {
+                    let mut job = egui::text::LayoutJob::single_section(
+                        spec.text.to_owned(),
+                        egui::TextFormat::simple(font_id, style.color),
+                    );
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width().max(1.0));
+                    ui.fonts_mut(|f| f.layout_job(job))
+                } else {
+                    ui.fonts_mut(|f| f.layout_no_wrap(spec.text.to_owned(), font_id, style.color))
+                }
             } else {
-                (egui::TextWrapMode::Extend, f32::INFINITY)
+                let mut rich = egui::RichText::new(spec.text).color(style.color);
+                if style.monospace {
+                    rich = rich.monospace();
+                }
+                let (wrap_mode, max_w) = if style.truncate {
+                    (egui::TextWrapMode::Truncate, rect.width().max(1.0))
+                } else {
+                    (egui::TextWrapMode::Extend, f32::INFINITY)
+                };
+                egui::WidgetText::from(rich).into_galley(
+                    ui,
+                    Some(wrap_mode),
+                    max_w,
+                    egui::TextStyle::Body,
+                )
             };
-            let built = egui::WidgetText::from(rich).into_galley(
-                ui,
-                Some(wrap_mode),
-                max_w,
-                egui::TextStyle::Body,
-            );
             if let (Some(c), Some(m)) = (cache, spec.meta) {
-                if matches!(spec.col_idx, 3 | 4) {
+                if matches!(spec.col_idx, 1..=4) {
                     let key = SharedCellKey {
                         col_idx: spec.col_idx,
                         width_key,
@@ -291,7 +314,7 @@ fn render_grid_row_inner(
 
     let cols: [(&str, CellStyle); 6] = [
         (
-            &line.number_str,
+            line.number_str.as_str(),
             CellStyle {
                 monospace: true,
                 truncate: false,
@@ -299,7 +322,7 @@ fn render_grid_row_inner(
             },
         ),
         (
-            &line.start_str,
+            line.start_str.as_str(),
             CellStyle {
                 monospace: true,
                 truncate: false,
@@ -307,7 +330,7 @@ fn render_grid_row_inner(
             },
         ),
         (
-            &line.end_str,
+            line.end_str.as_str(),
             CellStyle {
                 monospace: true,
                 truncate: false,
@@ -315,7 +338,7 @@ fn render_grid_row_inner(
             },
         ),
         (
-            &line.cps_str,
+            line.cps_str.as_str(),
             CellStyle {
                 monospace: true,
                 truncate: false,
@@ -372,9 +395,12 @@ pub fn render_grid_table(
     let row_height = 22.0;
     let total_rows = grid.lines.len();
     let mut clicked_row: Option<(usize, bool, bool)> = None;
+    let style_ref = ui.style();
     let meta = RowPaintMeta {
         palette_sig: palette_signature(palette),
         dpi_bits: ui.ctx().pixels_per_point().to_bits(),
+        body_font: egui::TextStyle::Body.resolve(style_ref),
+        mono_font: egui::TextStyle::Monospace.resolve(style_ref),
     };
 
     ui.style_mut().interaction.selectable_labels = false;

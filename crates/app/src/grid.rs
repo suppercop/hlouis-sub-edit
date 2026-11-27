@@ -1,7 +1,96 @@
 //! Virtualized 50,000-line (up to 200k+) subtitle grid state and multi-select logic.
 
 use ass_core::ScriptFile;
-use std::ops::RangeInclusive;
+use std::fmt;
+use std::ops::{Deref, RangeInclusive};
+use std::sync::Arc;
+
+/// Stack-resident valid ASCII string storing up to `CAP` bytes without heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineAscii<const CAP: usize> {
+    buf: [u8; CAP],
+    len: u8,
+}
+
+impl<const CAP: usize> Default for InlineAscii<CAP> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const CAP: usize> InlineAscii<CAP> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; CAP],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline]
+    pub fn push_ascii(&mut self, byte: u8) {
+        let idx = usize::from(self.len);
+        if idx < CAP && byte.is_ascii() {
+            self.buf[idx] = byte;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                self.len = (idx + 1) as u8;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn push_ascii_slice(&mut self, bytes: &[u8]) {
+        let idx = usize::from(self.len);
+        let avail = CAP.saturating_sub(idx);
+        let n = bytes.len().min(avail);
+        for &b in &bytes[..n] {
+            if !b.is_ascii() {
+                return;
+            }
+        }
+        self.buf[idx..idx + n].copy_from_slice(&bytes[..n]);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.len = (idx + n) as u8;
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        let n = usize::from(self.len).min(CAP);
+        // Invariant: constructors and push helpers only admit ASCII bytes into `buf[..len]`.
+        std::str::from_utf8(&self.buf[..n]).unwrap_or("")
+    }
+}
+
+impl<const CAP: usize> Deref for InlineAscii<CAP> {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl<const CAP: usize> AsRef<str> for InlineAscii<CAP> {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<const CAP: usize> fmt::Display for InlineAscii<CAP> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Compact bitset for selected subtitle row indices with O(1) membership/count and O(N/64) bulk ops.
 #[derive(Debug, Clone, Default)]
@@ -150,25 +239,25 @@ impl SelectionSet {
 #[derive(Debug, Clone)]
 pub struct SubtitleLine {
     pub number: usize,
-    pub number_str: String,
+    pub number_str: InlineAscii<16>,
     pub start_cs: u32,
     pub end_cs: u32,
-    pub start_str: String,
-    pub end_str: String,
+    pub start_str: InlineAscii<16>,
+    pub end_str: InlineAscii<16>,
     pub cps: f32,
-    pub cps_str: String,
-    pub style: String,
+    pub cps_str: InlineAscii<16>,
+    pub style: Arc<str>,
     pub text: String,
     pub version: u64,
 }
 
 impl SubtitleLine {
-    /// Recomputes `cps` and `cps_str` after `text` changes without heap churn.
+    /// Recomputes `cps` and `cps_str` after `text` changes without heap allocations.
     pub fn recompute_cps(&mut self) {
         let dur_sec = (self.end_cs.saturating_sub(self.start_cs).max(1) as f32) / 100.0;
         let visible_chars = visible_char_count(&self.text);
         self.cps = (visible_chars as f32) / dur_sec;
-        format_tenths_into(&mut self.cps_str, self.cps);
+        format_tenths_inline(&mut self.cps_str, self.cps);
         self.version = self.version.wrapping_add(1);
     }
 }
@@ -229,24 +318,25 @@ pub struct GridState {
 }
 
 impl SubtitleLine {
+    #[inline]
     fn new_with_cps(
         number: usize,
         start_cs: u32,
         end_cs: u32,
-        style: String,
+        style: Arc<str>,
         text: String,
     ) -> Self {
-        let mut number_str = String::with_capacity(7);
-        push_usize_ascii(&mut number_str, number);
+        let mut number_str = InlineAscii::new();
+        push_usize_inline(&mut number_str, number);
         let mut line = Self {
             number,
             number_str,
             start_cs,
             end_cs,
-            start_str: format_ass_time(start_cs),
-            end_str: format_ass_time(end_cs),
+            start_str: format_ass_time_inline(start_cs),
+            end_str: format_ass_time_inline(end_cs),
             cps: 0.0,
-            cps_str: String::with_capacity(6),
+            cps_str: InlineAscii::new(),
             style,
             text,
             version: 0,
@@ -303,8 +393,9 @@ impl GridState {
             ),
         ];
 
+        let style_arcs: [Arc<str>; 6] = std::array::from_fn(|i| Arc::from(SAMPLES[i].0));
         let mut lines = Vec::with_capacity(count);
-        let mut num_buf = String::with_capacity(7);
+        let mut num_buf = InlineAscii::<16>::new();
         for idx in 0..count {
             let start_cs = u32::try_from(idx * 250).unwrap_or(u32::MAX);
             // Vary durations so CPS spans normal, warning (>18), and critical (>25).
@@ -314,21 +405,22 @@ impl GridState {
                 _ => 240,
             };
             let end_cs = start_cs.saturating_add(dur_cs);
-            let (style, template) = SAMPLES[idx % SAMPLES.len()];
+            let sample_idx = idx % SAMPLES.len();
+            let template = SAMPLES[sample_idx].1;
             let number = idx + 1;
             num_buf.clear();
-            push_usize_ascii(&mut num_buf, number);
+            push_usize_inline(&mut num_buf, number);
             let mut text = String::with_capacity(template.len() + 12);
             text.push_str(template);
             text.push_str(" [#");
-            text.push_str(&num_buf);
+            text.push_str(num_buf.as_str());
             text.push(']');
 
             lines.push(SubtitleLine::new_with_cps(
                 number,
                 start_cs,
                 end_cs,
-                (*style).to_owned(),
+                Arc::clone(&style_arcs[sample_idx]),
                 text,
             ));
         }
@@ -343,12 +435,24 @@ impl GridState {
             .events_section()
             .map_or(0, ass_core::EventsSection::event_count);
         let mut lines = Vec::with_capacity(count);
+        let mut interned_styles: Vec<Arc<str>> = Vec::with_capacity(8);
+        let mut last_style: Option<Arc<str>> = None;
         for (idx, ev) in script.events().enumerate() {
+            let raw_style = ev.style();
+            let style = if let Some(last) = &last_style {
+                if &**last == raw_style {
+                    Arc::clone(last)
+                } else {
+                    intern_style(raw_style, &mut interned_styles, &mut last_style)
+                }
+            } else {
+                intern_style(raw_style, &mut interned_styles, &mut last_style)
+            };
             lines.push(SubtitleLine::new_with_cps(
                 idx + 1,
                 ev.start().as_cs(),
                 ev.end().as_cs(),
-                ev.style().to_owned(),
+                style,
                 ev.text().to_owned(),
             ));
         }
@@ -431,17 +535,33 @@ impl GridState {
     }
 }
 
-/// Formats centiseconds as `H:MM:SS.CC` using fixed-buffer ASCII (no `core::fmt`).
+#[inline]
+fn intern_style(raw: &str, interned: &mut Vec<Arc<str>>, last: &mut Option<Arc<str>>) -> Arc<str> {
+    if let Some(found) = interned.iter().find(|s| &***s == raw) {
+        let arc = Arc::clone(found);
+        *last = Some(Arc::clone(&arc));
+        return arc;
+    }
+    let arc: Arc<str> = Arc::from(raw);
+    if interned.len() < 64 {
+        interned.push(Arc::clone(&arc));
+    }
+    *last = Some(Arc::clone(&arc));
+    arc
+}
+
+/// Formats centiseconds as `H:MM:SS.CC` into an inline ASCII buffer (zero heap allocations).
 #[must_use]
-pub fn format_ass_time(cs: u32) -> String {
+#[inline]
+pub fn format_ass_time_inline(cs: u32) -> InlineAscii<16> {
     let total_sec = cs / 100;
     let cc = cs % 100;
     let ss = total_sec % 60;
     let total_min = total_sec / 60;
     let mm = total_min % 60;
     let hh = total_min / 60;
-    let mut out = String::with_capacity(11);
-    push_usize_ascii(&mut out, hh as usize);
+    let mut out = InlineAscii::new();
+    push_usize_inline(&mut out, hh as usize);
     #[allow(clippy::cast_possible_truncation)]
     let tail = [
         b':',
@@ -454,16 +574,20 @@ pub fn format_ass_time(cs: u32) -> String {
         b'0' + (cc / 10) as u8,
         b'0' + (cc % 10) as u8,
     ];
-    if let Ok(s) = std::str::from_utf8(&tail) {
-        out.push_str(s);
-    }
+    out.push_ascii_slice(&tail);
     out
 }
 
+/// Formats centiseconds as `H:MM:SS.CC` using fixed-buffer ASCII (no `core::fmt`).
+#[must_use]
+pub fn format_ass_time(cs: u32) -> String {
+    format_ass_time_inline(cs).as_str().to_owned()
+}
+
 #[inline]
-fn push_usize_ascii(out: &mut String, mut val: usize) {
+fn push_usize_inline<const CAP: usize>(out: &mut InlineAscii<CAP>, mut val: usize) {
     if val == 0 {
-        out.push('0');
+        out.push_ascii(b'0');
         return;
     }
     let mut buf = [0u8; 20];
@@ -476,31 +600,28 @@ fn push_usize_ascii(out: &mut String, mut val: usize) {
         }
         val /= 10;
     }
-    if let Ok(s) = std::str::from_utf8(&buf[pos..]) {
-        out.push_str(s);
-    }
+    out.push_ascii_slice(&buf[pos..]);
 }
 
 #[inline]
-fn format_tenths_into(out: &mut String, val: f32) {
+fn format_tenths_inline<const CAP: usize>(out: &mut InlineAscii<CAP>, val: f32) {
     out.clear();
     if !val.is_finite() || val.abs() >= 1e9 {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{val:.1}");
+        out.push_ascii_slice(b"0.0");
         return;
     }
     #[allow(clippy::cast_possible_truncation)]
     let tenths = (val * 10.0).round() as i64;
     if tenths < 0 {
-        out.push('-');
+        out.push_ascii(b'-');
     }
     let abs = tenths.unsigned_abs();
     let whole = abs / 10;
     #[allow(clippy::cast_possible_truncation)]
     let frac = (abs % 10) as u8;
-    push_usize_ascii(out, whole as usize);
-    out.push('.');
-    out.push(char::from(b'0' + frac));
+    push_usize_inline(out, whole as usize);
+    out.push_ascii(b'.');
+    out.push_ascii(b'0' + frac);
 }
 
 #[cfg(test)]
