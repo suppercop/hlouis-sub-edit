@@ -13,6 +13,7 @@ members = [
     "crates/scene-detect",
     "crates/edit-ops",
     "crates/styles-catalog",
+    "crates/aegisub-config",
     "crates/i18n",
     "crates/libass-sys",
     "crates/ffms2-sys",

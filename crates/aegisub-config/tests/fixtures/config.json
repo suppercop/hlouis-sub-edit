@@ -1,0 +1,108 @@
+{
+  "App": {
+    "Auto": {
+      "Backup": true,
+      "Save": true,
+      "Save Every Seconds": 60,
+      "Save on Every Change": false
+    },
+    "Language": "en_US",
+    "Show Audio": true,
+    "Show Toolbar": true,
+    "Show Video": true
+  },
+  "Audio": {
+    "Auto": {
+      "Commit": true,
+      "Focus": true
+    },
+    "Lead": {
+      "IN": 200,
+      "OUT": 300
+    },
+    "Medusa Timing Hotkeys": false,
+    "Provider": "FFmpegSource",
+    "Spectrum": true,
+    "Spectrum Cutoff": 0,
+    "Spectrum Quality": 1
+  },
+  "Colour": {
+    "Subtitle Grid": {
+      "Active Border": "rgb(45, 207, 42)",
+      "Background": {
+        "Background": "rgb(255, 255, 255)",
+        "Comment": "rgb(216, 222, 245)",
+        "Inframe": "rgb(255, 253, 234)",
+        "Selected Comment": "rgb(211, 238, 238)",
+        "Selection": "rgb(206, 255, 231)"
+      },
+      "Collision": "rgb(255, 0, 0)",
+      "Header": "rgb(165, 207, 231)",
+      "Standard": "rgb(0, 0, 0)"
+    }
+  },
+  "Path": {
+    "Auto": {
+      "Backup": "?user/autoback",
+      "Save": "?user/autosave"
+    }
+  },
+  "Subtitle": {
+    "Edit Box": {
+      "Font Face": "Consolas",
+      "Font Size": 11
+    },
+    "Grid": {
+      "Column": {
+        "Actor": true,
+        "CPS": true,
+        "Effect": false,
+        "End": true,
+        "Layer": true,
+        "MarginL": false,
+        "MarginR": false,
+        "MarginV": false,
+        "Start": true,
+        "Style": true
+      },
+      "Font Face": "Tahoma",
+      "Font Size": 9,
+      "Hide Overrides": 1
+    },
+    "Provider": "libass"
+  },
+  "Timing": {
+    "Default Duration": 2000
+  },
+  "Tool": {
+    "Timing Post Processor": {
+      "Adjacent Bias": 1.0,
+      "Enable": {
+        "Adjacent": true,
+        "Keyframe": true,
+        "Lead": {
+          "IN": true,
+          "OUT": true
+        }
+      },
+      "Threshold": {
+        "Adjacent": 300,
+        "Key End After": 10,
+        "Key End Before": 15,
+        "Key Start After": 5,
+        "Key Start Before": 6
+      }
+    }
+  },
+  "Video": {
+    "Check Script Res": 2,
+    "Default Zoom": 7,
+    "Provider": "FFmpegSource",
+    "Slider": {
+      "Fast Jump Step": 10
+    }
+  },
+  "UnknownCustomSection": {
+    "FutureFlag": 42
+  }
+}
