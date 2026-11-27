@@ -1,10 +1,10 @@
 use commands::CommandRegistry;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use egui::{Pos2, RawInput, Rect, Vec2};
 use i18n_catalog::{Catalog, Locale};
 use settings::AppSettings;
 use theme::ThemeSpec;
-use ui_preferences::{PreferencesDialogState, show_preferences_dialog};
+use ui_preferences::{show_preferences_dialog, PreferencesDialogState};
 use ui_theme::{FontConfig, ThemeController};
 
 fn bench_ui_preferences(c: &mut Criterion) {

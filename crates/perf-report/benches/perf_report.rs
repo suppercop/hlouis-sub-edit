@@ -1,5 +1,5 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use perf_report::{BenchmarkRow, render_markdown_report};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use perf_report::{render_markdown_report, BenchmarkRow};
 
 fn bench_perf_report(c: &mut Criterion) {
     let rows: Vec<BenchmarkRow> = (0..50)

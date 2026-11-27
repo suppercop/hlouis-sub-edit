@@ -4,11 +4,11 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use ass_core::{ScriptFile, parse_ass, serialize_ass};
+use ass_core::{parse_ass, serialize_ass, ScriptFile};
 use ass_tools::{
-    AdjacentLinkConfig, AspectRatioMode, KeyframeSnapConfig, ResampleOptions, ShiftAffect,
-    ShiftAmount, ShiftDirection, ShiftOptions, ShiftTarget, TppOptions, resample_resolution,
-    shift_times, timing_post_process,
+    resample_resolution, shift_times, timing_post_process, AdjacentLinkConfig, AspectRatioMode,
+    KeyframeSnapConfig, ResampleOptions, ShiftAffect, ShiftAmount, ShiftDirection, ShiftOptions,
+    ShiftTarget, TppOptions,
 };
 use std::collections::BTreeSet;
 

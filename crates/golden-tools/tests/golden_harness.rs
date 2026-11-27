@@ -1,6 +1,6 @@
 //! Integration test comparing all 10 `golden-tools` fixtures against expected `.ass` files.
 
-use golden_tools::{GOLDEN_CASES, run_golden_case};
+use golden_tools::{run_golden_case, GOLDEN_CASES};
 use std::fs;
 use std::path::Path;
 

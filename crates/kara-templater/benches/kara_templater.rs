@@ -1,5 +1,5 @@
-use ass_core::{AssStyle, parse_ass};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use ass_core::{parse_ass, AssStyle};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use kara_templater::{EngineConfig, KaraTemplater};
 use karaskel::{TextExtents, TextMetric};
 use std::fmt::Write as _;

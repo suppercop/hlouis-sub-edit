@@ -4,8 +4,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use perf_report::{
-    BenchmarkRow, collect_criterion_estimates, known_reference, parse_bench_ui_output,
-    render_markdown_report,
+    collect_criterion_estimates, known_reference, parse_bench_ui_output, render_markdown_report,
+    BenchmarkRow,
 };
 use std::fs;
 use std::path::PathBuf;

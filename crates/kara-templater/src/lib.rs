@@ -12,17 +12,17 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ass_core::{AssEvent, AssTime, EventKind, ScriptFile};
 use karaskel::{
-    KaraskelOutput, KaraskelSyllable, PreprocessedLine, ScriptMeta, TextExtents, collect_head,
-    preprocess_script_into,
+    collect_head, preprocess_script_into, KaraskelOutput, KaraskelSyllable, PreprocessedLine,
+    ScriptMeta, TextExtents,
 };
 use mlua::{Function, HookTriggers, Lua, Table, Value, VmState};
-use template_doctor::{Diagnostic, Severity, lint_script};
+use template_doctor::{lint_script, Diagnostic, Severity};
 use thiserror::Error;
 
 /// Configuration & sandbox limits for [`KaraTemplater`].
@@ -159,9 +159,7 @@ pub fn strip_fx_lines(script: &mut ScriptFile) -> usize {
                 removed += 1;
                 continue;
             }
-            if ev.kind() == EventKind::Comment
-                && eff.eq_ignore_ascii_case("karaoke")
-            {
+            if ev.kind() == EventKind::Comment && eff.eq_ignore_ascii_case("karaoke") {
                 if let Some(ev_mut) = ev_sec.get_event_mut(i) {
                     ev_mut.set_kind(EventKind::Dialogue);
                 }
@@ -441,9 +439,7 @@ impl KaraTemplater {
 
         // 5. Execute `code once` lines.
         for pt in &parsed_templates {
-            if pt.kind == RuleKind::Code
-                && pt.once
-            {
+            if pt.kind == RuleKind::Code && pt.once {
                 if let Some(f) = compiled_codes.get(&pt.line_index) {
                     f.call::<()>(()).map_err(|e| KaraError::LuaError {
                         line_index: pt.line_index,
@@ -482,10 +478,7 @@ impl KaraTemplater {
 
             // Run matching `code line` blocks.
             for pt in &parsed_templates {
-                if pt.kind == RuleKind::Code
-                    && pt.is_line
-                    && style_matches(pt, orig_ev.style())
-                {
+                if pt.kind == RuleKind::Code && pt.is_line && style_matches(pt, orig_ev.style()) {
                     if let Some(f) = compiled_codes.get(&pt.line_index) {
                         f.call::<()>(()).map_err(|e| KaraError::LuaError {
                             line_index: pt.line_index,
@@ -1306,7 +1299,7 @@ fn parse_template_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ass_core::{AssStyle, parse_ass};
+    use ass_core::{parse_ass, AssStyle};
     use karaskel::TextMetric;
 
     struct MonoExtents;
@@ -1359,11 +1352,9 @@ mod tests {
         let (s1, r1) = run_ass(&ass1);
         assert_eq!(r1.generated_fx_lines, 2);
         assert!(fx_lines(&s1)[0].text().contains("\\t(0,500,\\fscx120)}ka"));
-        assert!(
-            fx_lines(&s1)[1]
-                .text()
-                .contains("\\t(500,1000,\\fscx120)}ra")
-        );
+        assert!(fx_lines(&s1)[1]
+            .text()
+            .contains("\\t(500,1000,\\fscx120)}ra"));
 
         // 2. retime("syl", 0, 0) + fade
         let ass2 = format!(

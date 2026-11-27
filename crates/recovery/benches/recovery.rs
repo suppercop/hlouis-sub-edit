@@ -1,4 +1,4 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use recovery::count_diff_lines;
 
 fn bench_recovery(c: &mut Criterion) {

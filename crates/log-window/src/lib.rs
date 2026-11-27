@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::Layer;
 
 /// Numeric log severity matching `tracing::Level`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -413,11 +413,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("report.txt");
         save_text_file(&p, &redacted).expect("save");
-        assert!(
-            fs::read_to_string(&p)
-                .expect("read")
-                .contains("HLouis Sub Edit")
-        );
+        assert!(fs::read_to_string(&p)
+            .expect("read")
+            .contains("HLouis Sub Edit"));
 
         // Render egui Log window
         let mut state = LogWindowState::default();

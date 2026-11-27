@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use ass_core::{AssStyle, parse_ass};
+use ass_core::{parse_ass, AssStyle};
 use kara_templater::{EngineConfig, KaraTemplater};
 use karaskel::{TextExtents, TextMetric};
 use std::time::Instant;

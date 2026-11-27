@@ -1,9 +1,9 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use egui::{Pos2, RawInput, Rect, Vec2};
 use i18n_catalog::{Catalog, Locale};
 use mkv_import::TrackPickerModel;
 use mkv_subs::{SubtitleCodec, TrackInfo, TrackType};
-use ui_mkv_import::{MkvImportDialogState, show_mkv_import_dialog};
+use ui_mkv_import::{show_mkv_import_dialog, MkvImportDialogState};
 
 fn bench_ui_mkv_import(c: &mut Criterion) {
     let tracks: Vec<TrackInfo> = (1u64..=68u64)

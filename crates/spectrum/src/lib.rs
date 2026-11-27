@@ -17,7 +17,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use rayon::prelude::*;
-use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::sync::Arc;

@@ -11,8 +11,8 @@
 use egui::{ProgressBar, ScrollArea, Ui};
 use i18n_catalog::Catalog;
 use mkv_import::{ImportError, ImportOutput, MultiTrackMode, TrackPickerModel, TrackPickerRow};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Action emitted by [`show_mkv_import_dialog`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,8 +214,7 @@ pub fn show_mkv_import_dialog(
             ui.set_min_width(260.0);
             ui.strong("Preview (first 5 lines)");
             if let Some(tn) = state.focused_track {
-                if let Some(row) = state.picker.rows().iter().find(|r| r.track_number == tn)
-                {
+                if let Some(row) = state.picker.rows().iter().find(|r| r.track_number == tn) {
                     if row.preview_lines.is_empty() {
                         ui.weak("(No preview loaded yet)");
                     } else {
