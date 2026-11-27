@@ -8,8 +8,7 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use ass_core::{AssEvent, AssTime, ScriptFile};
-use audio_peaks::PeakBucket;
+use ass_core::ScriptFile;
 use audio_view::TimelineMarkerIndex;
 use commands::{CommandRegistry, HotkeyContext, KeyChord};
 use document::DocumentController;
@@ -30,110 +29,7 @@ use ui_dialogs::{ActiveDialog, DialogAction, DialogHostState, show_active_dialog
 use ui_editbox::{EditBoxState, show_edit_box};
 use ui_grid::{GridAction, SubtitleGridState, show_subtitle_grid};
 use ui_theme::{FontConfig, ThemeController};
-use ui_video::{RgbaFrameRef, VideoFrameSupplier, VideoPanelState, show_video_panel};
-
-/// Built-in procedural checkerboard video supplier for demos & headless benchmarks.
-pub struct DummyVideoSupplier {
-    pub width: u32,
-    pub height: u32,
-    pub total_frames: u32,
-    rgba: Vec<u8>,
-}
-
-impl DummyVideoSupplier {
-    #[must_use]
-    pub fn new(width: u32, height: u32, total_frames: u32) -> Self {
-        let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
-        for y in 0..height {
-            for x in 0..width {
-                let dark = ((x / 16) + (y / 16)).is_multiple_of(2);
-                let v = if dark { 42u8 } else { 58u8 };
-                let idx = ((y as usize) * (width as usize) + (x as usize)) * 4;
-                rgba[idx] = v;
-                rgba[idx + 1] = v;
-                rgba[idx + 2] = v + 6;
-                rgba[idx + 3] = 255;
-            }
-        }
-        Self {
-            width,
-            height,
-            total_frames,
-            rgba,
-        }
-    }
-}
-
-impl VideoFrameSupplier for DummyVideoSupplier {
-    fn total_frames(&self) -> u32 {
-        self.total_frames
-    }
-    fn is_keyframe(&self, frame: u32) -> bool {
-        frame.is_multiple_of(24)
-    }
-    fn frame_revision(&self, _frame: u32) -> u64 {
-        1
-    }
-    fn frame_rgba(&self, _frame: u32) -> Option<RgbaFrameRef<'_>> {
-        Some(RgbaFrameRef {
-            width: self.width,
-            height: self.height,
-            rgba: &self.rgba,
-        })
-    }
-}
-
-/// Built-in procedural sine-wave audio column supplier for demos & headless benchmarks.
-pub struct DummyAudioProvider {
-    pub duration_ms: i64,
-}
-
-impl AudioColumnProvider for DummyAudioProvider {
-    fn duration_ms(&self) -> i64 {
-        self.duration_ms
-    }
-    fn query_columns_into(
-        &self,
-        start_ms: i64,
-        end_ms: i64,
-        width_px: usize,
-        out: &mut Vec<PeakBucket>,
-    ) {
-        out.clear();
-        let span = (end_ms - start_ms).max(1) as f32;
-        for i in 0..width_px {
-            let t = (start_ms as f32) + span * (i as f32 / width_px.max(1) as f32);
-            #[allow(clippy::cast_sign_loss)]
-            let amp = (((t * 0.015).sin() * (t * 0.0023).cos()).abs() * 24_000.0) as i16;
-            out.push(PeakBucket {
-                min: -amp,
-                max: amp,
-                rms: amp.unsigned_abs(),
-            });
-        }
-    }
-}
-
-/// Generates a synthetic `line_count`-line ASS script for demos and 200k-line UI benchmarks.
-#[must_use]
-pub fn generate_demo_script(line_count: usize) -> ScriptFile {
-    let mut script = ScriptFile::new_default();
-    let sec = script.ensure_events_section_mut();
-    for i in 0..line_count {
-        let s = (i as u32) * 5;
-        let text = if i.is_multiple_of(20) {
-            r"{\an8\blur1}Typeset sign / Tiêu đề cảnh"
-        } else {
-            r"{\i1}Sample subtitle dialogue line{\i0}"
-        };
-        let mut ev = AssEvent::dialogue(AssTime::from_cs(s), AssTime::from_cs(s + 120), text);
-        if i.is_multiple_of(10) {
-            ev.set_style("Sign");
-        }
-        sec.insert_event(i, ev);
-    }
-    script
-}
+use ui_video::{VideoFrameSupplier, VideoPanelState, show_video_panel};
 
 /// Full application shell state combining all UI panels, document, playback, settings, and telemetry.
 pub struct AppShell {
@@ -143,7 +39,7 @@ pub struct AppShell {
     pub theme: ThemeController,
     pub catalog: Catalog,
     pub commands: CommandRegistry,
-    pub playback: PlaybackController,
+    pub playback: Option<PlaybackController>,
     pub grid: SubtitleGridState,
     pub editbox: EditBoxState,
     pub audio: AudioPanelState,
@@ -163,22 +59,14 @@ pub struct AppShell {
 }
 
 impl AppShell {
-    /// Creates a new shell initialized with `script`.
+    /// Creates a new shell initialized with `script` and no media attached.
+    ///
+    /// Call [`Self::attach_video`] and [`Self::attach_audio`] when real media is opened.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
     pub fn new(script: ScriptFile) -> Self {
         let mut grid = SubtitleGridState::default();
         grid.sync_from_script(&script);
         let doc = DocumentController::new(script);
-        let tc = Timecodes::from_cfr(24_000, 1_001).unwrap_or_else(|_| {
-            Timecodes::from_vfr_ms(vec![0, 42]).unwrap_or_else(|_| panic!("unreachable"))
-        });
-        let kfs: Vec<u32> = (0..1_000).map(|i| i * 24).collect();
-        let pb = PlaybackController::new(tc, 24_000, kfs, PlaybackConfig::default());
-        let audio_markers = TimelineMarkerIndex::new(
-            (0..500).map(|i| i * 2_000).collect(),
-            (0..2_000).map(|i| i * 500).collect(),
-        );
         Self {
             doc,
             settings: AppSettings::default(),
@@ -186,12 +74,12 @@ impl AppShell {
             theme: ThemeController::new(ThemeSpec::Dark, FontConfig::default()),
             catalog: Catalog::for_locale(Locale::En),
             commands: CommandRegistry::new_default(),
-            playback: pb,
+            playback: None,
             grid,
             editbox: EditBoxState::default(),
-            audio: AudioPanelState::new(1_000_000),
-            audio_markers,
-            video: VideoPanelState::new(1280, 720),
+            audio: AudioPanelState::new(0),
+            audio_markers: TimelineMarkerIndex::new(Vec::new(), Vec::new()),
+            video: VideoPanelState::new(0, 0),
             dialogs: DialogHostState::new(),
             metrics: PerfMetrics::default(),
             command_palette_open: false,
@@ -204,6 +92,43 @@ impl AppShell {
             fonts_installed: false,
             last_theme_rev: 0,
         }
+    }
+
+    /// Attaches real video timing metadata (timecodes, frame count, keyframes, dimensions).
+    pub fn attach_video(
+        &mut self,
+        timecodes: Timecodes,
+        frame_count: u32,
+        keyframes: Vec<u32>,
+        width: u32,
+        height: u32,
+    ) {
+        self.playback = Some(PlaybackController::new(
+            timecodes,
+            frame_count,
+            keyframes,
+            PlaybackConfig::default(),
+        ));
+        self.video = VideoPanelState::new(width, height);
+    }
+
+    /// Detaches the active video source and clears playback state.
+    pub fn detach_video(&mut self) {
+        self.playback = None;
+        self.video = VideoPanelState::new(0, 0);
+        self.audio.video_marker_ms = None;
+    }
+
+    /// Attaches real audio duration and timeline markers.
+    pub fn attach_audio(&mut self, duration_ms: i64, markers: TimelineMarkerIndex) {
+        self.audio = AudioPanelState::new(duration_ms.max(0));
+        self.audio_markers = markers;
+    }
+
+    /// Detaches the active audio source and clears timeline markers.
+    pub fn detach_audio(&mut self) {
+        self.audio = AudioPanelState::new(0);
+        self.audio_markers = TimelineMarkerIndex::new(Vec::new(), Vec::new());
     }
 
     /// Switches theme specification live at runtime.
@@ -302,8 +227,8 @@ impl AppShell {
     pub fn show(
         &mut self,
         ui: &mut Ui,
-        video_supplier: &dyn VideoFrameSupplier,
-        audio_provider: &dyn AudioColumnProvider,
+        video_supplier: Option<&dyn VideoFrameSupplier>,
+        audio_provider: Option<&dyn AudioColumnProvider>,
         clock: &dyn Clock,
     ) {
         let ctx = ui.ctx().clone();
@@ -338,9 +263,11 @@ impl AppShell {
         }
 
         // Advance playback tick ONLY if playing (repaint discipline: never continuous when idle!).
-        if self.playback.is_playing() {
+        if let Some(ref mut pb) = self.playback
+            && pb.is_playing()
+        {
             let mut decode_q = [0u32; 4];
-            let dec = self.playback.tick(clock, &mut decode_q);
+            let dec = pb.tick(clock, &mut decode_q);
             self.audio.video_marker_ms = Some(dec.current_time_ms);
             ctx.request_repaint();
         }
@@ -525,15 +452,25 @@ impl AppShell {
                     Vec2::new(v.w, v.h),
                 );
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(vr));
-                let _ = show_video_panel(
-                    &mut child,
-                    &mut self.video,
-                    video_supplier,
-                    &mut self.playback,
-                    clock,
-                    &pal,
-                    &self.catalog,
-                );
+                if let (Some(vs), Some(pb)) = (video_supplier, self.playback.as_mut()) {
+                    let _ = show_video_panel(
+                        &mut child,
+                        &mut self.video,
+                        vs,
+                        pb,
+                        clock,
+                        &pal,
+                        &self.catalog,
+                    );
+                } else {
+                    child.centered_and_justified(|ui| {
+                        ui.label(
+                            self.catalog
+                                .get("video-no-video")
+                                .unwrap_or("No video loaded"),
+                        );
+                    });
+                }
             }
 
             // Top-right: Audio panel
@@ -545,17 +482,27 @@ impl AppShell {
                     Vec2::new(a.w, a.h),
                 );
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ar));
-                let _ = show_audio_panel(
-                    &mut child,
-                    &mut self.audio,
-                    audio_provider,
-                    &self.audio_markers,
-                    None,
-                    None,
-                    &pal,
-                    pal_rev,
-                    &self.catalog,
-                );
+                if let Some(ap) = audio_provider {
+                    let _ = show_audio_panel(
+                        &mut child,
+                        &mut self.audio,
+                        ap,
+                        &self.audio_markers,
+                        None,
+                        None,
+                        &pal,
+                        pal_rev,
+                        &self.catalog,
+                    );
+                } else {
+                    child.centered_and_justified(|ui| {
+                        ui.label(
+                            self.catalog
+                                .get("audio-no-audio")
+                                .unwrap_or("No audio loaded"),
+                        );
+                    });
+                }
             }
 
             // Middle-right (under audio): Edit Box
@@ -597,7 +544,10 @@ impl AppShell {
                     Vec2::new(comp.grid.w, comp.grid.h),
                 );
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(gr));
-                let vid_cs = u32::try_from(self.playback.current_time_ms().max(0) / 10).ok();
+                let vid_cs = self
+                    .playback
+                    .as_ref()
+                    .and_then(|pb| u32::try_from(pb.current_time_ms().max(0) / 10).ok());
                 if let Some(act) = show_subtitle_grid(
                     &mut child,
                     self.doc.script(),
@@ -715,6 +665,7 @@ impl AppShell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ass_core::{AssEvent, AssTime};
     use egui_kittest::Harness;
 
     struct ZeroClock;
@@ -725,24 +676,26 @@ mod tests {
     }
 
     #[test]
-    fn full_shell_composes_all_panels_and_switches_themes() {
-        let script = generate_demo_script(2_000);
+    fn shell_starts_without_media_and_switches_themes() {
+        let mut script = ScriptFile::new_default();
+        script.ensure_events_section_mut().insert_event(
+            0,
+            AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(250), "Hello world"),
+        );
         let mut shell = AppShell::new(script);
-        let vid = DummyVideoSupplier::new(64, 36, 240);
-        let aud = DummyAudioProvider {
-            duration_ms: 120_000,
-        };
+        assert!(shell.playback.is_none());
+        assert!(shell.audio.video_marker_ms.is_none());
 
-        let mut harness = Harness::builder()
+        let builder = Harness::builder()
             .with_size(Vec2::new(1280.0, 800.0))
-            .with_accessibility_check(false)
-            .build_ui(move |ui| {
-                shell.show(ui, &vid, &aud, &ZeroClock);
-                shell.set_theme(ThemeSpec::EyeComfort {
-                    base: BaseTheme::Dark,
-                    strength: 65,
-                });
+            .with_accessibility_check(false);
+        let mut harness = builder.build_ui(move |ui| {
+            shell.show(ui, None, None, &ZeroClock);
+            shell.set_theme(ThemeSpec::EyeComfort {
+                base: BaseTheme::Dark,
+                strength: 65,
             });
+        });
         harness.run();
         harness.step();
     }

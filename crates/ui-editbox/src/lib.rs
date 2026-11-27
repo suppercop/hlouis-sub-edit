@@ -539,7 +539,8 @@ mod tests {
         let fonts = ui_theme::build_font_definitions(&ui_theme::FontConfig::default());
         let mut inited = false;
 
-        let mut harness = Harness::builder().with_accessibility_check(false).build_ui(move |ui| {
+        let builder = Harness::builder().with_accessibility_check(false);
+        let mut harness = builder.build_ui(move |ui| {
             if !inited {
                 ui.ctx().set_fonts(fonts.clone());
                 inited = true;

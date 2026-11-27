@@ -1,9 +1,10 @@
 //! Zero-allocation autosave-check & scaling tests for `ui-shell`.
 
+use ass_core::{AssEvent, AssTime, ScriptFile};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use ui_shell::{AppShell, generate_demo_script};
+use ui_shell::AppShell;
 
 struct CountingAlloc;
 
@@ -28,8 +29,22 @@ fn allocs() -> usize {
     ALLOC_COUNT.load(Ordering::Relaxed)
 }
 
+fn make_script(n: usize) -> ScriptFile {
+    let mut script = ScriptFile::new_default();
+    let sec = script.ensure_events_section_mut();
+    for i in 0..n {
+        #[allow(clippy::cast_possible_truncation)]
+        let s = (i as u32) * 5;
+        sec.insert_event(
+            i,
+            AssEvent::dialogue(AssTime::from_cs(s), AssTime::from_cs(s + 100), "Line"),
+        );
+    }
+    script
+}
+
 fn hot_path_zero_alloc() {
-    let script = generate_demo_script(100);
+    let script = make_script(100);
     let shell = AppShell::new(script);
 
     let before = allocs();
@@ -48,11 +63,11 @@ fn hot_path_zero_alloc() {
 
 fn scaling_n_vs_2n() {
     let t1 = Instant::now();
-    let s1 = generate_demo_script(1_000);
+    let s1 = make_script(1_000);
     let d1 = t1.elapsed().as_nanos().max(1);
 
     let t2 = Instant::now();
-    let s2 = generate_demo_script(2_000);
+    let s2 = make_script(2_000);
     let d2 = t2.elapsed().as_nanos().max(1);
 
     assert_eq!(s1.events().count() * 2, s2.events().count());
