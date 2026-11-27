@@ -1,0 +1,63 @@
+name: Setup Rust and Native Dependencies
+description: Installs pinned Rust 1.100.0 toolchain, configures Swatinem/rust-cache, and restores or builds .native dependencies.
+
+inputs:
+  components:
+    description: Comma-separated rustup components to install (e.g. rustfmt,clippy)
+    required: false
+    default: ""
+  cache-prefix:
+    description: Prefix key isolating Swatinem/rust-cache per CI job
+    required: false
+    default: "v2"
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.100.0
+        components: ${{ inputs.components }}
+
+    - name: Cache Cargo registry and target
+      uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: ${{ inputs.cache-prefix }}-${{ runner.os }}
+        cache-all-crates: true
+
+    - name: Cache native dependencies (.native)
+      id: cache-native
+      uses: actions/cache@v4
+      with:
+        path: |
+          .native/include
+          .native/lib
+          .native/bin
+          .native/licenses
+          .native/downloads
+          .native/ffms2-ffmpeg.stamp
+        key: native-v2-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'scripts/fetch-native.ps1') }}
+
+    - name: Cache vcpkg binary archives
+      if: steps.cache-native.outputs.cache-hit != 'true'
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.LOCALAPPDATA }}/vcpkg/archives
+        key: vcpkg-archives-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+        restore-keys: |
+          vcpkg-archives-${{ runner.os }}-
+
+    - name: Fetch and build native dependencies
+      if: steps.cache-native.outputs.cache-hit != 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: pwsh
+      run: |
+        ./scripts/fetch-native.ps1
+
+    - name: Add native DLLs to PATH
+      shell: pwsh
+      run: |
+        $binDir = Join-Path $PWD ".native\bin"
+        Add-Content -Path $env:GITHUB_PATH -Value $binDir
