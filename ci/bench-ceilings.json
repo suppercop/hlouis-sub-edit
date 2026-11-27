@@ -1,0 +1,465 @@
+{
+  "_meta": {
+    "calibration_rule": "CI ceiling on windows-latest = median_of_3_runs * 1.3 (or * 2.0 when median < 1000 ns)",
+    "owner_rule": "Initial owner-PC ceilings from AGENTS.md; ratchet down to new measured + 15% after quiet wins",
+    "calibrated_on_ci": true,
+    "calibration_run_id": 46018649176
+  },
+  "benchmarks": {
+    "aegisub_config_parse_and_map_both": {
+      "ci_median_ns": 35987.45,
+      "ci_max_ns": 46784,
+      "owner_max_ns": 50000
+    },
+    "align_to_video_1080p_300x200_region": {
+      "ci_median_ns": 529743.11,
+      "ci_max_ns": 688666,
+      "owner_max_ns": 700000
+    },
+    "app_hot_paths/grid_200k_generate": {
+      "ci_median_ns": 76001025.0,
+      "ci_max_ns": 98801332,
+      "owner_max_ns": null
+    },
+    "app_hot_paths/grid_200k_scroll_frame": {
+      "ci_median_ns": 108867.45,
+      "ci_max_ns": 141528,
+      "owner_max_ns": null
+    },
+    "app_hot_paths/grid_200k_select_all": {
+      "ci_median_ns": 492.25,
+      "ci_max_ns": 984,
+      "owner_max_ns": null
+    },
+    "app_hot_paths/syntax_layout_job": {
+      "ci_median_ns": 4663.78,
+      "ci_max_ns": 6063,
+      "owner_max_ns": null
+    },
+    "app_services_filter_100k_entries": {
+      "ci_median_ns": 282316.07,
+      "ci_max_ns": 367011,
+      "owner_max_ns": null
+    },
+    "app_services_log_append_steady_state": {
+      "ci_median_ns": 8.47,
+      "ci_max_ns": 17,
+      "owner_max_ns": null
+    },
+    "audio_cache_fill/fill_16mb_from_memory": {
+      "ci_median_ns": 557247.5,
+      "ci_max_ns": 724422,
+      "owner_max_ns": null
+    },
+    "audio_cache_random_100ms_hot_read": {
+      "ci_median_ns": 440.95,
+      "ci_max_ns": 882,
+      "owner_max_ns": null
+    },
+    "audio_out_render_1s_passthrough_48k": {
+      "ci_median_ns": 84755.25,
+      "ci_max_ns": 110182,
+      "owner_max_ns": null
+    },
+    "audio_out_render_1s_resample_44k1_to_48k": {
+      "ci_median_ns": 823694.72,
+      "ci_max_ns": 1070803,
+      "owner_max_ns": null
+    },
+    "audio_peaks_24min/spectrum_fft1024_50pct_24min_48khz": {
+      "ci_median_ns": 348096250.0,
+      "ci_max_ns": 452525125,
+      "owner_max_ns": 270000000
+    },
+    "audio_peaks_24min/waveform_pyramid_24min_48khz_stereo": {
+      "ci_median_ns": 40802860.42,
+      "ci_max_ns": 53043719,
+      "owner_max_ns": 150000000
+    },
+    "audio_view_frame_2000px_20k_lines_3k_kf": {
+      "ci_median_ns": 1077.66,
+      "ci_max_ns": 1401,
+      "owner_max_ns": 1500
+    },
+    "autosave_20k_end_to_end_with_fsync": {
+      "ci_median_ns": 15111562.5,
+      "ci_max_ns": 19645031,
+      "owner_max_ns": 30000000
+    },
+    "autosave_20k_snapshot_handoff": {
+      "ci_median_ns": 99.61,
+      "ci_max_ns": 199,
+      "owner_max_ns": 5000000
+    },
+    "cfr_convert_200k_frames": {
+      "ci_median_ns": 6207322.22,
+      "ci_max_ns": 8069519,
+      "owner_max_ns": 6000000
+    },
+    "check_fonts_20k_lines": {
+      "ci_median_ns": 15388275.0,
+      "ci_max_ns": 20004758,
+      "owner_max_ns": 20000000
+    },
+    "commands_build_registry": {
+      "ci_median_ns": 10970.87,
+      "ci_max_ns": 14262,
+      "owner_max_ns": null
+    },
+    "commands_hotkey_lookup": {
+      "ci_median_ns": 23.03,
+      "ci_max_ns": 46,
+      "owner_max_ns": null
+    },
+    "dialogs_model_field_update_and_validate": {
+      "ci_median_ns": 9.69,
+      "ci_max_ns": 19,
+      "owner_max_ns": null
+    },
+    "document_amend_while_typing_zero_alloc": {
+      "ci_median_ns": 8.65,
+      "ci_max_ns": 17,
+      "owner_max_ns": null
+    },
+    "document_commit_text_with_notify": {
+      "ci_median_ns": 230.92,
+      "ci_max_ns": 462,
+      "owner_max_ns": null
+    },
+    "document_undo_redo_single_line": {
+      "ci_median_ns": 146.95,
+      "ci_max_ns": 294,
+      "owner_max_ns": null
+    },
+    "edit_box_ops_insert_newline_2000_char": {
+      "ci_median_ns": 75.08,
+      "ci_max_ns": 150,
+      "owner_max_ns": null
+    },
+    "edit_box_ops_set_alignment_2000_char": {
+      "ci_median_ns": 154.01,
+      "ci_max_ns": 308,
+      "owner_max_ns": null
+    },
+    "edit_box_ops_set_color_2000_char": {
+      "ci_median_ns": 293.26,
+      "ci_max_ns": 587,
+      "owner_max_ns": null
+    },
+    "edit_box_ops_toggle_bold_2000_char": {
+      "ci_median_ns": 2275.47,
+      "ci_max_ns": 2958,
+      "owner_max_ns": null
+    },
+    "edit_ops_cps_all_20k_lines": {
+      "ci_median_ns": 1725860.5,
+      "ci_max_ns": 2243619,
+      "owner_max_ns": 1500000
+    },
+    "edit_ops_delete_10000_selected": {
+      "ci_median_ns": 2023230.0,
+      "ci_max_ns": 2630199,
+      "owner_max_ns": 2000000
+    },
+    "edit_ops_paste_5000_lines": {
+      "ci_median_ns": 2090910.42,
+      "ci_max_ns": 2718184,
+      "owner_max_ns": 4000000
+    },
+    "edit_ops_sort_20k_by_start_cmd": {
+      "ci_median_ns": 472566.21,
+      "ci_max_ns": 614336,
+      "owner_max_ns": 6000000
+    },
+    "edit_ops_sort_20k_by_start_in_place": {
+      "ci_median_ns": 3261718.75,
+      "ci_max_ns": 4240234,
+      "owner_max_ns": 6000000
+    },
+    "find_replace_skip_tags_20k": {
+      "ci_median_ns": 4580277.27,
+      "ci_max_ns": 5954360,
+      "owner_max_ns": 17000000
+    },
+    "fonts_dwrite_missing_glyphs_50x2000_warm": {
+      "ci_median_ns": 604524.91,
+      "ci_max_ns": 785882,
+      "owner_max_ns": null
+    },
+    "frame_cache_get_hit": {
+      "ci_median_ns": 23.21,
+      "ci_max_ns": 46,
+      "owner_max_ns": null
+    },
+    "frame_cache_steady_insert_with_pool": {
+      "ci_median_ns": 75.78,
+      "ci_max_ns": 152,
+      "owner_max_ns": null
+    },
+    "frame_tools_snap_20k_lines": {
+      "ci_median_ns": 1878282.14,
+      "ci_max_ns": 2441767,
+      "owner_max_ns": 2300000
+    },
+    "frame_tools_transform_20k_lines_with_tags": {
+      "ci_median_ns": 4827021.43,
+      "ci_max_ns": 6275128,
+      "owner_max_ns": 6000000
+    },
+    "grid_model_incremental_overlap_update_1_row": {
+      "ci_median_ns": 161.82,
+      "ci_max_ns": 324,
+      "owner_max_ns": null
+    },
+    "grid_model_overlap_rebuild_200k": {
+      "ci_median_ns": 727398.35,
+      "ci_max_ns": 945618,
+      "owner_max_ns": null
+    },
+    "grid_model_select_all_200k": {
+      "ci_median_ns": 246.1,
+      "ci_max_ns": 492,
+      "owner_max_ns": null
+    },
+    "grid_model_visible_60_rows_flags": {
+      "ci_median_ns": 183.57,
+      "ci_max_ns": 367,
+      "owner_max_ns": null
+    },
+    "i18n_catalog_format_placeables": {
+      "ci_median_ns": 97.07,
+      "ci_max_ns": 194,
+      "owner_max_ns": null
+    },
+    "i18n_catalog_lookup_simple": {
+      "ci_median_ns": 32.03,
+      "ci_max_ns": 64,
+      "owner_max_ns": null
+    },
+    "join_100_lines_in_20k": {
+      "ci_median_ns": 36661.34,
+      "ci_max_ns": 47660,
+      "owner_max_ns": 50000
+    },
+    "karaoke_parse_rebuild_20k": {
+      "ci_median_ns": 8556633.33,
+      "ci_max_ns": 11123623,
+      "owner_max_ns": 15000000
+    },
+    "karaoke_timing_commit_200_syllables": {
+      "ci_median_ns": 4290.85,
+      "ci_max_ns": 5578,
+      "owner_max_ns": 2000
+    },
+    "karaoke_timing_drag_200_syllables": {
+      "ci_median_ns": 25.03,
+      "ci_max_ns": 50,
+      "owner_max_ns": 100
+    },
+    "karaskel_preprocess_2000_lines_20_syls": {
+      "ci_median_ns": 3677815.38,
+      "ci_max_ns": 4781160,
+      "owner_max_ns": null
+    },
+    "layout_compute_full_workspace": {
+      "ci_median_ns": 22.33,
+      "ci_max_ns": 45,
+      "owner_max_ns": null
+    },
+    "media_hot_paths/rgba_upload_prep_1080p": {
+      "ci_median_ns": 216623.94,
+      "ci_max_ns": 281611,
+      "owner_max_ns": null
+    },
+    "mkv_import_build_picker_64_tracks": {
+      "ci_median_ns": 9648.41,
+      "ci_max_ns": 12543,
+      "owner_max_ns": null
+    },
+    "mkv_import_convert_2000_srt_to_ass": {
+      "ci_median_ns": 703038.63,
+      "ci_max_ns": 913950,
+      "owner_max_ns": null
+    },
+    "mkv_skip_heavy_40_tracks/extract_all_37_srt_tracks_16mb": {
+      "ci_median_ns": 3775346.43,
+      "ci_max_ns": 4907950,
+      "owner_max_ns": 250000000
+    },
+    "parse_20k_lines": {
+      "ci_median_ns": 7305233.33,
+      "ci_max_ns": 9496803,
+      "owner_max_ns": 10000000
+    },
+    "perf_metrics_hdr_percentile_p99": {
+      "ci_median_ns": 192.65,
+      "ci_max_ns": 385,
+      "owner_max_ns": null
+    },
+    "perf_metrics_hdr_record": {
+      "ci_median_ns": 2.82,
+      "ci_max_ns": 6,
+      "owner_max_ns": null
+    },
+    "playback_scrub_coalescing_1000_events": {
+      "ci_median_ns": 1082.73,
+      "ci_max_ns": 1408,
+      "owner_max_ns": null
+    },
+    "playback_tick_scheduling_decision": {
+      "ci_median_ns": 29.46,
+      "ci_max_ns": 59,
+      "owner_max_ns": null
+    },
+    "project_read_write_links_20k_script": {
+      "ci_median_ns": 592.37,
+      "ci_max_ns": 1185,
+      "owner_max_ns": 1000
+    },
+    "render_hot_paths/libass_render_blend_1080p": {
+      "ci_median_ns": 314938.95,
+      "ci_max_ns": 409421,
+      "owner_max_ns": null
+    },
+    "render_hot_paths/rgba_blend_mask_1080p": {
+      "ci_median_ns": 798720.23,
+      "ci_max_ns": 1038336,
+      "owner_max_ns": null
+    },
+    "resample_resolution_20k_tags_drawings": {
+      "ci_median_ns": 8847575.0,
+      "ci_max_ns": 11501848,
+      "owner_max_ns": 15000000
+    },
+    "scene_detect_1080p_quarter_res_per_frame": {
+      "ci_median_ns": 305181.89,
+      "ci_max_ns": 396736,
+      "owner_max_ns": 500000
+    },
+    "script_props_read_edit_apply": {
+      "ci_median_ns": 2080.51,
+      "ci_max_ns": 2705,
+      "owner_max_ns": null
+    },
+    "select_lines_20k": {
+      "ci_median_ns": 952548.51,
+      "ci_max_ns": 1238313,
+      "owner_max_ns": 1500000
+    },
+    "serialize_20k_lines": {
+      "ci_median_ns": 2524502.5,
+      "ci_max_ns": 3281853,
+      "owner_max_ns": 8000000
+    },
+    "settings_load_and_validate": {
+      "ci_median_ns": 3742.73,
+      "ci_max_ns": 4866,
+      "owner_max_ns": null
+    },
+    "settings_save_json": {
+      "ci_median_ns": 2433.56,
+      "ci_max_ns": 3164,
+      "owner_max_ns": null
+    },
+    "shift_times_20k": {
+      "ci_median_ns": 55964.72,
+      "ci_max_ns": 72754,
+      "owner_max_ns": 11000000
+    },
+    "split_by_newline_in_20k": {
+      "ci_median_ns": 36135.52,
+      "ci_max_ns": 46976,
+      "owner_max_ns": 50000
+    },
+    "style_editor_apply_with_rename_20k": {
+      "ci_median_ns": 728015.89,
+      "ci_max_ns": 946421,
+      "owner_max_ns": null
+    },
+    "styles_catalog_import_200_styles": {
+      "ci_median_ns": 111850.54,
+      "ci_max_ns": 145406,
+      "owner_max_ns": 130000
+    },
+    "styles_catalog_rename_propagate_20k": {
+      "ci_median_ns": 613035.64,
+      "ci_max_ns": 796946,
+      "owner_max_ns": 800000
+    },
+    "syntax_highlight_grid_display_200_rows": {
+      "ci_median_ns": 13084.93,
+      "ci_max_ns": 17010,
+      "owner_max_ns": 15000
+    },
+    "syntax_highlight_retokenize_1_char_edit": {
+      "ci_median_ns": 503.55,
+      "ci_max_ns": 1007,
+      "owner_max_ns": 1000
+    },
+    "syntax_highlight_tokenize_2000_char": {
+      "ci_median_ns": 18369.68,
+      "ci_max_ns": 23881,
+      "owner_max_ns": 20000
+    },
+    "theme_eye_comfort_full_palette_dark_100": {
+      "ci_median_ns": 20707.65,
+      "ci_max_ns": 26920,
+      "owner_max_ns": null
+    },
+    "theme_eye_comfort_full_palette_light_100": {
+      "ci_median_ns": 23798.18,
+      "ci_max_ns": 30938,
+      "owner_max_ns": null
+    },
+    "timing_controller_drag_snap_20k_lines_3k_kf": {
+      "ci_median_ns": 54.73,
+      "ci_max_ns": 109,
+      "owner_max_ns": 100
+    },
+    "tpp_full_pipeline_20k": {
+      "ci_median_ns": 699103.5,
+      "ci_max_ns": 908835,
+      "owner_max_ns": 13000000
+    },
+    "undo_redo_step_20k_lines": {
+      "ci_median_ns": 42.57,
+      "ci_max_ns": 85,
+      "owner_max_ns": 100000
+    },
+    "vfr_convert_200k_frames": {
+      "ci_median_ns": 5660511.11,
+      "ci_max_ns": 7358664,
+      "owner_max_ns": 5000000
+    },
+    "video_geometry_dummy_1080p_checkerboard_fill": {
+      "ci_median_ns": 157485.79,
+      "ci_max_ns": 204732,
+      "owner_max_ns": 350000
+    },
+    "video_geometry_transform_per_frame": {
+      "ci_median_ns": 21.93,
+      "ci_max_ns": 44,
+      "owner_max_ns": 50
+    },
+    "visual_tools_hit_test_and_drag_500pt_vector_clip": {
+      "ci_median_ns": 644.85,
+      "ci_max_ns": 1290,
+      "owner_max_ns": 1000
+    },
+    "visual_tools_serialize_500pt_vector_clip": {
+      "ci_median_ns": 21696.37,
+      "ci_max_ns": 28205,
+      "owner_max_ns": 25000
+    },
+    "waveform_first_screen_10s": {
+      "ci_median_ns": 270932.46,
+      "ci_max_ns": 352212,
+      "owner_max_ns": 500000
+    },
+    "waveform_query_2000px": {
+      "ci_median_ns": 18817.9,
+      "ci_max_ns": 24463,
+      "owner_max_ns": 30000
+    }
+  }
+}

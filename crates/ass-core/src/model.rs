@@ -118,15 +118,7 @@ impl ScriptFile {
             raw_format_line: None,
             entries: vec![StyleEntry::Style(Box::default()), StyleEntry::Blank],
         };
-        let events = EventsSection {
-            header: "[Events]".to_owned(),
-            format: DEFAULT_EVENT_FORMAT
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            raw_format_line: None,
-            entries: Vec::new(),
-        };
+        let events = EventsSection::new("[Events]".to_owned());
 
         Self {
             has_bom: true,
@@ -236,15 +228,8 @@ impl ScriptFile {
         let idx = if let Some(i) = pos {
             i
         } else {
-            self.sections.push(Section::Events(EventsSection {
-                header: "[Events]".to_owned(),
-                format: DEFAULT_EVENT_FORMAT
-                    .iter()
-                    .map(|s| (*s).to_owned())
-                    .collect(),
-                raw_format_line: None,
-                entries: Vec::new(),
-            }));
+            self.sections
+                .push(Section::Events(EventsSection::new("[Events]".to_owned())));
             self.sections.len() - 1
         };
         match &mut self.sections[idx] {
@@ -823,16 +808,103 @@ impl AssStyle {
 }
 
 /// `[Events]` section preserving custom `Format:` order and raw non-event lines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct EventsSection {
     pub header: String,
     pub format: Vec<String>,
     /// Original `Format: ...` line if present, for byte-identical serialization.
     pub raw_format_line: Option<String>,
     pub entries: Vec<EventEntry>,
+    /// Cached `(entries.len(), entries.as_ptr() as usize, all_events_only)` for O(1) index lookup.
+    pub(crate) layout_cache: Option<(usize, usize, bool)>,
 }
 
+impl Clone for EventsSection {
+    fn clone(&self) -> Self {
+        let entries = self.entries.clone();
+        let layout_cache = self.layout_cache.and_then(|(len, ptr, all_ev)| {
+            (len == self.entries.len() && ptr == self.entries.as_ptr() as usize).then_some((
+                entries.len(),
+                entries.as_ptr() as usize,
+                all_ev,
+            ))
+        });
+        Self {
+            header: self.header.clone(),
+            format: self.format.clone(),
+            raw_format_line: self.raw_format_line.clone(),
+            entries,
+            layout_cache,
+        }
+    }
+}
+
+impl PartialEq for EventsSection {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header
+            && self.format == other.format
+            && self.raw_format_line == other.raw_format_line
+            && self.entries == other.entries
+    }
+}
+
+impl Eq for EventsSection {}
+
 impl EventsSection {
+    /// Creates an empty `[Events]` section with default V4+ columns.
+    #[must_use]
+    pub fn new(header: impl Into<String>) -> Self {
+        let entries = Vec::new();
+        let ptr = entries.as_ptr() as usize;
+        Self {
+            header: header.into(),
+            format: DEFAULT_EVENT_FORMAT
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            raw_format_line: None,
+            entries,
+            layout_cache: Some((0, ptr, true)),
+        }
+    }
+
+    /// Replaces `self.entries` and updates the fast-lookup layout cache.
+    pub fn set_entries(&mut self, entries: Vec<EventEntry>) {
+        self.entries = entries;
+        let _ = self.refresh_all_events_cache();
+    }
+
+    /// Checks whether `entries` contains only `EventEntry::Event` items and caches the result.
+    #[inline]
+    pub(crate) fn refresh_all_events_cache(&mut self) -> bool {
+        let key_len = self.entries.len();
+        let key_ptr = self.entries.as_ptr() as usize;
+        if let Some((len, ptr, all_ev)) = self.layout_cache {
+            if len == key_len && ptr == key_ptr {
+                return all_ev;
+            }
+        }
+        let all_ev = self
+            .entries
+            .iter()
+            .all(|e| matches!(e, EventEntry::Event(_)));
+        self.layout_cache = Some((key_len, key_ptr, all_ev));
+        all_ev
+    }
+
+    /// Marks the cache directly when the caller already knows whether all entries are events.
+    #[inline]
+    pub(crate) fn set_all_events_cache(&mut self, all_ev: bool) {
+        self.layout_cache = Some((self.entries.len(), self.entries.as_ptr() as usize, all_ev));
+    }
+
+    /// Fast O(1) check using the cached `(len, ptr)` signature (returns `None` if cache is stale).
+    #[inline]
+    fn cached_all_events(&self) -> Option<bool> {
+        let (len, ptr, all_ev) = self.layout_cache?;
+        (len == self.entries.len() && ptr == self.entries.as_ptr() as usize).then_some(all_ev)
+    }
+
     /// Iterates over parsed `AssEvent` items.
     pub fn events(&self) -> impl Iterator<Item = &AssEvent> {
         self.entries.iter().filter_map(|e| match e {
@@ -844,6 +916,9 @@ impl EventsSection {
     /// Returns the number of `AssEvent` items.
     #[must_use]
     pub fn event_count(&self) -> usize {
+        if self.cached_all_events() == Some(true) {
+            return self.entries.len();
+        }
         self.entries
             .iter()
             .filter(|e| matches!(e, EventEntry::Event(_)))
@@ -853,6 +928,9 @@ impl EventsSection {
     /// Maps logical event index `idx` to its position in `self.entries`.
     #[must_use]
     pub fn entry_index_of_event(&self, idx: usize) -> Option<usize> {
+        if self.cached_all_events() == Some(true) {
+            return (idx < self.entries.len()).then_some(idx);
+        }
         if let Some(EventEntry::Event(_)) = self.entries.get(idx) {
             if self
                 .entries
@@ -881,33 +959,55 @@ impl EventsSection {
             })
     }
 
-    /// Gets a mutable event by logical event index.
+    /// Gets a mutable event by logical event index in O(1) when all entries are events.
     pub fn get_event_mut(&mut self, idx: usize) -> Option<&mut AssEvent> {
-        self.entry_index_of_event(idx)
-            .and_then(|i| match &mut self.entries[i] {
-                EventEntry::Event(ev) => Some(ev),
-                _ => None,
-            })
+        let entry_idx = if self.refresh_all_events_cache() {
+            (idx < self.entries.len()).then_some(idx)?
+        } else {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| matches!(e, EventEntry::Event(_)))
+                .nth(idx)
+                .map(|(i, _)| i)?
+        };
+        match &mut self.entries[entry_idx] {
+            EventEntry::Event(ev) => Some(ev),
+            _ => None,
+        }
     }
 
     /// Inserts an event at logical index `idx` (clamped to `event_count()`).
     pub fn insert_event(&mut self, idx: usize, event: AssEvent) {
-        let entry_pos = self.entry_index_of_event(idx).unwrap_or_else(|| {
-            self.entries
-                .iter()
-                .rposition(|e| !matches!(e, EventEntry::Blank))
-                .map_or(0, |i| i + 1)
-        });
+        let all_ev = self.refresh_all_events_cache();
+        let entry_pos = if all_ev {
+            idx.min(self.entries.len())
+        } else {
+            self.entry_index_of_event(idx).unwrap_or_else(|| {
+                self.entries
+                    .iter()
+                    .rposition(|e| !matches!(e, EventEntry::Blank))
+                    .map_or(0, |i| i + 1)
+            })
+        };
         self.entries.insert(entry_pos, EventEntry::Event(event));
+        self.set_all_events_cache(all_ev);
     }
 
     /// Removes and returns the event at logical index `idx`.
     pub fn remove_event(&mut self, idx: usize) -> Option<AssEvent> {
-        let entry_pos = self.entry_index_of_event(idx)?;
-        match self.entries.remove(entry_pos) {
+        let all_ev = self.refresh_all_events_cache();
+        let entry_pos = if all_ev {
+            (idx < self.entries.len()).then_some(idx)?
+        } else {
+            self.entry_index_of_event(idx)?
+        };
+        let removed = match self.entries.remove(entry_pos) {
             EventEntry::Event(ev) => Some(ev),
             _ => None,
-        }
+        };
+        self.set_all_events_cache(all_ev);
+        removed
     }
 
     /// Reorders parsed `AssEvent` entries in-place according to `order`, where `after[dst] = before[order[dst]]`.
@@ -968,6 +1068,7 @@ impl EventsSection {
                 cur = src;
             }
         }
+        self.set_all_events_cache(all_events);
         Ok(())
     }
 
@@ -1023,6 +1124,7 @@ impl EventsSection {
             w += 1;
         }
         self.entries.truncate(w);
+        self.set_all_events_cache(fast_all_events);
         Ok(())
     }
 
@@ -1090,6 +1192,7 @@ impl EventsSection {
             k += 1;
         }
         self.entries = merged;
+        self.set_all_events_cache(fast_all_events);
         Ok(())
     }
 }

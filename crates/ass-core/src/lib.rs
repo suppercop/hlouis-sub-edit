@@ -18,7 +18,7 @@ pub mod time;
 use thiserror::Error;
 
 pub use charset::{decode_bytes, DetectedEncoding};
-pub use history::{EditCommand, UndoHistory, DEFAULT_MAX_HISTORY_BYTES};
+pub use history::{EditCommand, EventTimeChange, UndoHistory, DEFAULT_MAX_HISTORY_BYTES};
 pub use model::{
     AssEvent, AssStyle, EventEntry, EventKind, EventsSection, KeyValueEntry, KeyValueSection,
     LineEnding, RawSection, ScriptFile, Section, StyleEntry, StylesSection,

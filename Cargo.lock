@@ -595,6 +595,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bestsource-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2238,6 +2245,7 @@ name = "hlouis-sub-edit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ass-core",
  "criterion",
  "dark-light",
  "eframe",
@@ -2249,6 +2257,7 @@ dependencies = [
  "media",
  "render",
  "rfd",
+ "settings",
  "wgpu",
  "windows-sys 0.61.2",
 ]
@@ -2784,9 +2793,11 @@ checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 name = "media"
 version = "0.1.0"
 dependencies = [
+ "bestsource-sys",
  "criterion",
  "ffms2-sys",
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

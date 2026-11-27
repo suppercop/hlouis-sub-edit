@@ -18,6 +18,7 @@ members = [
     "crates/i18n",
     "crates/libass-sys",
     "crates/ffms2-sys",
+    "crates/bestsource-sys",
     "crates/render",
     "crates/media",
     "crates/app-services",

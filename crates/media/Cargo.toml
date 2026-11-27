@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bestsource-sys = { path = "../bestsource-sys" }
 ffms2-sys = { path = "../ffms2-sys" }
 thiserror.workspace = true
+windows-sys.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

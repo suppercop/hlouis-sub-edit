@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ass-core = { path = "../ass-core" }
 dark-light.workspace = true
 eframe.workspace = true
 egui.workspace = true
@@ -16,6 +17,7 @@ i18n = { path = "../i18n" }
 media = { path = "../media" }
 render = { path = "../render" }
 rfd.workspace = true
+settings = { path = "../settings" }
 wgpu.workspace = true
 windows-sys.workspace = true
 

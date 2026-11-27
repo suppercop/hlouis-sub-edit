@@ -123,6 +123,35 @@ impl AssTime {
     /// Returns `None` if malformed.
     #[must_use]
     pub fn parse_ass(input: &str) -> Option<Self> {
+        Self::parse_ass_canonical(input).map(|(t, _)| t)
+    }
+
+    /// Parses an ASS timestamp and reports whether `input` was already canonical `H:MM:SS.cc`
+    /// without needing expensive recomposition checks in the parser hot path.
+    #[must_use]
+    pub(crate) fn parse_ass_canonical(input: &str) -> Option<(Self, bool)> {
+        let b_raw = input.as_bytes();
+        // Ultra-fast path for canonical unpadded `H:MM:SS.cc` (no trim needed).
+        if b_raw.len() == 10
+            && b_raw[1] == b':'
+            && b_raw[4] == b':'
+            && b_raw[7] == b'.'
+            && b_raw[0].is_ascii_digit()
+            && b_raw[2].is_ascii_digit()
+            && b_raw[3].is_ascii_digit()
+            && b_raw[5].is_ascii_digit()
+            && b_raw[6].is_ascii_digit()
+            && b_raw[8].is_ascii_digit()
+            && b_raw[9].is_ascii_digit()
+        {
+            let h = u32::from(b_raw[0] - b'0');
+            let m = u32::from(b_raw[2] - b'0') * 10 + u32::from(b_raw[3] - b'0');
+            let sec = u32::from(b_raw[5] - b'0') * 10 + u32::from(b_raw[6] - b'0');
+            let cs = u32::from(b_raw[8] - b'0') * 10 + u32::from(b_raw[9] - b'0');
+            let t = Self::from_hms_cs(h, m, sec, cs);
+            return Some((t, m < 60 && sec < 60));
+        }
+
         let s = input.trim();
         let mut parts = s.split(':');
         let h_str = parts.next()?;
@@ -146,7 +175,16 @@ impl AssTime {
             Some(f) => parse_centiseconds_fraction(f)?,
         };
 
-        Some(Self::from_hms_cs(hours, minutes, seconds, cs))
+        let t = Self::from_hms_cs(hours, minutes, seconds, cs);
+        let canonical = s.len() == input.len()
+            && hours >= 10
+            && minutes < 60
+            && seconds < 60
+            && frac_str.is_some_and(|f| f.len() == 2)
+            && m_str.len() == 2
+            && sec_str.len() == 2
+            && !h_str.starts_with('0');
+        Some((t, canonical))
     }
 
     /// Parses an SRT timestamp (`HH:MM:SS,mmm` or `HH:MM:SS.mmm`, also tolerating 1-2 digit ms).
@@ -192,10 +230,30 @@ impl AssTime {
     }
 
     /// Appends canonical ASS timestamp `H:MM:SS.cc` into `out` without intermediate allocations.
+    #[inline]
     pub fn write_ass(self, out: &mut String) {
-        use std::fmt::Write as _;
         let (h, m, s, cs) = self.to_hms_cs();
-        let _ = write!(out, "{h}:{m:02}:{s:02}.{cs:02}");
+        if h < 10 {
+            #[allow(clippy::cast_possible_truncation)]
+            let buf = [
+                b'0' + (h as u8),
+                b':',
+                b'0' + ((m / 10) as u8),
+                b'0' + ((m % 10) as u8),
+                b':',
+                b'0' + ((s / 10) as u8),
+                b'0' + ((s % 10) as u8),
+                b'.',
+                b'0' + ((cs / 10) as u8),
+                b'0' + ((cs % 10) as u8),
+            ];
+            if let Ok(ascii) = std::str::from_utf8(&buf) {
+                out.push_str(ascii);
+            }
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{h}:{m:02}:{s:02}.{cs:02}");
+        }
     }
 
     /// Formats as canonical SRT timestamp `HH:MM:SS,mmm`.

@@ -15,7 +15,7 @@ Full plan with rationale is kept by the project owner. This file is the scope ag
 - **Tools:** Find & Replace, Select Lines, Shift Times, Timing Post-Processor, framerate transform on export, snap to video frame.
 - **Karaoke:** `\k` tags, karaoke audio mode, Karaoke Templater (user-written templates) via LuaJIT + karaskel + bundled helper libs.
 - **Fonts:** check for missing fonts only.
-- **UI:** context hotkeys, toolbar/menu, layouts, preferences, Light/Dark/System theme, English + Vietnamese, High-DPI, log window, version check, scroll-modifier options.
+- **UI:** context hotkeys, toolbar/menu, layouts, preferences, Light/Dark/System theme, Eye comfort for all themes + a new Eye comfort theme (warm, blue-reduced, strength slider), see `docs/eye-comfort.md`, English + Vietnamese, High-DPI, log window, version check, scroll-modifier options.
 - **Providers from arch1t3cht fork:** BestSource, VapourSynth.
 
 ## Known Aegisub bug we must not repeat: MKV with many subtitle tracks
@@ -41,7 +41,7 @@ SSA, TTXT, MicroDVD, plain text, EBU STL, Encore, Transtation; open-with-charset
 ## Phases
 0. Spike & foundation (2–3 w) — see `docs/phase-0.md`
 1. Core data: ASS/SRT round-trip, charset, MKV subs, undo, autosave (3–4 w)
-2. Basic editor: grid, edit box, styles, script props, find/replace, select; i18n + theme framework (4–6 w) — Milestone A
+2. Basic editor: grid, edit box, styles, script props, find/replace, select; i18n + theme framework incl. Light/Dark/System/Eye comfort + CI contrast tests (4–6 w) — Milestone A
 3. Audio & timing (5–7 w) — Milestone B
 4. Video & keyframes incl. SCXvid; **BestSource as default video/audio provider, FFMS2 as fast-open fallback**, both behind the common `media` trait (6–8 w) — Milestone C
    - Includes FFMS2 on-disk index cache (Phase 1/4) and post-seek decode latency optimization (e.g., ~43 ms long-seek spikes).
