@@ -1040,6 +1040,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dialogs-model"
+version = "0.1.0"
+dependencies = [
+ "ass-tools",
+ "criterion",
+ "script-props",
+ "serde",
+ "serde_json",
+ "settings",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

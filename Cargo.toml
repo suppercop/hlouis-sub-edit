@@ -43,6 +43,7 @@ members = [
     "crates/frame-cache",
     "crates/perf-metrics",
     "crates/mkv-import",
+    "crates/dialogs-model",
 ]
 
 [workspace.package]
