@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/app",
     "crates/ass-core",
+    "crates/ass-tools",
     "crates/i18n",
     "crates/libass-sys",
     "crates/ffms2-sys",
