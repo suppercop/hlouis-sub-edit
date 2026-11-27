@@ -16,6 +16,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 dark-light = "3"
 eframe = "0.37.0"
 egui = "0.37.0"
@@ -41,3 +42,9 @@ cast_precision_loss = "allow"
 # Justification: Phase 0 spike and rendering loops return descriptive errors without exhaustive # Errors boilerplate on every internal helper.
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

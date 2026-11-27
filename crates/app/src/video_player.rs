@@ -187,6 +187,10 @@ impl Drop for VideoPlayerHandle {
     }
 }
 
+const MAX_QUEUED_FRAMES: usize = 3;
+const MAX_POOLED_BUFFERS_PLAYING: usize = 4;
+const MAX_POOLED_BUFFERS_PAUSED: usize = 1;
+
 struct WorkerState {
     video: Option<FfmsVideo>,
     renderer: Option<AssSubRenderer>,
@@ -204,6 +208,22 @@ enum AssContent {
 }
 
 impl WorkerState {
+    fn pool_cap(&self) -> usize {
+        if self.playing {
+            MAX_POOLED_BUFFERS_PLAYING
+        } else {
+            MAX_POOLED_BUFFERS_PAUSED
+        }
+    }
+
+    fn trim_pool(&mut self) {
+        let cap = self.pool_cap();
+        if self.buffer_pool.len() > cap {
+            self.buffer_pool.truncate(cap);
+            self.buffer_pool.shrink_to_fit();
+        }
+    }
+
     fn ensure_renderer(&mut self, width: u32, height: u32) -> Result<&mut AssSubRenderer, String> {
         if self.renderer.is_none() {
             let mut r = AssSubRenderer::new(width, height).map_err(|e| e.to_string())?;
@@ -329,13 +349,15 @@ fn worker_loop(
     };
 
     loop {
+        let cap = state.pool_cap();
         while let Ok(buf) = recycle_rx.try_recv() {
-            if state.buffer_pool.len() < 8 {
+            if state.buffer_pool.len() < cap {
                 state.buffer_pool.push(buf);
             }
         }
+        state.trim_pool();
         let cmd = if state.playing && state.video.is_some() {
-            if queued_frames.load(Ordering::Relaxed) < 4 {
+            if queued_frames.load(Ordering::Relaxed) < MAX_QUEUED_FRAMES {
                 match cmd_rx.try_recv() {
                     Ok(c) => Some(c),
                     Err(mpsc::TryRecvError::Empty) => None,
@@ -388,6 +410,7 @@ fn worker_loop(
                 0
             } else {
                 state.playing = false;
+                state.trim_pool();
                 let _ = evt_tx.send(PlayerEvent::PlaybackEnded);
                 ctx.request_repaint();
                 continue;
@@ -422,6 +445,8 @@ fn handle_open_video(
     ctx: &egui::Context,
 ) {
     state.playing = false;
+    state.buffer_pool.clear();
+    state.buffer_pool.shrink_to_fit();
     state.generation = state.generation.wrapping_add(1);
     if cancel.load(Ordering::Acquire) || open_id != latest_open_id.load(Ordering::Acquire) {
         if open_id == latest_open_id.load(Ordering::Acquire) {
@@ -485,6 +510,9 @@ fn handle_command(
         }
         PlayerCmd::SetPlaying(play) => {
             state.playing = play && state.video.is_some();
+            if !state.playing {
+                state.trim_pool();
+            }
         }
         PlayerCmd::OpenVideo {
             path,
@@ -503,24 +531,10 @@ fn handle_command(
             );
         }
         PlayerCmd::LoadAssMemory(text) => {
-            state.ass_script = AssContent::Memory(text);
-            if let Err(err) = state.reload_ass() {
-                let _ = evt_tx.send(PlayerEvent::AssError(err));
-            } else if state.video.is_some() && !state.playing {
-                state.generation = state.generation.wrapping_add(1);
-                emit_seek_frame(state, state.current_frame, evt_tx, queued_frames, ctx);
-            }
-            ctx.request_repaint();
+            reload_ass_and_emit(state, AssContent::Memory(text), evt_tx, queued_frames, ctx);
         }
         PlayerCmd::LoadAssFile(path) => {
-            state.ass_script = AssContent::File(path);
-            if let Err(err) = state.reload_ass() {
-                let _ = evt_tx.send(PlayerEvent::AssError(err));
-            } else if state.video.is_some() && !state.playing {
-                state.generation = state.generation.wrapping_add(1);
-                emit_seek_frame(state, state.current_frame, evt_tx, queued_frames, ctx);
-            }
-            ctx.request_repaint();
+            reload_ass_and_emit(state, AssContent::File(path), evt_tx, queued_frames, ctx);
         }
         PlayerCmd::SeekFrame(frame) => {
             if let Some(video) = state.video.as_ref() {
@@ -564,6 +578,23 @@ fn handle_command(
     true
 }
 
+fn reload_ass_and_emit(
+    state: &mut WorkerState,
+    content: AssContent,
+    evt_tx: &mpsc::Sender<PlayerEvent>,
+    queued_frames: &AtomicUsize,
+    ctx: &egui::Context,
+) {
+    state.ass_script = content;
+    if let Err(err) = state.reload_ass() {
+        let _ = evt_tx.send(PlayerEvent::AssError(err));
+    } else if state.video.is_some() && !state.playing {
+        state.generation = state.generation.wrapping_add(1);
+        emit_seek_frame(state, state.current_frame, evt_tx, queued_frames, ctx);
+    }
+    ctx.request_repaint();
+}
+
 fn emit_seek_frame(
     state: &mut WorkerState,
     target: usize,
@@ -581,6 +612,7 @@ fn emit_seek_frame(
             let _ = evt_tx.send(PlayerEvent::Error(err));
         }
     }
+    state.trim_pool();
     ctx.request_repaint();
 }
 

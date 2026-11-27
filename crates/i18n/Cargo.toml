@@ -9,5 +9,8 @@ fluent.workspace = true
 thiserror.workspace = true
 unic-langid.workspace = true
 
+[lib]
+bench = false
+
 [lints]
 workspace = true

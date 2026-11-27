@@ -32,7 +32,7 @@ pub struct RenderStats {
 }
 
 /// Borrowed descriptor for a single rasterized `ASS_Image` alpha mask.
-pub(crate) struct AssBitmap<'a> {
+pub struct AssBitmap<'a> {
     pub dst_x: i32,
     pub dst_y: i32,
     pub width: u32,
@@ -47,10 +47,10 @@ mod ffi {
     use super::{AssBitmap, RenderError, RenderStats};
     use libass_sys::{
         ass_free_track, ass_library_done, ass_library_init, ass_library_version, ass_read_memory,
-        ass_render_frame, ass_renderer_done, ass_renderer_init, ass_set_extract_fonts,
-        ass_set_fonts, ass_set_frame_size, ass_set_hinting, ass_set_message_cb, ass_set_shaper,
-        ass_set_storage_size, ASS_Library, ASS_Renderer, ASS_Track, ASS_FONTPROVIDER_AUTODETECT,
-        ASS_HINTING_NONE, ASS_SHAPING_COMPLEX,
+        ass_render_frame, ass_renderer_done, ass_renderer_init, ass_set_cache_limits,
+        ass_set_extract_fonts, ass_set_fonts, ass_set_frame_size, ass_set_hinting,
+        ass_set_message_cb, ass_set_shaper, ass_set_storage_size, ASS_Library, ASS_Renderer,
+        ASS_Track, ASS_FONTPROVIDER_AUTODETECT, ASS_HINTING_NONE, ASS_SHAPING_COMPLEX,
     };
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_longlong, c_void};
@@ -105,6 +105,7 @@ mod ffi {
                 ass_set_storage_size(renderer.as_ptr(), w, h);
                 ass_set_hinting(renderer.as_ptr(), ASS_HINTING_NONE);
                 ass_set_shaper(renderer.as_ptr(), ASS_SHAPING_COMPLEX);
+                ass_set_cache_limits(renderer.as_ptr(), 4096, 32);
                 ass_set_fonts(
                     renderer.as_ptr(),
                     ptr::null(),
@@ -301,6 +302,34 @@ impl AssSubRenderer {
         });
         Ok(stats)
     }
+}
+
+/// Alpha-blends a single 8-bit coverage `bitmap` onto tightly packed `frame_rgba`.
+pub fn blend_rgba_mask(
+    bitmap: &AssBitmap<'_>,
+    frame_rgba: &mut [u8],
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<(), RenderError> {
+    let expected = (frame_width as usize)
+        .saturating_mul(frame_height as usize)
+        .saturating_mul(4);
+    if frame_rgba.len() != expected {
+        return Err(RenderError::FrameSizeMismatch {
+            expected,
+            actual: frame_rgba.len(),
+        });
+    }
+    let needed_mask = bitmap.stride.saturating_mul(bitmap.height as usize);
+    if bitmap.width == 0
+        || bitmap.height == 0
+        || bitmap.stride < bitmap.width as usize
+        || bitmap.data.len() < needed_mask
+    {
+        return Ok(());
+    }
+    blend_bitmap_into_rgba(bitmap, frame_rgba, frame_width, frame_height);
+    Ok(())
 }
 
 pub(crate) fn blend_bitmap_into_rgba(

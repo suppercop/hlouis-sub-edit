@@ -38,6 +38,7 @@ SSA, TTXT, MicroDVD, plain text, EBU STL, Encore, Transtation; open-with-charset
 2. Basic editor: grid, edit box, styles, script props, find/replace, select; i18n + theme framework (4–6 w) — Milestone A
 3. Audio & timing (5–7 w) — Milestone B
 4. Video & keyframes incl. SCXvid; **BestSource as default video/audio provider, FFMS2 as fast-open fallback**, both behind the common `media` trait (6–8 w) — Milestone C
+   - Includes FFMS2 on-disk index cache (Phase 1/4) and post-seek decode latency optimization (e.g., ~43 ms long-seek spikes).
 5. Typesetting tools, resample, Align to Video (5–6 w)
 6. Karaoke Templater (2–3 w)
 7. VapourSynth/Avisynth, fonts check, prefs/hotkeys polish, Windows installer (3–5 w)
