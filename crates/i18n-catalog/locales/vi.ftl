@@ -6,6 +6,7 @@ menu-subtitle = Phụ đề
 menu-timing = Thời gian
 menu-video = Video
 menu-audio = Âm thanh
+menu-automation = Tự động hóa
 menu-view = Hiển thị
 menu-help = Trợ giúp
 menu-file-new = Tạo phụ đề mới

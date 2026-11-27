@@ -6,6 +6,7 @@ menu-subtitle = Subtitle
 menu-timing = Timing
 menu-video = Video
 menu-audio = Audio
+menu-automation = Automation
 menu-view = View
 menu-help = Help
 menu-file-new = New Subtitles
