@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use ass_core::ScriptFile;
+use ass_core::{EditCommand, ScriptFile};
 use thiserror::Error;
 
 /// Errors returned by `script-props`.
@@ -17,6 +17,9 @@ pub enum ScriptPropsError {
     /// Script has no `[Script Info]` section.
     #[error("script has no [Script Info] section")]
     MissingScriptInfo,
+    /// Underlying `ass-core` edit failed.
+    #[error("ass-core edit failed: {0}")]
+    Core(String),
 }
 
 /// ASS `WrapStyle` (`0..=3`, matches libass / Aegisub `src/dialog_properties.cpp`).
@@ -317,32 +320,53 @@ pub struct ScriptInfoEdit {
 }
 
 impl ScriptInfoEdit {
-    /// Applies all changes forward to `script`.
+    /// Converts this edit into an undoable [`ass_core::EditCommand`] (a `Batch` of
+    /// `SetScriptInfo`), so header edits go through the normal undo/redo history.
+    ///
+    /// Returns `None` when there is nothing to change.
+    #[must_use]
+    pub fn to_command(&self) -> Option<EditCommand> {
+        if self.changes.is_empty() {
+            return None;
+        }
+        let cmds: Vec<EditCommand> = self
+            .changes
+            .iter()
+            .map(|ch| EditCommand::SetScriptInfo {
+                key: ch.key.to_owned(),
+                before: ch.before.clone(),
+                after: Some(ch.after.clone()),
+            })
+            .collect();
+        Some(EditCommand::Batch(cmds))
+    }
+
+    /// Applies all changes forward to `script` via [`EditCommand::SetScriptInfo`].
     ///
     /// # Errors
     /// Returns [`ScriptPropsError::MissingScriptInfo`] if `[Script Info]` is absent.
     pub fn apply(&self, script: &mut ScriptFile) -> Result<(), ScriptPropsError> {
-        let info = script
-            .script_info_mut()
-            .ok_or(ScriptPropsError::MissingScriptInfo)?;
-        for ch in &self.changes {
-            info.set(ch.key, ch.after.clone());
+        if script.script_info().is_none() {
+            return Err(ScriptPropsError::MissingScriptInfo);
+        }
+        if let Some(cmd) = self.to_command() {
+            cmd.apply(script)
+                .map_err(|e| ScriptPropsError::Core(e.to_string()))?;
         }
         Ok(())
     }
 
-    /// Reverts all changes back to their prior values.
+    /// Reverts all changes back to their prior values (keys that did not exist are removed).
     ///
     /// # Errors
     /// Returns [`ScriptPropsError::MissingScriptInfo`] if `[Script Info]` is absent.
     pub fn revert(&self, script: &mut ScriptFile) -> Result<(), ScriptPropsError> {
-        let info = script
-            .script_info_mut()
-            .ok_or(ScriptPropsError::MissingScriptInfo)?;
-        for ch in self.changes.iter().rev() {
-            if let Some(ref old) = ch.before {
-                info.set(ch.key, old.clone());
-            }
+        if script.script_info().is_none() {
+            return Err(ScriptPropsError::MissingScriptInfo);
+        }
+        if let Some(cmd) = self.to_command() {
+            cmd.revert(script)
+                .map_err(|e| ScriptPropsError::Core(e.to_string()))?;
         }
         Ok(())
     }
@@ -486,5 +510,34 @@ mod tests {
 
         edit.revert(&mut script).expect("revert");
         assert_eq!(ScriptProperties::from_script(&script).play_res_x, 1280);
+    }
+
+    #[test]
+    fn edit_goes_through_undo_history() {
+        let mut script = ass_core::parse_ass(
+            "[Script Info]
+Title: Old
+PlayResX: 1280
+PlayResY: 720
+",
+        )
+        .value;
+        let mut props = ScriptProperties::from_script(&script);
+        props.set_from_video(1920, 1080);
+        props.kerning = true;
+        let edit = props.build_edit(&script).expect("edit");
+        let cmd = edit.to_command().expect("changes");
+        let mut history = ass_core::UndoHistory::default();
+        history.execute(&mut script, cmd).expect("execute");
+        assert_eq!(ScriptProperties::from_script(&script).play_res_x, 1920);
+        assert!(history.undo(&mut script).expect("undo"));
+        let after_undo = ScriptProperties::from_script(&script);
+        assert_eq!(after_undo.play_res_x, 1280);
+        assert!(!after_undo.kerning);
+        assert!(script
+            .script_info()
+            .is_some_and(|i| i.get("Kerning").is_none()));
+        assert!(history.redo(&mut script).expect("redo"));
+        assert_eq!(ScriptProperties::from_script(&script).play_res_x, 1920);
     }
 }
