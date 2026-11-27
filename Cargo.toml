@@ -39,6 +39,7 @@ members = [
     "crates/edit-box-ops",
     "crates/syntax-highlight",
     "crates/document",
+    "crates/playback",
 ]
 
 [workspace.package]
