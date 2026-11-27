@@ -1,0 +1,26 @@
+[package]
+name = "ui-video"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+egui = { workspace = true, features = ["default_fonts"] }
+i18n-catalog = { path = "../i18n-catalog" }
+playback = { path = "../playback" }
+theme = { path = "../theme" }
+ui-theme = { path = "../ui-theme" }
+video-geometry = { path = "../video-geometry" }
+visual-tools = { path = "../visual-tools" }
+
+[dev-dependencies]
+criterion = "0.5"
+egui_kittest = "0.37.0"
+keyframes = { path = "../keyframes" }
+
+[[bench]]
+name = "ui_video"
+harness = false
