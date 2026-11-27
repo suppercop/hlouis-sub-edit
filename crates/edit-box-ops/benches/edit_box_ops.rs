@@ -29,7 +29,7 @@ fn bench_edit_box_ops(c: &mut Criterion) {
 
     c.bench_function("edit_box_ops_toggle_bold_2000_char", |b| {
         b.iter(|| {
-            let res = toggle_bold(black_box(&line), sel, None);
+            let res = toggle_bold(black_box(&line), sel, "Default", &[]);
             black_box(res);
         });
     });

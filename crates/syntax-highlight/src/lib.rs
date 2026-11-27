@@ -335,6 +335,7 @@ fn tokenize_slice_with_state(
     in_drawing
 }
 
+#[allow(clippy::too_many_lines)]
 fn tokenize_override_body(
     body: &[u8],
     base: usize,
@@ -413,18 +414,76 @@ fn tokenize_override_body(
 
             if name_end < tag_end {
                 let arg_slice = &body[name_end..tag_end];
-                // Vector `\clip(m ...)` / `\iclip(scale, m ...)` highlights drawing payload as DrawingCommand.
-                let val_kind = if is_clip_tag && is_vector_clip_arg(arg_slice) {
-                    TokenKind::DrawingCommand
+                let is_t_tag = name_len == 1 && raw_tag[0] == b't';
+                if is_t_tag && arg_slice.starts_with(b"(") && arg_slice.ends_with(b")") {
+                    // Recursively tokenize tags inside `\t([t1,t2,[accel,]]\tag1\tag2...)`.
+                    let inner = &arg_slice[1..arg_slice.len() - 1];
+                    let inner_base = base + name_end + 1;
+                    if let Some(first_bs) = inner.iter().position(|&c| c == b'\\') {
+                        // Emit `(` + timing/accel prefix up to first `\` as TagValue.
+                        out.push(TokenSpan {
+                            start: base + name_end,
+                            end: inner_base + first_bs,
+                            kind: TokenKind::TagValue,
+                            drawing_after: *in_drawing,
+                        });
+                        tokenize_override_body(
+                            &inner[first_bs..],
+                            inner_base + first_bs,
+                            in_drawing,
+                            out,
+                        );
+                        // Closing `)` as TagValue.
+                        out.push(TokenSpan {
+                            start: base + tag_end - 1,
+                            end: base + tag_end,
+                            kind: TokenKind::TagValue,
+                            drawing_after: *in_drawing,
+                        });
+                    } else {
+                        out.push(TokenSpan {
+                            start: base + name_end,
+                            end: base + tag_end,
+                            kind: TokenKind::TagValue,
+                            drawing_after: *in_drawing,
+                        });
+                    }
+                } else if is_clip_tag
+                    && is_vector_clip_arg(arg_slice)
+                    && arg_slice.starts_with(b"(")
+                    && arg_slice.ends_with(b")")
+                {
+                    // Emit `(` (plus optional `scale,`) as TagValue, drawing payload as DrawingCommand, `)` as TagValue.
+                    let inner = &arg_slice[1..arg_slice.len() - 1];
+                    let draw_rel = inner.iter().position(|&c| c == b',').map_or(0, |c| c + 1);
+                    out.push(TokenSpan {
+                        start: base + name_end,
+                        end: base + name_end + 1 + draw_rel,
+                        kind: TokenKind::TagValue,
+                        drawing_after: *in_drawing,
+                    });
+                    if 1 + draw_rel < arg_slice.len() - 1 {
+                        out.push(TokenSpan {
+                            start: base + name_end + 1 + draw_rel,
+                            end: base + tag_end - 1,
+                            kind: TokenKind::DrawingCommand,
+                            drawing_after: *in_drawing,
+                        });
+                    }
+                    out.push(TokenSpan {
+                        start: base + tag_end - 1,
+                        end: base + tag_end,
+                        kind: TokenKind::TagValue,
+                        drawing_after: *in_drawing,
+                    });
                 } else {
-                    TokenKind::TagValue
-                };
-                out.push(TokenSpan {
-                    start: base + name_end,
-                    end: base + tag_end,
-                    kind: val_kind,
-                    drawing_after: *in_drawing,
-                });
+                    out.push(TokenSpan {
+                        start: base + name_end,
+                        end: base + tag_end,
+                        kind: TokenKind::TagValue,
+                        drawing_after: *in_drawing,
+                    });
+                }
             }
         } else {
             out.push(TokenSpan {
@@ -636,10 +695,9 @@ mod tests {
                 .any(|t| t.kind == TokenKind::DrawingCommand
                     && &line[t.start..t.end] == "m 0 0 l 5 5")
         );
-        assert!(toks
-            .iter()
-            .any(|t| t.kind == TokenKind::DrawingCommand
-                && &line[t.start..t.end] == "(m 0 0 l 10 10)"));
+        assert!(toks.iter().any(
+            |t| t.kind == TokenKind::DrawingCommand && &line[t.start..t.end] == "m 0 0 l 10 10"
+        ));
         assert!(toks
             .iter()
             .any(|t| t.kind == TokenKind::Error && &line[t.start..t.end] == r"\bogus"));
@@ -667,6 +725,27 @@ mod tests {
         edited2.replace_range(p1_pos..=p1_pos, "0");
         inc.re_tokenize_edit(&edited2, p1_pos, p1_pos + 1, p1_pos + 1);
         assert_eq!(inc.tokens(), tokenize(&edited2).as_slice());
+    }
+
+    #[test]
+    fn tokenizes_tags_recursively_inside_t_transform() {
+        let line = r"{\t(0,500,\fs60\1c&H00FF00&\clip(m 0 0 l 20 20))}Hi";
+        let toks = tokenize(line);
+        assert!(toks
+            .iter()
+            .any(|t| t.kind == TokenKind::TagName && &line[t.start..t.end] == r"\t"));
+        assert!(toks
+            .iter()
+            .any(|t| t.kind == TokenKind::TagName && &line[t.start..t.end] == r"\fs"));
+        assert!(toks
+            .iter()
+            .any(|t| t.kind == TokenKind::TagValue && &line[t.start..t.end] == "60"));
+        assert!(toks
+            .iter()
+            .any(|t| t.kind == TokenKind::TagName && &line[t.start..t.end] == r"\1c"));
+        assert!(toks.iter().any(
+            |t| t.kind == TokenKind::DrawingCommand && &line[t.start..t.end] == "m 0 0 l 20 20"
+        ));
     }
 
     #[test]

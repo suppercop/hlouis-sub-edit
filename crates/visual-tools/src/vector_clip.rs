@@ -38,6 +38,12 @@ pub enum VectorVertexKind {
     BezierCtrl2,
     /// Cubic bezier endpoint (third pair of `b`).
     BezierEnd,
+    /// Cubic B-spline control point (`s x1 y1 x2 y2 x3 y3 ...`).
+    Spline,
+    /// Extended B-spline control point (`p x y`).
+    SplineExtend,
+    /// Closes an open B-spline (`c` — no coordinates, `pos` unused).
+    SplineClose,
 }
 
 /// A single editable vertex in a vector clip path.
@@ -53,6 +59,8 @@ pub struct VectorClipPath {
     pub inverted: bool,
     pub scale: u32,
     pub vertices: Vec<VectorVertex>,
+    /// Preserved verbatim input payload so untouched clips round-trip byte-identically.
+    raw_original: Option<String>,
 }
 
 impl VectorClipPath {
@@ -77,7 +85,15 @@ impl VectorClipPath {
         while let Some(tok) = tokens.next() {
             if tok.len() == 1 {
                 let c = tok.as_bytes()[0].to_ascii_lowercase() as char;
-                if matches!(c, 'm' | 'n' | 'l' | 'b' | 's' | 'p' | 'c') {
+                if c == 'c' {
+                    vertices.push(VectorVertex {
+                        kind: VectorVertexKind::SplineClose,
+                        pos: Vec2::new(0.0, 0.0),
+                    });
+                    cmd = 'c';
+                    continue;
+                }
+                if matches!(c, 'm' | 'n' | 'l' | 'b' | 's' | 'p') {
                     cmd = c;
                     continue;
                 }
@@ -132,6 +148,18 @@ impl VectorClipPath {
                         pos: Vec2::new(x3, y3),
                     });
                 }
+                's' => {
+                    vertices.push(VectorVertex {
+                        kind: VectorVertexKind::Spline,
+                        pos: Vec2::new(x, y),
+                    });
+                }
+                'p' => {
+                    vertices.push(VectorVertex {
+                        kind: VectorVertexKind::SplineExtend,
+                        pos: Vec2::new(x, y),
+                    });
+                }
                 _ => {}
             }
         }
@@ -140,6 +168,7 @@ impl VectorClipPath {
             inverted,
             scale,
             vertices,
+            raw_original: Some(payload.to_owned()),
         }
     }
 
@@ -151,6 +180,9 @@ impl VectorClipPath {
         let mut best_d2 = radius * radius;
         let mut best_idx = None;
         for (i, v) in self.vertices.iter().enumerate() {
+            if v.kind == VectorVertexKind::SplineClose {
+                continue;
+            }
             let dx = v.pos.x - query.x;
             let dy = v.pos.y - query.y;
             let d2 = dx * dx + dy * dy;
@@ -167,6 +199,7 @@ impl VectorClipPath {
     pub fn drag_vertex(&mut self, index: usize, new_pos: Vec2) {
         if let Some(v) = self.vertices.get_mut(index) {
             v.pos = new_pos;
+            self.raw_original = None;
         }
     }
 
@@ -178,6 +211,7 @@ impl VectorClipPath {
             VectorVertexKind::Line
         };
         self.vertices.push(VectorVertex { kind, pos });
+        self.raw_original = None;
     }
 
     /// Appends a cubic bezier segment from the previous vertex to `end_pos` with 1/3 & 2/3
@@ -210,6 +244,7 @@ impl VectorClipPath {
             kind: VectorVertexKind::BezierEnd,
             pos: end_pos,
         });
+        self.raw_original = None;
     }
 
     /// Converts a `Line` vertex at `index` into a cubic bezier (`Ctrl1, Ctrl2, End`), or a
@@ -245,6 +280,7 @@ impl VectorClipPath {
                         pos: c1,
                     },
                 );
+                self.raw_original = None;
                 true
             }
             VectorVertexKind::BezierEnd if index >= 2 => {
@@ -253,6 +289,7 @@ impl VectorClipPath {
                 {
                     self.vertices[index].kind = VectorVertexKind::Line;
                     self.vertices.drain(index - 2..index);
+                    self.raw_original = None;
                     return true;
                 }
                 false
@@ -292,6 +329,7 @@ impl VectorClipPath {
                     pos,
                 },
             );
+            self.raw_original = None;
         }
         best_i
     }
@@ -308,6 +346,7 @@ impl VectorClipPath {
                     && self.vertices[index - 2].kind == VectorVertexKind::BezierCtrl1 =>
             {
                 self.vertices.drain(index - 2..=index);
+                self.raw_original = None;
                 true
             }
             VectorVertexKind::BezierCtrl1 | VectorVertexKind::BezierCtrl2 => false,
@@ -316,6 +355,7 @@ impl VectorClipPath {
                 if index == 0 && !self.vertices.is_empty() {
                     self.vertices[0].kind = VectorVertexKind::Move;
                 }
+                self.raw_original = None;
                 true
             }
         }
@@ -335,6 +375,7 @@ impl VectorClipPath {
         if simplified.is_empty() {
             return;
         }
+        self.raw_original = None;
         self.vertices.push(VectorVertex {
             kind: VectorVertexKind::Move,
             pos: simplified[0],
@@ -375,6 +416,11 @@ impl VectorClipPath {
     pub fn write_tag_into(&self, out: &mut String) {
         out.clear();
         out.push_str(if self.inverted { r"\iclip(" } else { r"\clip(" });
+        if let Some(ref raw) = self.raw_original {
+            out.push_str(raw);
+            out.push(')');
+            return;
+        }
         if self.scale > 1 {
             let _ = write!(out, "{},", self.scale);
         }
@@ -418,6 +464,27 @@ impl VectorClipPath {
                         round_i32(end.y),
                     );
                     i += 3;
+                }
+                VectorVertexKind::Spline => {
+                    if last_cmd != 's' {
+                        out.push_str(" s");
+                        last_cmd = 's';
+                    }
+                    let _ = write!(out, " {} {}", round_i32(v.pos.x), round_i32(v.pos.y));
+                    i += 1;
+                }
+                VectorVertexKind::SplineExtend => {
+                    if last_cmd != 'p' {
+                        out.push_str(" p");
+                        last_cmd = 'p';
+                    }
+                    let _ = write!(out, " {} {}", round_i32(v.pos.x), round_i32(v.pos.y));
+                    i += 1;
+                }
+                VectorVertexKind::SplineClose => {
+                    out.push_str(" c");
+                    last_cmd = 'c';
+                    i += 1;
                 }
                 _ => {
                     i += 1;

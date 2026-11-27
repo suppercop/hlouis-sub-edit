@@ -388,6 +388,96 @@ pub fn build_multi_line_drag_command(
     EditCommand::Batch(cmds)
 }
 
+/// Parsed `\move(x1,y1,x2,y2[,t1,t2])` tag from an ASS event's text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoveTag {
+    pub p1: Vec2,
+    pub p2: Vec2,
+    pub t1: Option<i64>,
+    pub t2: Option<i64>,
+}
+
+/// Parses the first `\move(x1,y1,x2,y2[,t1,t2])` tag from `text` (mirrors Aegisub
+/// `VisualToolDrag::OnRefresh` in `src/visual_tool_drag.cpp`).
+#[must_use]
+pub fn parse_move_tag(text: &str) -> Option<MoveTag> {
+    let bytes = text.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let rel_open = bytes[pos..].iter().position(|&b| b == b'{')?;
+        let b_start = pos + rel_open + 1;
+        let rel_close = bytes[b_start..].iter().position(|&b| b == b'}')?;
+        let body = &text[b_start..b_start + rel_close];
+        if let Some((s, e)) = find_tag_span(body, "move") {
+            let tag = &body[s + 1..e];
+            if let Some(inner) = tag.strip_prefix("move(").and_then(|r| r.strip_suffix(')')) {
+                let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+                if parts.len() == 4 || parts.len() == 6 {
+                    let x1 = parts[0].parse::<f64>().ok()?;
+                    let y1 = parts[1].parse::<f64>().ok()?;
+                    let x2 = parts[2].parse::<f64>().ok()?;
+                    let y2 = parts[3].parse::<f64>().ok()?;
+                    let (t1, t2) = if parts.len() == 6 {
+                        (parts[4].parse::<i64>().ok(), parts[5].parse::<i64>().ok())
+                    } else {
+                        (None, None)
+                    };
+                    return Some(MoveTag {
+                        p1: Vec2::new(x1, y1),
+                        p2: Vec2::new(x2, y2),
+                        t1,
+                        t2,
+                    });
+                }
+            }
+        }
+        pos = b_start + rel_close + 1;
+    }
+    None
+}
+
+/// Updates a line's `\move` tag during drag (Shift = drag second point `p2`, otherwise drag
+/// `p1` or both by `delta`, matching Aegisub `VisualToolDrag::UpdateDrag`).
+#[must_use]
+pub fn drag_move_tag(
+    line_index: usize,
+    event: &AssEvent,
+    delta: Vec2,
+    mods: Modifiers,
+) -> Option<EditCommand> {
+    let mut mv = parse_move_tag(event.text())?;
+    if mods.shift {
+        mv.p2.x = ((mv.p2.x + delta.x) * 100.0).round() / 100.0;
+        mv.p2.y = ((mv.p2.y + delta.y) * 100.0).round() / 100.0;
+    } else {
+        mv.p1.x = ((mv.p1.x + delta.x) * 100.0).round() / 100.0;
+        mv.p1.y = ((mv.p1.y + delta.y) * 100.0).round() / 100.0;
+    }
+    let mut tag = String::with_capacity(48);
+    if let (Some(t1), Some(t2)) = (mv.t1, mv.t2) {
+        let _ = write!(
+            tag,
+            "\\move({},{},{},{},{t1},{t2})",
+            mv.p1.x, mv.p1.y, mv.p2.x, mv.p2.y
+        );
+    } else {
+        let _ = write!(
+            tag,
+            "\\move({},{},{},{})",
+            mv.p1.x, mv.p1.y, mv.p2.x, mv.p2.y
+        );
+    }
+    let after = upsert_leading_tag(event.text(), "move", &tag);
+    if after == event.text() {
+        return None;
+    }
+    Some(EditCommand::ModifyEventText {
+        index: line_index,
+        before: event.text().to_owned(),
+        after,
+    })
+}
+
 fn find_tag_span(body: &str, name: &str) -> Option<(usize, usize)> {
     let bytes = body.as_bytes();
     let target = name.as_bytes();
@@ -496,6 +586,52 @@ mod tests {
             }
             _ => panic!("expected batch"),
         }
+    }
+
+    #[test]
+    fn vector_clip_preserves_bspline_spc_and_roundtrips_byte_identically() {
+        let payload = "m 0 0 s 10 20 30 40 50 60 p 70 80 c";
+        let mut path = VectorClipPath::parse(payload, false);
+        let mut tag = String::new();
+        path.write_tag_into(&mut tag);
+        // Untouched clip round-trips byte-identically
+        assert_eq!(tag, format!(r"\clip({payload})"));
+
+        // Dragging a B-spline control point edits it without dropping s/p/c
+        let s_idx = path
+            .hit_test_vertex(Vec2::new(10.0, 20.0), 3.0)
+            .expect("hit s");
+        path.drag_vertex(s_idx, Vec2::new(15.0, 25.0));
+        path.write_tag_into(&mut tag);
+        assert_eq!(tag, r"\clip(m 0 0 s 15 25 30 40 50 60 p 70 80 c)");
+    }
+
+    #[test]
+    fn move_tag_parse_and_shift_second_point_drag() {
+        let ev = AssEvent::dialogue(
+            AssTime::from_cs(0),
+            AssTime::from_cs(100),
+            r"{\move(10,20,100,200,0,500)}Hi",
+        );
+        let mv = parse_move_tag(ev.text()).expect("move");
+        assert_eq!(mv.p1, Vec2::new(10.0, 20.0));
+        assert_eq!(mv.p2, Vec2::new(100.0, 200.0));
+        assert_eq!((mv.t1, mv.t2), (Some(0), Some(500)));
+
+        let cmd = drag_move_tag(
+            0,
+            &ev,
+            Vec2::new(25.0, -10.0),
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        )
+        .expect("cmd");
+        assert!(matches!(
+            cmd,
+            EditCommand::ModifyEventText { after, .. } if after == r"{\move(10,20,125,190,0,500)}Hi"
+        ));
     }
 
     #[test]

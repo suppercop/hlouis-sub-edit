@@ -131,14 +131,17 @@ impl EffectiveStyleState {
     }
 }
 
-/// Computes the effective style state at byte position `byte_pos` by scanning override blocks
-/// strictly before (or enclosing) `byte_pos`.
+/// Computes the effective style state at `byte_pos`, resolving both bare `\r` (back to
+/// `active_style_name`) and named `\rStyleName` against the script's full `styles` table
+/// (mirrors Aegisub `SubsEditBox` / `AssDialogueBlockOverride`).
 #[must_use]
 pub fn effective_state_at(
     text: &str,
-    base_style: Option<&AssStyle>,
+    active_style_name: &str,
+    styles: &[AssStyle],
     byte_pos: usize,
 ) -> EffectiveStyleState {
+    let base_style = styles.iter().find(|s| s.name() == active_style_name);
     let mut state = EffectiveStyleState::from_style(base_style);
     let limit = byte_pos.min(text.len());
     let bytes = text.as_bytes();
@@ -153,9 +156,8 @@ pub fn effective_state_at(
             break;
         };
         let block_end = block_start + rel_close;
-        // Scan tags inside this block up to `limit.min(block_end)`.
         let scan_end = limit.min(block_end);
-        apply_override_block_to_state(&text[block_start..scan_end], base_style, &mut state);
+        apply_override_block_to_state(&text[block_start..scan_end], base_style, styles, &mut state);
         pos = block_end + 1;
     }
 
@@ -165,6 +167,7 @@ pub fn effective_state_at(
 fn apply_override_block_to_state(
     block: &str,
     base_style: Option<&AssStyle>,
+    styles: &[AssStyle],
     state: &mut EffectiveStyleState,
 ) {
     let bytes = block.as_bytes();
@@ -246,8 +249,13 @@ fn apply_override_block_to_state(
                     state.strikeout = v != 0;
                 }
             }
-        } else if tag == "r" {
-            *state = EffectiveStyleState::from_style(base_style);
+        } else if let Some(rest) = tag.strip_prefix('r') {
+            if rest.is_empty() {
+                *state = EffectiveStyleState::from_style(base_style);
+            } else {
+                let target = styles.iter().find(|s| s.name() == rest).or(base_style);
+                *state = EffectiveStyleState::from_style(target);
+            }
         }
         i = j;
     }
@@ -284,10 +292,11 @@ pub fn set_tag(
 pub fn toggle_bold(
     text: &str,
     selection: TextSelection,
-    base_style: Option<&AssStyle>,
+    active_style_name: &str,
+    styles: &[AssStyle],
 ) -> TextEditResult {
     let sel = TextSelection::clamped(selection.start, selection.end, text);
-    let cur = effective_state_at(text, base_style, sel.start).bold;
+    let cur = effective_state_at(text, active_style_name, styles, sel.start).bold;
     toggle_binary_tag(text, sel, "b", cur)
 }
 
@@ -296,10 +305,11 @@ pub fn toggle_bold(
 pub fn toggle_italic(
     text: &str,
     selection: TextSelection,
-    base_style: Option<&AssStyle>,
+    active_style_name: &str,
+    styles: &[AssStyle],
 ) -> TextEditResult {
     let sel = TextSelection::clamped(selection.start, selection.end, text);
-    let cur = effective_state_at(text, base_style, sel.start).italic;
+    let cur = effective_state_at(text, active_style_name, styles, sel.start).italic;
     toggle_binary_tag(text, sel, "i", cur)
 }
 
@@ -308,10 +318,11 @@ pub fn toggle_italic(
 pub fn toggle_underline(
     text: &str,
     selection: TextSelection,
-    base_style: Option<&AssStyle>,
+    active_style_name: &str,
+    styles: &[AssStyle],
 ) -> TextEditResult {
     let sel = TextSelection::clamped(selection.start, selection.end, text);
-    let cur = effective_state_at(text, base_style, sel.start).underline;
+    let cur = effective_state_at(text, active_style_name, styles, sel.start).underline;
     toggle_binary_tag(text, sel, "u", cur)
 }
 
@@ -320,10 +331,11 @@ pub fn toggle_underline(
 pub fn toggle_strikeout(
     text: &str,
     selection: TextSelection,
-    base_style: Option<&AssStyle>,
+    active_style_name: &str,
+    styles: &[AssStyle],
 ) -> TextEditResult {
     let sel = TextSelection::clamped(selection.start, selection.end, text);
-    let cur = effective_state_at(text, base_style, sel.start).strikeout;
+    let cur = effective_state_at(text, active_style_name, styles, sel.start).strikeout;
     toggle_binary_tag(text, sel, "s", cur)
 }
 
@@ -771,11 +783,21 @@ mod tests {
     fn toggle_bold_respects_style_and_merges_existing_override_block() {
         let st = bold_style();
         // Style is already bold -> toggling bold writes \b0!
-        let r1 = toggle_bold(r"{\an8}Hello", TextSelection::caret(6), Some(&st));
+        let r1 = toggle_bold(
+            r"{\an8}Hello",
+            TextSelection::caret(6),
+            "BoldDef",
+            std::slice::from_ref(&st),
+        );
         assert_eq!(r1.text, r"{\an8\b0}Hello");
 
         // Selection wrap toggles bold off over "Hello" and restores \b1 after
-        let r2 = toggle_bold("Hello world", TextSelection { start: 0, end: 5 }, Some(&st));
+        let r2 = toggle_bold(
+            "Hello world",
+            TextSelection { start: 0, end: 5 },
+            "BoldDef",
+            std::slice::from_ref(&st),
+        );
         assert_eq!(r2.text, r"{\b0}Hello{\b1} world");
 
         // Color & alignment
@@ -783,6 +805,19 @@ mod tests {
         assert!(r3.text.starts_with(r"{\1c&H332211&}"));
         let r4 = set_alignment(&r3.text, TextSelection::caret(0), 8).expect("an");
         assert!(r4.text.contains(r"\an8"));
+    }
+
+    #[test]
+    fn resolves_named_r_style_reset_against_full_style_table() {
+        let raw = "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Plain,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\nStyle: Strong,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n";
+        let styles: Vec<AssStyle> = ass_core::parse_ass(raw).value.styles().cloned().collect();
+        let line = r"Hello {\rStrong}BoldWord{\r}PlainAgain";
+        let pos_in_strong = line.find("BoldWord").expect("pos");
+        assert!(effective_state_at(line, "Plain", &styles, pos_in_strong).bold);
+        let toggled = toggle_bold(line, TextSelection::caret(pos_in_strong), "Plain", &styles);
+        assert!(toggled.text.contains(r"{\rStrong\b0}BoldWord"));
+        let pos_after_reset = line.find("PlainAgain").expect("pos2");
+        assert!(!effective_state_at(line, "Plain", &styles, pos_after_reset).bold);
     }
 
     #[test]
