@@ -5139,6 +5139,8 @@ dependencies = [
  "i18n-catalog",
  "keyframes",
  "layout",
+ "mkv-import",
+ "mkv-subs",
  "perf-metrics",
  "playback",
  "png 0.17.16",
@@ -5149,6 +5151,8 @@ dependencies = [
  "ui-dialogs",
  "ui-editbox",
  "ui-grid",
+ "ui-mkv-import",
+ "ui-preferences",
  "ui-theme",
  "ui-video",
 ]
