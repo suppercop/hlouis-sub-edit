@@ -1508,10 +1508,12 @@ mod tests {
         let ctx = egui::Context::default();
         let mut grid = GridState::generate(50_000);
         let palette = ThemePalette::dark();
-        let start = Instant::now();
         let frames = 120usize;
+        let warmup = 5usize;
+        let mut frame_ms = Vec::with_capacity(frames);
 
         for frame_idx in 0..frames {
+            let frame_start = Instant::now();
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0))),
                 events: if frame_idx > 0 {
@@ -1539,12 +1541,23 @@ mod tests {
                 );
             });
             out.textures_delta.clear();
+            if frame_idx >= warmup {
+                frame_ms.push(frame_start.elapsed().as_secs_f64() * 1000.0);
+            }
         }
-        let avg_ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
-        println!("[bench] 50k virtualized grid avg frame time over {frames} scroll frames: {avg_ms:.3} ms");
+        // Frames 0..warmup build the font atlas and table layout once; they are
+        // excluded so the check measures steady-state scrolling. The median is
+        // used instead of the mean so one preempted frame on a shared CI runner
+        // cannot fail the test; the release-mode Criterion bench gates regressions.
+        frame_ms.sort_by(f64::total_cmp);
+        let median_ms = frame_ms[frame_ms.len() / 2];
+        println!(
+            "[bench] 50k virtualized grid median frame time over {} scroll frames: {median_ms:.3} ms",
+            frame_ms.len()
+        );
         assert!(
-            avg_ms < 16.0,
-            "50k grid frame time too high: {avg_ms:.2} ms"
+            median_ms < 16.0,
+            "50k grid median frame time too high: {median_ms:.2} ms"
         );
     }
 
