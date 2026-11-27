@@ -18,6 +18,17 @@ Full plan with rationale is kept by the project owner. This file is the scope ag
 - **UI:** context hotkeys, toolbar/menu, layouts, preferences, Light/Dark/System theme, English + Vietnamese, High-DPI, log window, version check, scroll-modifier options.
 - **Providers from arch1t3cht fork:** BestSource, VapourSynth.
 
+## Known Aegisub bug we must not repeat: MKV with many subtitle tracks
+Aegisub 3.5.1 "Open Subtitles from Video" silently returns an empty script for MKVs with >32 tracks (owner's file: 40 tracks, 37 SRT subtitle tracks; likely the 32-bit track mask in Haali's MatroskaParser). Phase 1 requirements:
+- No track-count limit; demux via libavformat (or a Matroska parser without track limits).
+- Track picker shows index, codec, language, name, default/forced flags and a preview of the first lines; allow importing several tracks at once.
+- Read only the selected track(s), in the background with progress + cancel; the owner's 40-track 1080p episode must finish in ≤ 3 s.
+- Never fail silently: a track yielding 0 events reports why.
+- Regression tests: the owner's file (path via env var, not committed) and a generated MKV with ≥ 64 subtitle tracks (ASS, SRT, zlib-compressed, header-stripped).
+
+## UI direction (owner preference)
+The owner prefers the **classic Aegisub 3.2.2 look and layout** over the 3.4/3.5 UI, and has tuned their own Aegisub 3.5.1 to look like 3.2.2. Use that as the reference: same panel arrangement (video top-left, audio top-right, edit box under audio, grid at the bottom), compact toolbar, classic grid/edit-box density and colours as the Light theme default. New features (pan/zoom, new audio marker, dark theme) are added without changing that layout. The owner's Aegisub config and hotkeys (%APPDATA%\Aegisub\config.json, hotkey.json) are the reference for default layout options and hotkeys; import them where they map.
+
 ## Out of scope
 SSA, TTXT, MicroDVD, plain text, EBU STL, Encore, Transtation; open-with-charset; recent files; Export As filters; attachments manager; VSFilter; spell check, thesaurus, translation assistant; Kanji timer; MoonScript, automation manager, macro menu, Lua export filters, `aegisub.*` macro API, DependencyControl; font copy/zip; other UI languages; line folding; perspective tool; Linux/macOS.
 
@@ -26,8 +37,8 @@ SSA, TTXT, MicroDVD, plain text, EBU STL, Encore, Transtation; open-with-charset
 1. Core data: ASS/SRT round-trip, charset, MKV subs, undo, autosave (3–4 w)
 2. Basic editor: grid, edit box, styles, script props, find/replace, select; i18n + theme framework (4–6 w) — Milestone A
 3. Audio & timing (5–7 w) — Milestone B
-4. Video & keyframes incl. SCXvid (6–8 w) — Milestone C
+4. Video & keyframes incl. SCXvid; **BestSource as default video/audio provider, FFMS2 as fast-open fallback**, both behind the common `media` trait (6–8 w) — Milestone C
    - Includes FFMS2 on-disk index cache (Phase 1/4) and post-seek decode latency optimization (e.g., ~43 ms long-seek spikes).
 5. Typesetting tools, resample, Align to Video (5–6 w)
 6. Karaoke Templater (2–3 w)
-7. BestSource/VapourSynth/Avisynth, fonts check, prefs/hotkeys polish, Windows installer (3–5 w)
+7. VapourSynth/Avisynth, fonts check, prefs/hotkeys polish, Windows installer (3–5 w)
