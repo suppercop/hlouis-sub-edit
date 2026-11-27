@@ -141,9 +141,7 @@ impl GridState {
             }
             let lo = self.anchor_row.min(row);
             let hi = self.anchor_row.max(row);
-            for idx in lo..=hi {
-                self.selected.insert(idx);
-            }
+            self.selected.extend(lo..=hi);
             self.active_row = row;
         } else if ctrl {
             if self.selected.contains(&row) {
@@ -169,6 +167,11 @@ impl GridState {
         }
     }
 
+    /// Selects every row in `self.lines`.
+    pub fn select_all(&mut self) {
+        self.selected = (0..self.lines.len()).collect();
+    }
+
     /// Moves the active row by `delta` (`-1` or `+1`), optionally extending selection with `Shift`.
     pub fn move_active(&mut self, delta: isize, shift: bool) {
         if self.lines.is_empty() {
@@ -180,9 +183,7 @@ impl GridState {
             self.selected.clear();
             let lo = self.anchor_row.min(next);
             let hi = self.anchor_row.max(next);
-            for idx in lo..=hi {
-                self.selected.insert(idx);
-            }
+            self.selected.extend(lo..=hi);
         } else {
             self.selected.clear();
             self.selected.insert(next);

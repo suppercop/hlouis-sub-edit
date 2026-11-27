@@ -2,19 +2,16 @@
 //! FFMS2 + libass + wgpu video preview, Light/Dark/System themes, and en/vi Fluent i18n.
 
 mod ffi;
-mod grid;
-mod sample_ass;
-mod syntax;
-mod theme;
 mod video_player;
 
-use crate::grid::GridState;
-use crate::theme::{ThemeMode, ThemePalette};
 use crate::video_player::{PlayerCmd, PlayerEvent, ReadyFrame, VideoPlayerHandle};
 use eframe::egui;
 use egui::{FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Sense, Vec2};
-use egui_extras::{Column, TableBuilder};
 use fluent::FluentValue;
+use hlouis_sub_edit::grid::{self, GridState};
+use hlouis_sub_edit::sample_ass;
+use hlouis_sub_edit::syntax;
+use hlouis_sub_edit::theme::{self, ThemeMode, ThemePalette};
 use i18n::{I18n, Locale};
 use media::VideoInfo;
 use std::collections::VecDeque;
@@ -212,12 +209,20 @@ impl Default for VideoMetrics {
     }
 }
 
+struct CachedEditGalley {
+    text: String,
+    wrap_bits: u32,
+    is_dark: bool,
+    galley: Arc<egui::Galley>,
+}
+
 struct SpikeApp {
     i18n: I18n,
     theme_mode: ThemeMode,
     palette: ThemePalette,
     last_theme_check: Instant,
     grid: GridState,
+    cached_edit_galley: Option<CachedEditGalley>,
     player: VideoPlayerHandle,
     video_info: Option<VideoInfo>,
     video_file_name: String,
@@ -236,8 +241,10 @@ struct SpikeApp {
     video_metrics: VideoMetrics,
     error_banner: Option<String>,
     last_frame_instant: Instant,
+    last_input_at: Instant,
     smoothed_frame_ms: f32,
     working_set_mib: f64,
+    private_mib: f64,
     last_mem_check: Instant,
     last_metrics_log: Instant,
 }
@@ -276,12 +283,14 @@ impl SpikeApp {
         }
 
         let now = Instant::now();
+        let mem = ffi::process_memory_mib().unwrap_or_default();
         Ok(Self {
             i18n,
             theme_mode,
             palette,
             last_theme_check: now,
             grid: GridState::generate(50_000),
+            cached_edit_galley: None,
             player,
             video_info: None,
             video_file_name,
@@ -300,8 +309,10 @@ impl SpikeApp {
             video_metrics: VideoMetrics::default(),
             error_banner: None,
             last_frame_instant: now,
+            last_input_at: now,
             smoothed_frame_ms: 16.6,
-            working_set_mib: ffi::process_working_set_mib().unwrap_or(0.0),
+            working_set_mib: mem.working_set_mib,
+            private_mib: mem.private_mib,
             last_mem_check: now,
             last_metrics_log: now,
         })
@@ -309,7 +320,7 @@ impl SpikeApp {
 
     fn update_theme_if_needed(&mut self, ctx: &egui::Context) {
         if self.theme_mode == ThemeMode::FollowWindows
-            && self.last_theme_check.elapsed() >= Duration::from_secs(1)
+            && self.last_theme_check.elapsed() >= Duration::from_secs(2)
         {
             self.last_theme_check = Instant::now();
             let resolved = theme::resolve_palette(self.theme_mode);
@@ -652,7 +663,7 @@ impl SpikeApp {
         }
     }
 
-    fn render_video_panel(&mut self, ui: &mut egui::Ui) -> bool {
+    fn render_video_panel(&mut self, ui: &mut egui::Ui, allow_cursor_blink: bool) -> bool {
         let mut seek_focused = false;
         egui::Panel::left("video_panel")
             .resizable(true)
@@ -668,7 +679,7 @@ impl SpikeApp {
                     ))
                     .color(self.palette.text_muted),
                 );
-                seek_focused = self.render_transport_controls(ui);
+                seek_focused = self.render_transport_controls(ui, allow_cursor_blink);
                 ui.separator();
 
                 let avail = ui.available_size();
@@ -752,7 +763,7 @@ impl SpikeApp {
         }
     }
 
-    fn render_transport_controls(&mut self, ui: &mut egui::Ui) -> bool {
+    fn render_transport_controls(&mut self, ui: &mut egui::Ui, allow_cursor_blink: bool) -> bool {
         let mut seek_focused = false;
         ui.horizontal_wrapped(|ui| {
             let has_video = self.video_info.is_some() && self.indexing_progress.is_none();
@@ -795,8 +806,12 @@ impl SpikeApp {
                 }
 
                 ui.label(self.i18n.tr("label-seek-frame"));
-                let seek_resp =
-                    ui.add(egui::TextEdit::singleline(&mut self.seek_input).desired_width(64.0));
+                let seek_resp = ui
+                    .scope(|ui| {
+                        ui.visuals_mut().text_cursor.blink = allow_cursor_blink;
+                        ui.add(egui::TextEdit::singleline(&mut self.seek_input).desired_width(64.0))
+                    })
+                    .inner;
                 seek_focused = seek_resp.has_focus();
                 let submit =
                     seek_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -828,6 +843,7 @@ impl SpikeApp {
         egui::Area::new(egui::Id::unique("metrics_overlay"))
             .fixed_pos(overlay_pos)
             .interactable(false)
+            .fade_in(false)
             .show(ui.ctx(), |ui| {
                 ui.spacing_mut().item_spacing.y = 1.5;
                 egui::Frame::NONE
@@ -876,10 +892,7 @@ impl SpikeApp {
         ui.label(
             egui::RichText::new(self.i18n.tr_args(
                 "overlay-memory",
-                &[(
-                    "mb",
-                    FluentValue::from(format!("{:.1}", self.working_set_mib)),
-                )],
+                &[("mb", FluentValue::from(format!("{:.1}", self.private_mib)))],
             ))
             .size(11.0)
             .monospace()
@@ -995,9 +1008,14 @@ impl SpikeApp {
         });
     }
 
-    fn render_editor_and_grid(&mut self, ui: &mut egui::Ui, seek_focused: bool) {
+    fn render_editor_and_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        seek_focused: bool,
+        allow_cursor_blink: bool,
+    ) {
         egui::CentralPanel::default().show(ui, |ui| {
-            let edit_focused = self.render_edit_box(ui);
+            let edit_focused = self.render_edit_box(ui, allow_cursor_blink);
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -1030,7 +1048,7 @@ impl SpikeApp {
         });
     }
 
-    fn render_edit_box(&mut self, ui: &mut egui::Ui) -> bool {
+    fn render_edit_box(&mut self, ui: &mut egui::Ui, allow_cursor_blink: bool) -> bool {
         ui.horizontal_wrapped(|ui| {
             ui.strong(self.i18n.tr("edit-section-title"));
             ui.separator();
@@ -1069,21 +1087,44 @@ impl SpikeApp {
 
         let palette = self.palette;
         let mono_font = FontId::monospace(15.0);
+        let cache = &mut self.cached_edit_galley;
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-            let job = syntax::build_layout_job(text.as_str(), &mono_font, wrap_width, &palette);
-            ui.fonts_mut(|f| f.layout_job(job))
+            let text_str = text.as_str();
+            let wrap_bits = wrap_width.to_bits();
+            if let Some(cached) = cache.as_ref() {
+                if cached.wrap_bits == wrap_bits
+                    && cached.is_dark == palette.is_dark
+                    && cached.text == text_str
+                {
+                    return Arc::clone(&cached.galley);
+                }
+            }
+            let job = syntax::build_layout_job(text_str, &mono_font, wrap_width, &palette);
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            *cache = Some(CachedEditGalley {
+                text: text_str.to_owned(),
+                wrap_bits,
+                is_dark: palette.is_dark,
+                galley: Arc::clone(&galley),
+            });
+            galley
         };
 
         let mut edit_focused = false;
         if let Some(line) = self.grid.active_line_mut() {
-            let edit_resp = ui.add(
-                egui::TextEdit::multiline(&mut line.text)
-                    .id_salt(("edit_box", line.number))
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(4)
-                    .layouter(&mut layouter),
-            );
+            let edit_resp = ui
+                .scope(|ui| {
+                    ui.visuals_mut().text_cursor.blink = allow_cursor_blink;
+                    ui.add(
+                        egui::TextEdit::multiline(&mut line.text)
+                            .id_salt(("edit_box", line.number))
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(4)
+                            .layouter(&mut layouter),
+                    )
+                })
+                .inner;
             edit_focused = edit_resp.has_focus();
             if edit_resp.changed() {
                 line.recompute_cps();
@@ -1093,130 +1134,20 @@ impl SpikeApp {
     }
 
     fn render_grid_table(&mut self, ui: &mut egui::Ui) {
-        let row_height = 22.0;
-        let total_rows = self.grid.lines.len();
-        let mut clicked_row: Option<(usize, bool, bool)> = None;
-
-        ui.style_mut().interaction.selectable_labels = false;
-        let mut table = TableBuilder::new(ui)
-            .striped(false)
-            .resizable(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .sense(Sense::click())
-            .column(Column::initial(64.0).at_least(44.0))
-            .column(Column::initial(92.0).at_least(72.0))
-            .column(Column::initial(92.0).at_least(72.0))
-            .column(Column::initial(56.0).at_least(44.0))
-            .column(Column::initial(88.0).at_least(60.0))
-            .column(Column::remainder().at_least(180.0));
-
-        if self.grid.scroll_to_active {
-            self.grid.scroll_to_active = false;
-            table = table.scroll_to_row(self.grid.active_row, None);
-        }
-
-        table
-            .header(24.0, |mut header| {
-                for key in [
-                    "col-index",
-                    "col-start",
-                    "col-end",
-                    "col-cps",
-                    "col-style",
-                    "col-text",
-                ] {
-                    header.col(|ui| {
-                        ui.strong(self.i18n.tr(key));
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(row_height, total_rows, |mut row| {
-                    let idx = row.index();
-                    render_grid_row(
-                        &mut row,
-                        &self.grid.lines[idx],
-                        self.grid.selected.contains(&idx),
-                        self.grid.active_row == idx,
-                        &self.palette,
-                        &mut clicked_row,
-                    );
-                });
-            });
-
-        if let Some((idx, shift, ctrl)) = clicked_row {
-            self.grid.click_row(idx, shift, ctrl);
-        }
-    }
-}
-
-fn render_grid_row(
-    row: &mut egui_extras::TableRow<'_, '_>,
-    line: &grid::SubtitleLine,
-    is_selected: bool,
-    is_active: bool,
-    palette: &ThemePalette,
-    clicked_row: &mut Option<(usize, bool, bool)>,
-) {
-    let idx = row.index();
-    row.set_selected(is_selected);
-    row.col(|ui| {
-        paint_row_bg(ui, is_selected, is_active, idx, palette);
-        ui.label(
-            egui::RichText::new(line.number.to_string())
-                .monospace()
-                .color(palette.text_muted),
+        let headers = [
+            self.i18n.tr("col-index"),
+            self.i18n.tr("col-start"),
+            self.i18n.tr("col-end"),
+            self.i18n.tr("col-cps"),
+            self.i18n.tr("col-style"),
+            self.i18n.tr("col-text"),
+        ];
+        hlouis_sub_edit::render_grid_table(
+            ui,
+            &mut self.grid,
+            &self.palette,
+            headers.each_ref().map(String::as_str),
         );
-    });
-    row.col(|ui| {
-        paint_row_bg(ui, is_selected, is_active, idx, palette);
-        ui.label(
-            egui::RichText::new(&line.start_str)
-                .monospace()
-                .color(palette.text_primary),
-        );
-    });
-    row.col(|ui| {
-        paint_row_bg(ui, is_selected, is_active, idx, palette);
-        ui.label(
-            egui::RichText::new(&line.end_str)
-                .monospace()
-                .color(palette.text_primary),
-        );
-    });
-    row.col(|ui| {
-        paint_row_bg(ui, is_selected, is_active, idx, palette);
-        let cps_color = if line.cps >= 25.0 {
-            palette.cps_critical
-        } else if line.cps >= 18.0 {
-            palette.cps_warning
-        } else {
-            palette.cps_normal
-        };
-        ui.label(
-            egui::RichText::new(&line.cps_str)
-                .monospace()
-                .color(cps_color),
-        );
-    });
-    row.col(|ui| {
-        paint_row_bg(ui, is_selected, is_active, idx, palette);
-        ui.label(egui::RichText::new(&line.style).color(palette.text_muted));
-    });
-    row.col(|ui| {
-        paint_row_bg(ui, is_selected, is_active, idx, palette);
-        ui.add(
-            egui::Label::new(egui::RichText::new(&line.text).color(palette.text_primary))
-                .truncate(),
-        );
-    });
-
-    if row.response().clicked() {
-        let (shift, ctrl) = row
-            .response()
-            .ctx
-            .input(|i| (i.modifiers.shift, i.modifiers.command || i.modifiers.ctrl));
-        *clicked_row = Some((idx, shift, ctrl));
     }
 }
 
@@ -1226,15 +1157,29 @@ impl eframe::App for SpikeApp {
         let now = Instant::now();
         let dt_ms = (now - self.last_frame_instant).as_secs_f32() * 1000.0;
         self.last_frame_instant = now;
-        if dt_ms > 0.0 && dt_ms < 500.0 {
+        if dt_ms > 0.0 && (self.playback_state == PlaybackState::Playing || dt_ms < 100.0) {
             self.smoothed_frame_ms = self.smoothed_frame_ms * 0.9 + dt_ms * 0.1;
         }
         if self.last_mem_check.elapsed() >= Duration::from_millis(500) {
             self.last_mem_check = now;
-            if let Some(mb) = ffi::process_working_set_mib() {
-                self.working_set_mib = mb;
+            if let Some(mem) = ffi::process_memory_mib() {
+                self.working_set_mib = mem.working_set_mib;
+                self.private_mib = mem.private_mib;
             }
         }
+
+        let has_input = ui.input(|i| {
+            !i.events.is_empty()
+                || i.pointer.any_down()
+                || i.pointer.is_moving()
+                || i.smooth_scroll_delta != Vec2::ZERO
+        });
+        if has_input {
+            self.last_input_at = now;
+        }
+        let allow_cursor_blink = self.playback_state == PlaybackState::Playing
+            || self.indexing_progress.is_some()
+            || now.duration_since(self.last_input_at) < Duration::from_secs(2);
 
         self.update_theme_if_needed(&ctx);
         self.process_player_events(frame);
@@ -1251,8 +1196,9 @@ impl eframe::App for SpikeApp {
             let avg_ren = self.video_metrics.total_render_ms / n;
             let avg_upl = self.video_metrics.total_upload_ms / n;
             println!(
-                "[metrics] ui_fps={fps:.1} frame_ms={:.2} mem_mib={:.1} video_frame={} avg_dec={avg_dec:.2} avg_ren={avg_ren:.2} avg_upl={avg_upl:.2} max_dec={:.2} max_ren={:.2} max_upl={:.2} rendered={} dropped={}",
+                "[metrics] ui_fps={fps:.1} frame_ms={:.2} priv_mib={:.1} ws_mib={:.1} video_frame={} avg_dec={avg_dec:.2} avg_ren={avg_ren:.2} avg_upl={avg_upl:.2} max_dec={:.2} max_ren={:.2} max_upl={:.2} rendered={} dropped={}",
                 self.smoothed_frame_ms,
+                self.private_mib,
                 self.working_set_mib,
                 self.video_metrics.current_frame,
                 self.video_metrics.max_decode_ms,
@@ -1264,8 +1210,8 @@ impl eframe::App for SpikeApp {
         }
 
         self.render_top_bar(ui);
-        let seek_focused = self.render_video_panel(ui);
-        self.render_editor_and_grid(ui, seek_focused);
+        let seek_focused = self.render_video_panel(ui, allow_cursor_blink);
+        self.render_editor_and_grid(ui, seek_focused, allow_cursor_blink);
 
         if self.playback_state == PlaybackState::Playing {
             ctx.request_repaint_after(Duration::from_millis(4));
@@ -1286,30 +1232,6 @@ fn fv_usize(n: usize) -> FluentValue<'static> {
 
 fn fv_u64(n: u64) -> FluentValue<'static> {
     FluentValue::from(i64::try_from(n).unwrap_or(i64::MAX))
-}
-
-fn paint_row_bg(
-    ui: &egui::Ui,
-    is_selected: bool,
-    is_active: bool,
-    row_idx: usize,
-    palette: &ThemePalette,
-) {
-    let rect = ui.max_rect();
-    let bg = if is_selected {
-        palette.row_selected
-    } else if row_idx.is_multiple_of(2) {
-        palette.row_even
-    } else {
-        palette.row_odd
-    };
-    ui.painter().rect_filled(rect, 0.0, bg);
-    if is_active {
-        ui.painter().line_segment(
-            [rect.left_bottom(), rect.right_bottom()],
-            egui::Stroke::new(1.0, palette.row_active_border),
-        );
-    }
 }
 
 fn compute_crisp_video_rect(
@@ -1398,12 +1320,41 @@ fn configure_fonts(ctx: &egui::Context) {
 
 fn main() -> anyhow::Result<()> {
     let cli = CliOptions::parse();
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) = wgpu_options.wgpu_setup {
+        // Default to DX12|GL + LowPower on Windows so dual-GPU laptops avoid waking the discrete
+        // GPU driver heap and avoid Intel Vulkan driver access violations during idle present.
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            setup.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::GL;
+        }
+        if std::env::var_os("WGPU_POWER_PREF").is_none() {
+            setup.power_preference = wgpu::PowerPreference::LowPower;
+        }
+        setup.device_descriptor = Arc::new(|adapter| {
+            let base_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
+                wgpu::Limits::downlevel_webgl2_defaults()
+            } else {
+                wgpu::Limits::default()
+            };
+            wgpu::DeviceDescriptor {
+                label: Some("hlouis_wgpu_device"),
+                required_limits: wgpu::Limits {
+                    max_texture_dimension_2d: 8192,
+                    ..base_limits
+                },
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                ..Default::default()
+            }
+        });
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 740.0])
             .with_min_inner_size([840.0, 520.0])
             .with_title("hlouis-sub-edit"),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
         ..Default::default()
     };
 
@@ -1555,7 +1506,7 @@ mod tests {
     #[test]
     fn grid_50k_scroll_renders_smoothly() {
         let ctx = egui::Context::default();
-        let grid = GridState::generate(50_000);
+        let mut grid = GridState::generate(50_000);
         let palette = ThemePalette::dark();
         let start = Instant::now();
         let frames = 120usize;
@@ -1580,27 +1531,12 @@ mod tests {
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| {
-                let mut clicked = None;
-                TableBuilder::new(ui)
-                    .column(Column::initial(64.0))
-                    .column(Column::initial(92.0))
-                    .column(Column::initial(92.0))
-                    .column(Column::initial(56.0))
-                    .column(Column::initial(88.0))
-                    .column(Column::remainder())
-                    .body(|body| {
-                        body.rows(22.0, grid.lines.len(), |mut row| {
-                            let idx = row.index();
-                            render_grid_row(
-                                &mut row,
-                                &grid.lines[idx],
-                                grid.selected.contains(&idx),
-                                grid.active_row == idx,
-                                &palette,
-                                &mut clicked,
-                            );
-                        });
-                    });
+                hlouis_sub_edit::render_grid_table(
+                    ui,
+                    &mut grid,
+                    &palette,
+                    ["#", "Start", "End", "CPS", "Style", "Text"],
+                );
             });
             out.textures_delta.clear();
         }
