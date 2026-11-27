@@ -19,6 +19,7 @@ members = [
     "crates/ffms2-sys",
     "crates/render",
     "crates/media",
+    "crates/style-editor",
     "crates/grid-model",
     "crates/layout",
     "crates/settings",
