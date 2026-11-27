@@ -83,3 +83,16 @@ fn parses_and_writes_mkvmerge_timecodes_v1_and_v2() {
     let tc_v2_rt = parse_timecodes(&v2_written).expect("rt v2");
     assert_eq!(tc_v2_rt, tc_v2);
 }
+
+#[test]
+fn vfr_v2_extrapolates_past_end_with_average_frame_duration() {
+    // 5 listed frames spanning 0..200 ms: average duration 50 ms (20 fps), not 24000/1001.
+    let tc = keyframes::parse_timecodes("# timecode format v2\n0\n30\n80\n120\n200\n").expect("v2");
+    assert_eq!(tc.frame_to_time_ms(4, TimeType::Exact), 200);
+    assert_eq!(tc.frame_to_time_ms(5, TimeType::Exact), 250);
+    assert_eq!(tc.frame_to_time_ms(8, TimeType::Exact), 400);
+    assert_eq!(tc.time_ms_to_frame(400, TimeType::Exact), 8);
+    // A single listed frame has no average: keep the 24000/1001 fallback.
+    let one = keyframes::parse_timecodes("# timecode format v2\n0\n").expect("v2");
+    assert_eq!(one.frame_to_time_ms(1, TimeType::Exact), 42);
+}

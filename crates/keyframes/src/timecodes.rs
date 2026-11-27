@@ -46,10 +46,20 @@ impl Timecodes {
                 "VFR timecode table cannot be empty".to_owned(),
             ));
         }
+        // Aegisub 3.5.1 (libaegisub/vfr.cpp): frames past the last listed timestamp are
+        // extrapolated with the average frame duration of the listed frames, i.e.
+        // fps = (n - 1) * 1000 / (last - first). Fall back to 24000/1001 when that is undefined
+        // (a single frame, or all timestamps equal).
+        let n = timestamps_ms.len();
+        let span = timestamps_ms[n - 1] - timestamps_ms[0];
+        let (default_num, default_den) = match (u64::try_from(n - 1), u64::try_from(span)) {
+            (Ok(intervals), Ok(span)) if intervals > 0 && span > 0 => (intervals * 1_000, span),
+            _ => (24_000, 1_001),
+        };
         Ok(Self::Vfr {
             timestamps_ms,
-            default_num: 24_000,
-            default_den: 1_001,
+            default_num,
+            default_den,
         })
     }
 
