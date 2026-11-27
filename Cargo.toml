@@ -59,6 +59,7 @@ members = [
     "crates/ui-video",
     "crates/ui-dialogs",
     "crates/ui-shell",
+    "crates/kara-templater",
 ]
 
 [workspace.package]
