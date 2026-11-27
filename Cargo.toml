@@ -19,6 +19,7 @@ members = [
     "crates/ffms2-sys",
     "crates/render",
     "crates/media",
+    "crates/align-to-video",
     "crates/visual-tools",
     "crates/audio-view",
     "crates/karaoke-timing",
