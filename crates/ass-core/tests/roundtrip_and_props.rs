@@ -37,7 +37,7 @@ fn crlf_bom_full_fixture_round_trips_byte_identically() {
 
     // Trailing whitespace in Text is preserved.
     let first_ev = script.events().next().expect("first event");
-    assert_eq!(first_ev.text, "Keep trailing spaces   ");
+    assert_eq!(first_ev.text(), "Keep trailing spaces   ");
 
     let out_bytes = serialize_ass_bytes(script);
     assert_eq!(
@@ -56,26 +56,70 @@ fn lf_custom_format_fixture_round_trips_byte_identically() {
     assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
 
     let ev = outcome.value.events().next().expect("event");
-    assert_eq!(ev.layer, 2);
-    assert_eq!(ev.start, AssTime::from_cs(50));
-    assert_eq!(ev.end, AssTime::from_cs(200));
-    assert_eq!(ev.style, "Mini");
-    assert_eq!(ev.text, "Custom order, with comma");
+    assert_eq!(ev.layer(), 2);
+    assert_eq!(ev.start(), AssTime::from_cs(50));
+    assert_eq!(ev.end(), AssTime::from_cs(200));
+    assert_eq!(ev.style(), "Mini");
+    assert_eq!(ev.text(), "Custom order, with comma");
 
     assert_eq!(serialize_ass_bytes(&outcome.value), bytes);
 }
 
 #[test]
-fn utf16le_bom_fixture_decodes_cleanly() {
-    let bytes = std::fs::read(Path::new(FIXTURES_DIR).join("utf16le_bom.ass"))
-        .expect("read utf16le_bom.ass");
+fn mixed_line_endings_fixture_round_trips_byte_identically() {
+    let bytes = std::fs::read(Path::new(FIXTURES_DIR).join("mixed_line_endings.ass"))
+        .expect("read mixed_line_endings.ass");
+    let (outcome, _) = parse_ass_bytes(&bytes);
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    assert!(outcome.value.line_endings.is_some());
+    assert_eq!(
+        serialize_ass_bytes(&outcome.value),
+        bytes,
+        "mixed CRLF/LF file must round-trip byte-identically"
+    );
+}
+
+#[test]
+fn utf16le_bom_generated_from_utf8_decodes_cleanly() {
+    let utf8_source = "[Script Info]\r\nTitle: UTF-16LE Fixture\r\nScriptType: v4.00+\r\n\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\nDialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Xin chào Tiếng Việt — 日本語\r\n";
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in utf8_source.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
     let (outcome, enc) = parse_ass_bytes(&bytes);
     assert_eq!(enc.name, "UTF-16LE");
     assert!(enc.has_bom);
     assert!(!enc.had_errors);
     assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
     let ev = outcome.value.events().next().expect("event");
-    assert_eq!(ev.text, "Xin chào Tiếng Việt — 日本語");
+    assert_eq!(ev.text(), "Xin chào Tiếng Việt — 日本語");
+}
+
+#[test]
+fn setters_invalidate_cached_raw_line_automatically() {
+    let raw = "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,48.00,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100.0,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 00,0:00:01.00,0:00:03.00,Default,,0000,0,0,,Before\n";
+    let mut script = parse_ass(raw).value;
+    let st = script
+        .styles_section_mut()
+        .unwrap()
+        .get_style_mut(0)
+        .unwrap();
+    assert!(st.has_cached_raw_line());
+    st.set_fontsize(52.0);
+    assert!(!st.has_cached_raw_line());
+
+    let ev = script
+        .events_section_mut()
+        .unwrap()
+        .get_event_mut(0)
+        .unwrap();
+    assert!(ev.has_cached_raw_line());
+    ev.set_text("After");
+    assert!(!ev.has_cached_raw_line());
+
+    let out = serialize_ass(&script);
+    assert!(out.contains("Style: Default,Arial,52,"));
+    assert!(out.contains("Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,After"));
 }
 
 #[test]
@@ -86,9 +130,9 @@ fn malformed_fixture_does_not_panic_and_collects_warnings() {
     assert!(outcome.warnings.len() >= 2);
     let events: Vec<&AssEvent> = outcome.value.events().collect();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].start, AssTime::ZERO);
-    assert_eq!(events[0].end, AssTime::from_cs(500));
-    assert_eq!(events[0].text, "Hello, world, extra, commas");
+    assert_eq!(events[0].start(), AssTime::ZERO);
+    assert_eq!(events[0].end(), AssTime::from_cs(500));
+    assert_eq!(events[0].text(), "Hello, world, extra, commas");
 }
 
 #[test]

@@ -41,8 +41,18 @@ pub fn parse_ass(input: &str) -> ParseOutcome<ScriptFile> {
     let mut warnings = Vec::new();
     let mut sections: Vec<Section> = Vec::new();
     let mut current: Option<Section> = None;
+    let mut mixed_endings: Option<Vec<LineEnding>> = None;
 
-    for (zero_idx, raw_line) in split_lines_lossless(body).enumerate() {
+    for (zero_idx, (raw_line, term)) in split_lines_with_endings(body).enumerate() {
+        if let Some(le) = term {
+            if let Some(ref mut endings) = mixed_endings {
+                endings.push(le);
+            } else if le != line_ending {
+                let mut v = vec![line_ending; zero_idx];
+                v.push(le);
+                mixed_endings = Some(v);
+            }
+        }
         let line_no = zero_idx + 1;
         let trimmed = raw_line.trim();
 
@@ -85,6 +95,7 @@ pub fn parse_ass(input: &str) -> ParseOutcome<ScriptFile> {
         value: ScriptFile {
             has_bom,
             line_ending,
+            line_endings: mixed_endings,
             trailing_newline,
             sections,
         },
@@ -103,22 +114,32 @@ fn detect_line_ending(text: &str) -> LineEnding {
     LineEnding::CrLf
 }
 
-fn split_lines_lossless(text: &str) -> impl Iterator<Item = &str> {
-    let trimmed = text
-        .strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .unwrap_or(text);
-    let empty_input = text.is_empty();
-    let iter = if empty_input {
-        None
-    } else {
-        Some(
-            trimmed
-                .split('\n')
-                .map(|l| l.strip_suffix('\r').unwrap_or(l)),
-        )
-    };
-    iter.into_iter().flatten()
+fn split_lines_with_endings(text: &str) -> impl Iterator<Item = (&str, Option<LineEnding>)> {
+    struct LineIter<'a> {
+        rest: &'a str,
+    }
+    impl<'a> Iterator for LineIter<'a> {
+        type Item = (&'a str, Option<LineEnding>);
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.rest.is_empty() {
+                return None;
+            }
+            if let Some(pos) = self.rest.find('\n') {
+                let (line, le) = if pos > 0 && self.rest.as_bytes()[pos - 1] == b'\r' {
+                    (&self.rest[..pos - 1], LineEnding::CrLf)
+                } else {
+                    (&self.rest[..pos], LineEnding::Lf)
+                };
+                self.rest = &self.rest[pos + 1..];
+                Some((line, Some(le)))
+            } else {
+                let line = self.rest;
+                self.rest = "";
+                Some((line, None))
+            }
+        }
+    }
+    LineIter { rest: text }
 }
 
 fn start_section(raw_header: &str, trimmed: &str) -> Section {

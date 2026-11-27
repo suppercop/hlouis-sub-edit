@@ -1,7 +1,10 @@
 //! Charset detection and decoding (BOM, UTF-8, and `chardetng` + `encoding_rs` fallback).
 
 use chardetng::EncodingDetector;
-use encoding_rs::{Encoding, GB18030, GBK, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252, WINDOWS_1258};
+use encoding_rs::{
+    Encoding, BIG5, GB18030, GBK, ISO_8859_2, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1250,
+    WINDOWS_1252, WINDOWS_1254, WINDOWS_1257, WINDOWS_1258,
+};
 
 /// Detected character encoding of a subtitle byte stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,7 +23,7 @@ pub struct DetectedEncoding {
 /// 1. Explicit BOM (`UTF-8`, `UTF-16LE`, `UTF-16BE`).
 /// 2. Valid UTF-8 without BOM.
 /// 3. Heuristic detection via `chardetng` (covering CP1252, Shift-JIS, GB18030, Windows-1258, etc.),
-///    with a Vietnamese Windows-1258 disambiguation check when `chardetng` guesses Windows-1252.
+///    with a Vietnamese Windows-1258 disambiguation check for short 1-3 word lines.
 #[must_use]
 pub fn decode_bytes(bytes: &[u8]) -> (String, DetectedEncoding) {
     // 1. Check explicit BOMs first.
@@ -75,13 +78,21 @@ pub fn decode_bytes(bytes: &[u8]) -> (String, DetectedEncoding) {
     detector.feed(bytes, true);
     let mut enc: &'static Encoding = detector.guess(None, true);
 
-    // `chardetng` does not distinguish Windows-1258 (Vietnamese combining tone marks 0xCC, 0xD2,
-    // 0xDE, 0xEC, 0xF2 and ơ/ư/đ 0xD5/0xF5/0xDD/0xFD/0xD0/0xF0) from Windows-1252.
-    if enc == WINDOWS_1252 && looks_like_windows_1258(bytes) {
+    // `chardetng` does not distinguish Windows-1258 from single-byte Latin encodings
+    // (especially on short 1-3 word Vietnamese lines like "Việt" or "được không").
+    let is_single_byte_latin = enc == WINDOWS_1252
+        || enc == WINDOWS_1250
+        || enc == ISO_8859_2
+        || enc == WINDOWS_1254
+        || enc == WINDOWS_1257;
+    if is_single_byte_latin && looks_like_windows_1258(bytes) {
         enc = WINDOWS_1258;
     } else if enc == GBK {
         // GB18030 is a strict superset of GBK; upgrading handles 4-byte Chinese extensions too.
         enc = GB18030;
+    } else if enc == BIG5 && looks_like_spanish_inverted_punct(bytes) {
+        // A single `¡` (0xA1) or `¿` (0xBF) followed by ASCII letters is Spanish CP1252, not Big5.
+        enc = WINDOWS_1252;
     }
 
     let (cow, _, had_errors) = enc.decode(bytes);
@@ -95,51 +106,127 @@ pub fn decode_bytes(bytes: &[u8]) -> (String, DetectedEncoding) {
     )
 }
 
-/// Heuristic check for Windows-1258 Vietnamese combining tone marks (`0xCC`, `0xD2`, `0xDE`, `0xEC`,
-/// `0xF2`) immediately following ASCII/Vietnamese vowels (`a/e/i/o/u/y` or `ă/â/ê/ô/ơ/ư`).
+/// Discriminates Windows-1258 (Vietnamese) from Windows-1252 (French/Spanish/German/etc.),
+/// including short 1-3 word strings such as `"Việt"`, `"được không"`, and `"Tiếng Việt"`.
 fn looks_like_windows_1258(bytes: &[u8]) -> bool {
-    let mut tone_hits = 0usize;
-    let mut viet_vowel_hits = 0usize;
-    for pair in bytes.windows(2) {
-        let prev = pair[0];
-        let curr = pair[1];
-        let is_viet_base = matches!(
-            prev,
-            b'a' | b'e'
-                | b'i'
-                | b'o'
-                | b'u'
-                | b'y'
-                | b'A'
-                | b'E'
-                | b'I'
-                | b'O'
-                | b'U'
-                | b'Y'
-                | 0xC3
-                | 0xE3
-                | 0xC2
-                | 0xE2
-                | 0xCA
-                | 0xEA
-                | 0xD4
-                | 0xF4
-                | 0xD5
-                | 0xF5
-                | 0xDD
-                | 0xFD
-        );
-        // Combining grave (0xCC), hook above (0xD2), tilde (0xDE), acute (0xEC), dot below (0xF2).
-        let is_combining_tone = matches!(curr, 0xCC | 0xD2 | 0xDE | 0xEC | 0xF2);
-        if is_viet_base && is_combining_tone {
-            tone_hits += 1;
+    let mut tone_after_vowel = 0usize;
+    let mut viet_unique_letter = 0usize;
+    let mut cp1252_western_marker = 0usize;
+
+    for (idx, &b) in bytes.iter().enumerate() {
+        // Characters common in CP1252 French/Spanish/German that do not occur in Vietnamese text:
+        // ¡ ¿ ß ä ö ü Ä Ö Ü ñ Ñ ç Ç « »
+        if matches!(
+            b,
+            0xA1 | 0xAB
+                | 0xBB
+                | 0xBF
+                | 0xC4
+                | 0xC7
+                | 0xD1
+                | 0xD6
+                | 0xDC
+                | 0xDF
+                | 0xE4
+                | 0xE7
+                | 0xF1
+                | 0xF6
+                | 0xFC
+        ) {
+            cp1252_western_marker += 1;
         }
-        // Windows-1258 specific letters: ă/Ă (0xE3/0xC3), đ/Đ (0xF0/0xD0), ơ/Ơ (0xF5/0xD5), ư/Ư (0xFD/0xDD).
-        if matches!(curr, 0xC3 | 0xE3 | 0xD0 | 0xF0 | 0xD5 | 0xF5 | 0xDD | 0xFD) {
-            viet_vowel_hits += 1;
+
+        // Windows-1258 unique Vietnamese letters that do not appear in FR/ES/DE CP1252:
+        // Ă/ă (0xC3/0xE3), Đ/đ (0xD0/0xF0), Ơ/ơ (0xD5/0xF5), Ư/ư (0xDD/0xFD), ₫ (0xFE).
+        if matches!(
+            b,
+            0xC3 | 0xE3 | 0xD0 | 0xF0 | 0xD5 | 0xF5 | 0xDD | 0xFD | 0xFE
+        ) {
+            let prev_is_letter = idx > 0 && is_latin_or_viet_byte(bytes[idx - 1]);
+            let next_is_letter = idx + 1 < bytes.len() && is_latin_or_viet_byte(bytes[idx + 1]);
+            if prev_is_letter || next_is_letter || b == 0xFE {
+                viet_unique_letter += 1;
+            }
+        }
+
+        // Combining tone marks in Windows-1258:
+        // 0xCC (grave), 0xD2 (hook above), 0xDE (tilde), 0xEC (acute), 0xF2 (dot below).
+        // In Vietnamese they always follow a vowel immediately.
+        if idx > 0 && matches!(b, 0xCC | 0xD2 | 0xDE | 0xEC | 0xF2) && is_viet_vowel(bytes[idx - 1])
+        {
+            tone_after_vowel += 1;
         }
     }
-    tone_hits >= 2 || (tone_hits >= 1 && viet_vowel_hits >= 1)
+
+    if tone_after_vowel >= 1 && cp1252_western_marker == 0 {
+        return true;
+    }
+    if tone_after_vowel >= 2 {
+        return true;
+    }
+    viet_unique_letter >= 1 && cp1252_western_marker == 0
+}
+
+fn looks_like_spanish_inverted_punct(bytes: &[u8]) -> bool {
+    let high_count = bytes.iter().filter(|&&b| b >= 0x80).count();
+    let inverted_punct = bytes
+        .windows(2)
+        .any(|w| matches!(w[0], 0xA1 | 0xBF) && w[1].is_ascii_alphabetic());
+    inverted_punct && high_count <= 2
+}
+
+const fn is_viet_vowel(b: u8) -> bool {
+    matches!(
+        b,
+        b'a' | b'e'
+            | b'i'
+            | b'o'
+            | b'u'
+            | b'y'
+            | b'A'
+            | b'E'
+            | b'I'
+            | b'O'
+            | b'U'
+            | b'Y'
+            | 0xC3
+            | 0xE3
+            | 0xC2
+            | 0xE2
+            | 0xCA
+            | 0xEA
+            | 0xD4
+            | 0xF4
+            | 0xD5
+            | 0xF5
+            | 0xDD
+            | 0xFD
+    )
+}
+
+const fn is_latin_or_viet_byte(b: u8) -> bool {
+    b.is_ascii_alphabetic()
+        || matches!(
+            b,
+            0xC2 | 0xC3
+                | 0xCA
+                | 0xCC
+                | 0xD0
+                | 0xD2
+                | 0xD4
+                | 0xD5
+                | 0xDD
+                | 0xDE
+                | 0xE2
+                | 0xE3
+                | 0xEA
+                | 0xEC
+                | 0xF0
+                | 0xF2
+                | 0xF4
+                | 0xF5
+                | 0xFD
+        )
 }
 
 #[cfg(test)]
@@ -186,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_shift_jis_gb18030_cp1252_and_windows_1258() {
+    fn detects_shift_jis_and_gb18030() {
         let jp = "日本語の字幕テストです。これはShift-JISで書かれた会話です。";
         let (sjis_bytes, _, _) = SHIFT_JIS.encode(jp);
         let (decoded_jp, enc_jp) = decode_bytes(&sjis_bytes);
@@ -198,18 +285,91 @@ mod tests {
         let (decoded_zh, enc_zh) = decode_bytes(&gb_bytes);
         assert_eq!(enc_zh.name, "gb18030");
         assert_eq!(decoded_zh, zh);
+    }
 
-        let fr = "Café résumé naïve — élève à Paris, déjà vu.";
-        let (cp_bytes, _, _) = WINDOWS_1252.encode(fr);
-        let (decoded_fr, enc_fr) = decode_bytes(&cp_bytes);
-        assert_eq!(enc_fr.name, "windows-1252");
-        assert_eq!(decoded_fr, fr);
+    #[test]
+    fn table_driven_short_windows_1258_vs_cp1252() {
+        // 22 short 1-3 word Vietnamese phrases in Windows-1258 (using combining tone marks as
+        // required by Windows-1258 encoding).
+        let vietnamese_samples = [
+            "Vi\u{00EA}\u{0323}t",
+            "\u{0111}\u{01B0}\u{01A1}\u{0323}c kh\u{00F4}ng",
+            "Ti\u{00EA}\u{0301}ng Vi\u{00EA}\u{0323}t",
+            "Xin cha\u{0300}o",
+            "Ca\u{0309}m \u{01A1}n",
+            "Ta\u{0323}m bi\u{00EA}\u{0323}t",
+            "\u{0103}n c\u{01A1}m",
+            "\u{0111}i ngu\u{0309}",
+            "kh\u{00F4}ng sao \u{0111}\u{00E2}u",
+            "t\u{00F4}i bi\u{00EA}\u{0301}t",
+            "c\u{00F3} th\u{00EA}\u{0309}",
+            "m\u{00F4}\u{0323}t chu\u{0301}t",
+            "nhanh l\u{00EA}n na\u{0300}o",
+            "\u{0111}\u{01B0}\u{0300}ng lo",
+            "he\u{0323}n g\u{0103}\u{0323}p la\u{0323}i",
+            "ng\u{01B0}\u{01A1}\u{0300}i ba\u{0323}n",
+            "c\u{00E2}u chuy\u{00EA}\u{0323}n",
+            "b\u{0103}\u{0301}t \u{0111}\u{00E2}\u{0300}u",
+            "k\u{00EA}\u{0301}t thu\u{0301}c",
+            "phu\u{0323} \u{0111}\u{00EA}\u{0300}",
+            "m\u{01A1} \u{01B0}\u{01A1}\u{0301}c",
+            "500\u{20AB}",
+        ];
 
-        // Windows-1258 uses NFD combining tone marks (e.g. "Tiê\u{0301}ng Viê\u{0323}t").
-        let vi_nfd = "Xin cha\u{0300}o Ti\u{00EA}\u{0301}ng Vi\u{00EA}\u{0323}t \u{0111}\u{01B0}\u{01A1}\u{0323}c ma\u{0303} ho\u{0301}a";
-        let (w1258_bytes, _, _) = WINDOWS_1258.encode(vi_nfd);
-        let (decoded_vi, enc_vi) = decode_bytes(&w1258_bytes);
-        assert_eq!(enc_vi.name, "windows-1258");
-        assert_eq!(decoded_vi, vi_nfd);
+        for sample in vietnamese_samples {
+            let (bytes, _, unmappable) = WINDOWS_1258.encode(sample);
+            assert!(
+                !unmappable,
+                "test sample `{sample}` must be representable in Windows-1258"
+            );
+            let (decoded, enc) = decode_bytes(&bytes);
+            assert_eq!(
+                enc.name, "windows-1258",
+                "failed to detect Windows-1258 for `{sample}` (got `{}`)",
+                enc.name
+            );
+            assert_eq!(decoded, sample);
+        }
+
+        // 22 short 1-3 word French / Spanish / German phrases in Windows-1252.
+        let cp1252_samples = [
+            "Café crème",
+            "Déjà vu",
+            "Naïve élève",
+            "Garçon français",
+            "Très bien",
+            "Où es-tu ?",
+            "À bientôt",
+            "Ça va bien",
+            "Noël joyeux",
+            "Cœur brisé",
+            "¡Hola amigo!",
+            "¿Cómo estás?",
+            "Mañana mismo",
+            "Niño pequeño",
+            "Español clásico",
+            "Corazón roto",
+            "Grüße aus Köln",
+            "Straße überqueren",
+            "Schöne Träume",
+            "München fährt",
+            "Äpfel und Öl",
+            "Überraschung!",
+        ];
+
+        for sample in cp1252_samples {
+            let (bytes, _, unmappable) = WINDOWS_1252.encode(sample);
+            assert!(
+                !unmappable,
+                "test sample `{sample}` must be representable in Windows-1252"
+            );
+            let (decoded, enc) = decode_bytes(&bytes);
+            assert_eq!(
+                enc.name, "windows-1252",
+                "misclassified CP1252 sample `{sample}` as `{}`",
+                enc.name
+            );
+            assert_eq!(decoded, sample);
+        }
     }
 }

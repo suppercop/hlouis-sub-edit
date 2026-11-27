@@ -1,5 +1,6 @@
 //! Lossless ASS/SSA document data model preserving section order, unknown sections,
-//! `[Fonts]`/`[Graphics]` verbatim payloads, custom `Format:` orders, and numeric formatting.
+//! `[Fonts]`/`[Graphics]` verbatim payloads, custom `Format:` orders, mixed line endings,
+//! and original numeric formatting via private `raw_line` caches invalidated by setters.
 
 use crate::time::AssTime;
 
@@ -61,8 +62,11 @@ impl LineEnding {
 pub struct ScriptFile {
     /// Whether the file began with a UTF-8 BOM (`\u{FEFF}`).
     pub has_bom: bool,
-    /// Dominant line-ending convention detected during parsing.
+    /// Dominant line-ending convention detected during parsing (used for uniform files and new lines).
     pub line_ending: LineEnding,
+    /// Per-line terminators populated *only* when the input mixes `\r\n` and `\n` (stays `None`
+    /// on uniform files for zero-overhead fast-path parsing and serialization).
+    pub line_endings: Option<Vec<LineEnding>>,
     /// Whether the original file ended with a trailing newline.
     pub trailing_newline: bool,
     /// Ordered list of sections (including preamble, known sections, and unknown sections).
@@ -127,6 +131,7 @@ impl ScriptFile {
         Self {
             has_bom: true,
             line_ending: LineEnding::CrLf,
+            line_endings: None,
             trailing_newline: true,
             sections: vec![
                 Section::ScriptInfo(script_info),
@@ -455,36 +460,35 @@ pub enum StyleEntry {
 
 /// Complete V4+ Style definition.
 ///
-/// Numeric fields are stored as typed values for editing, while `raw_line` (when present)
-/// preserves exact original numeric formatting (e.g. `100` vs `100.0`, `1.50`) until modified.
+/// All fields are mutated exclusively through setters (or `EditCommand`), which automatically
+/// invalidate the private `raw_line` cache so serialization always reflects edits while
+/// preserving exact original numeric formatting on untouched styles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssStyle {
-    pub name: String,
-    pub fontname: String,
-    pub fontsize: f64,
-    pub primary_colour: String,
-    pub secondary_colour: String,
-    pub outline_colour: String,
-    pub back_colour: String,
-    pub bold: i32,
-    pub italic: i32,
-    pub underline: i32,
-    pub strike_out: i32,
-    pub scale_x: f64,
-    pub scale_y: f64,
-    pub spacing: f64,
-    pub angle: f64,
-    pub border_style: i32,
-    pub outline: f64,
-    pub shadow: f64,
-    pub alignment: i32,
-    pub margin_l: i32,
-    pub margin_r: i32,
-    pub margin_v: i32,
-    pub encoding: i32,
-    /// Original raw `Style: ...` line for byte-identical round-trip when unmodified.
-    /// Call [`AssStyle::mark_dirty`] after mutating fields directly.
-    pub raw_line: Option<String>,
+    pub(crate) name: String,
+    pub(crate) fontname: String,
+    pub(crate) fontsize: f64,
+    pub(crate) primary_colour: String,
+    pub(crate) secondary_colour: String,
+    pub(crate) outline_colour: String,
+    pub(crate) back_colour: String,
+    pub(crate) bold: i32,
+    pub(crate) italic: i32,
+    pub(crate) underline: i32,
+    pub(crate) strike_out: i32,
+    pub(crate) scale_x: f64,
+    pub(crate) scale_y: f64,
+    pub(crate) spacing: f64,
+    pub(crate) angle: f64,
+    pub(crate) border_style: i32,
+    pub(crate) outline: f64,
+    pub(crate) shadow: f64,
+    pub(crate) alignment: i32,
+    pub(crate) margin_l: i32,
+    pub(crate) margin_r: i32,
+    pub(crate) margin_v: i32,
+    pub(crate) encoding: i32,
+    pub(crate) raw_line: Option<String>,
 }
 
 impl Default for AssStyle {
@@ -518,10 +522,266 @@ impl Default for AssStyle {
     }
 }
 
+#[allow(missing_docs)]
 impl AssStyle {
-    /// Clears cached raw formatting so serialization reflects edited typed fields.
-    pub fn mark_dirty(&mut self) {
+    #[inline]
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[inline]
+    pub fn set_name(&mut self, value: impl Into<String>) {
+        self.name = value.into();
         self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn fontname(&self) -> &str {
+        &self.fontname
+    }
+    #[inline]
+    pub fn set_fontname(&mut self, value: impl Into<String>) {
+        self.fontname = value.into();
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn fontsize(&self) -> f64 {
+        self.fontsize
+    }
+    #[inline]
+    pub fn set_fontsize(&mut self, value: f64) {
+        self.fontsize = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn primary_colour(&self) -> &str {
+        &self.primary_colour
+    }
+    #[inline]
+    pub fn set_primary_colour(&mut self, value: impl Into<String>) {
+        self.primary_colour = value.into();
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn secondary_colour(&self) -> &str {
+        &self.secondary_colour
+    }
+    #[inline]
+    pub fn set_secondary_colour(&mut self, value: impl Into<String>) {
+        self.secondary_colour = value.into();
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn outline_colour(&self) -> &str {
+        &self.outline_colour
+    }
+    #[inline]
+    pub fn set_outline_colour(&mut self, value: impl Into<String>) {
+        self.outline_colour = value.into();
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn back_colour(&self) -> &str {
+        &self.back_colour
+    }
+    #[inline]
+    pub fn set_back_colour(&mut self, value: impl Into<String>) {
+        self.back_colour = value.into();
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn bold(&self) -> i32 {
+        self.bold
+    }
+    #[inline]
+    pub fn set_bold(&mut self, value: i32) {
+        self.bold = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn italic(&self) -> i32 {
+        self.italic
+    }
+    #[inline]
+    pub fn set_italic(&mut self, value: i32) {
+        self.italic = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn underline(&self) -> i32 {
+        self.underline
+    }
+    #[inline]
+    pub fn set_underline(&mut self, value: i32) {
+        self.underline = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn strike_out(&self) -> i32 {
+        self.strike_out
+    }
+    #[inline]
+    pub fn set_strike_out(&mut self, value: i32) {
+        self.strike_out = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn scale_x(&self) -> f64 {
+        self.scale_x
+    }
+    #[inline]
+    pub fn set_scale_x(&mut self, value: f64) {
+        self.scale_x = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn scale_y(&self) -> f64 {
+        self.scale_y
+    }
+    #[inline]
+    pub fn set_scale_y(&mut self, value: f64) {
+        self.scale_y = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn spacing(&self) -> f64 {
+        self.spacing
+    }
+    #[inline]
+    pub fn set_spacing(&mut self, value: f64) {
+        self.spacing = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn angle(&self) -> f64 {
+        self.angle
+    }
+    #[inline]
+    pub fn set_angle(&mut self, value: f64) {
+        self.angle = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn border_style(&self) -> i32 {
+        self.border_style
+    }
+    #[inline]
+    pub fn set_border_style(&mut self, value: i32) {
+        self.border_style = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn outline(&self) -> f64 {
+        self.outline
+    }
+    #[inline]
+    pub fn set_outline(&mut self, value: f64) {
+        self.outline = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn shadow(&self) -> f64 {
+        self.shadow
+    }
+    #[inline]
+    pub fn set_shadow(&mut self, value: f64) {
+        self.shadow = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn alignment(&self) -> i32 {
+        self.alignment
+    }
+    #[inline]
+    pub fn set_alignment(&mut self, value: i32) {
+        self.alignment = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn margin_l(&self) -> i32 {
+        self.margin_l
+    }
+    #[inline]
+    pub fn set_margin_l(&mut self, value: i32) {
+        self.margin_l = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn margin_r(&self) -> i32 {
+        self.margin_r
+    }
+    #[inline]
+    pub fn set_margin_r(&mut self, value: i32) {
+        self.margin_r = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn margin_v(&self) -> i32 {
+        self.margin_v
+    }
+    #[inline]
+    pub fn set_margin_v(&mut self, value: i32) {
+        self.margin_v = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn encoding(&self) -> i32 {
+        self.encoding
+    }
+    #[inline]
+    pub fn set_encoding(&mut self, value: i32) {
+        self.encoding = value;
+        self.raw_line = None;
+    }
+
+    /// Returns `true` if this style still holds an uninvalidated verbatim source line.
+    #[inline]
+    #[must_use]
+    pub const fn has_cached_raw_line(&self) -> bool {
+        self.raw_line.is_some()
     }
 }
 
@@ -554,13 +814,9 @@ impl EventsSection {
     }
 
     /// Maps logical event index `idx` to its position in `self.entries`.
-    /// Fast-path O(1) when all entries up to `idx` are `EventEntry::Event` (typical Aegisub files).
     #[must_use]
     pub fn entry_index_of_event(&self, idx: usize) -> Option<usize> {
         if let Some(EventEntry::Event(_)) = self.entries.get(idx) {
-            // Verify there are no non-event entries before `idx`? For O(1) on standard files
-            // without comments/blanks in [Events], we still need exactness if comments exist.
-            // Check if all entries are events (common case: scan only if needed).
             if self
                 .entries
                 .iter()
@@ -647,23 +903,23 @@ impl EventKind {
 }
 
 /// Single ASS event line (`Dialogue:` or `Comment:`).
+///
+/// All fields are mutated exclusively through setters (or `EditCommand`), which automatically
+/// invalidate the private `raw_line` cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssEvent {
-    pub kind: EventKind,
-    pub layer: i32,
-    pub start: AssTime,
-    pub end: AssTime,
-    pub style: String,
-    pub name: String,
-    pub margin_l: i32,
-    pub margin_r: i32,
-    pub margin_v: i32,
-    pub effect: String,
-    pub text: String,
-    /// Optional raw line stored only when the input had non-canonical formatting (e.g. extra
-    /// leading zeros in margins/timestamps or custom unknown columns) for byte-identical output.
-    /// Cleared automatically on edits via [`AssEvent::set_text`] or [`AssEvent::mark_dirty`].
-    pub raw_line: Option<String>,
+    pub(crate) kind: EventKind,
+    pub(crate) layer: i32,
+    pub(crate) start: AssTime,
+    pub(crate) end: AssTime,
+    pub(crate) style: String,
+    pub(crate) name: String,
+    pub(crate) margin_l: i32,
+    pub(crate) margin_r: i32,
+    pub(crate) margin_v: i32,
+    pub(crate) effect: String,
+    pub(crate) text: String,
+    pub(crate) raw_line: Option<String>,
 }
 
 impl Default for AssEvent {
@@ -685,15 +941,144 @@ impl Default for AssEvent {
     }
 }
 
+#[allow(missing_docs)]
 impl AssEvent {
-    /// Updates `text` and clears `raw_line` so serialization emits the updated text.
-    pub fn set_text(&mut self, text: String) {
-        self.text = text;
+    /// Creates a new `Dialogue` event with the given start, end, and text.
+    #[must_use]
+    pub fn dialogue(start: AssTime, end: AssTime, text: impl Into<String>) -> Self {
+        Self {
+            start,
+            end,
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn kind(&self) -> EventKind {
+        self.kind
+    }
+    #[inline]
+    pub fn set_kind(&mut self, value: EventKind) {
+        self.kind = value;
         self.raw_line = None;
     }
 
-    /// Clears cached raw formatting so serialization reflects edited typed fields.
-    pub fn mark_dirty(&mut self) {
+    #[inline]
+    #[must_use]
+    pub const fn layer(&self) -> i32 {
+        self.layer
+    }
+    #[inline]
+    pub fn set_layer(&mut self, value: i32) {
+        self.layer = value;
         self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn start(&self) -> AssTime {
+        self.start
+    }
+    #[inline]
+    pub fn set_start(&mut self, value: AssTime) {
+        self.start = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn end(&self) -> AssTime {
+        self.end
+    }
+    #[inline]
+    pub fn set_end(&mut self, value: AssTime) {
+        self.end = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn style(&self) -> &str {
+        &self.style
+    }
+    #[inline]
+    pub fn set_style(&mut self, value: impl Into<String>) {
+        self.style = value.into();
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[inline]
+    pub fn set_name(&mut self, value: impl Into<String>) {
+        self.name = value.into();
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn margin_l(&self) -> i32 {
+        self.margin_l
+    }
+    #[inline]
+    pub fn set_margin_l(&mut self, value: i32) {
+        self.margin_l = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn margin_r(&self) -> i32 {
+        self.margin_r
+    }
+    #[inline]
+    pub fn set_margin_r(&mut self, value: i32) {
+        self.margin_r = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn margin_v(&self) -> i32 {
+        self.margin_v
+    }
+    #[inline]
+    pub fn set_margin_v(&mut self, value: i32) {
+        self.margin_v = value;
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn effect(&self) -> &str {
+        &self.effect
+    }
+    #[inline]
+    pub fn set_effect(&mut self, value: impl Into<String>) {
+        self.effect = value.into();
+        self.raw_line = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    #[inline]
+    pub fn set_text(&mut self, value: impl Into<String>) {
+        self.text = value.into();
+        self.raw_line = None;
+    }
+
+    /// Returns `true` if this event still holds an uninvalidated verbatim source line.
+    #[inline]
+    #[must_use]
+    pub const fn has_cached_raw_line(&self) -> bool {
+        self.raw_line.is_some()
     }
 }

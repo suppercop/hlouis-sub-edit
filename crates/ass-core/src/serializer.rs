@@ -16,34 +16,37 @@ pub fn serialize_ass(script: &ScriptFile) -> String {
         out.push('\u{FEFF}');
     }
 
-    let nl = script.line_ending.as_str();
-    let mut first_line = true;
+    let mut nl = NewlineWriter {
+        default: script.line_ending,
+        per_line: script.line_endings.as_deref(),
+        line_idx: 0,
+    };
 
     for section in &script.sections {
         match section {
             Section::Preamble(lines) => {
                 for line in lines {
-                    start_line(&mut out, nl, &mut first_line);
+                    nl.start_line(&mut out);
                     out.push_str(line);
                 }
             }
             Section::ScriptInfo(kv) | Section::AegisubGarbage(kv) => {
-                write_kv_section(&mut out, kv, nl, &mut first_line);
+                write_kv_section(&mut out, kv, &mut nl);
             }
             Section::Styles(sec) => {
-                write_styles_section(&mut out, sec, nl, &mut first_line);
+                write_styles_section(&mut out, sec, &mut nl);
             }
             Section::Events(sec) => {
-                write_events_section(&mut out, sec, nl, &mut first_line);
+                write_events_section(&mut out, sec, &mut nl);
             }
             Section::Fonts(raw) | Section::Graphics(raw) | Section::Unknown(raw) => {
-                write_raw_section(&mut out, raw, nl, &mut first_line);
+                write_raw_section(&mut out, raw, &mut nl);
             }
         }
     }
 
-    if script.trailing_newline && !first_line {
-        out.push_str(nl);
+    if script.trailing_newline && nl.line_idx > 0 {
+        nl.finish(&mut out);
     }
 
     out
@@ -75,19 +78,41 @@ fn estimate_capacity(script: &ScriptFile) -> usize {
     cap
 }
 
-fn start_line(out: &mut String, nl: &str, first_line: &mut bool) {
-    if !*first_line {
-        out.push_str(nl);
-    }
-    *first_line = false;
+struct NewlineWriter<'a> {
+    default: crate::model::LineEnding,
+    per_line: Option<&'a [crate::model::LineEnding]>,
+    line_idx: usize,
 }
 
-fn write_kv_section(out: &mut String, sec: &KeyValueSection, nl: &str, first_line: &mut bool) {
-    start_line(out, nl, first_line);
+impl NewlineWriter<'_> {
+    #[inline]
+    fn start_line(&mut self, out: &mut String) {
+        if self.line_idx > 0 {
+            let le = self
+                .per_line
+                .and_then(|v| v.get(self.line_idx - 1).copied())
+                .unwrap_or(self.default);
+            out.push_str(le.as_str());
+        }
+        self.line_idx += 1;
+    }
+
+    #[inline]
+    fn finish(&self, out: &mut String) {
+        let le = self
+            .per_line
+            .and_then(|v| v.get(self.line_idx - 1).copied())
+            .unwrap_or(self.default);
+        out.push_str(le.as_str());
+    }
+}
+
+fn write_kv_section(out: &mut String, sec: &KeyValueSection, nl: &mut NewlineWriter<'_>) {
+    nl.start_line(out);
     out.push_str(&sec.header);
 
     for entry in &sec.entries {
-        start_line(out, nl, first_line);
+        nl.start_line(out);
         match entry {
             KeyValueEntry::KeyValue {
                 key,
@@ -104,24 +129,24 @@ fn write_kv_section(out: &mut String, sec: &KeyValueSection, nl: &str, first_lin
     }
 }
 
-fn write_raw_section(out: &mut String, sec: &RawSection, nl: &str, first_line: &mut bool) {
-    start_line(out, nl, first_line);
+fn write_raw_section(out: &mut String, sec: &RawSection, nl: &mut NewlineWriter<'_>) {
+    nl.start_line(out);
     out.push_str(&sec.header);
     for line in &sec.lines {
-        start_line(out, nl, first_line);
+        nl.start_line(out);
         out.push_str(line);
     }
 }
 
-fn write_styles_section(out: &mut String, sec: &StylesSection, nl: &str, first_line: &mut bool) {
-    start_line(out, nl, first_line);
+fn write_styles_section(out: &mut String, sec: &StylesSection, nl: &mut NewlineWriter<'_>) {
+    nl.start_line(out);
     out.push_str(&sec.header);
 
     if let Some(raw_fmt) = &sec.raw_format_line {
-        start_line(out, nl, first_line);
+        nl.start_line(out);
         out.push_str(raw_fmt);
     } else if !sec.format.is_empty() {
-        start_line(out, nl, first_line);
+        nl.start_line(out);
         out.push_str("Format: ");
         for (i, col) in sec.format.iter().enumerate() {
             if i > 0 {
@@ -132,7 +157,7 @@ fn write_styles_section(out: &mut String, sec: &StylesSection, nl: &str, first_l
     }
 
     for entry in &sec.entries {
-        start_line(out, nl, first_line);
+        nl.start_line(out);
         match entry {
             StyleEntry::Style(style) => write_style_line(out, style, &sec.format),
             StyleEntry::Comment(line) | StyleEntry::Raw(line) => out.push_str(line),
@@ -210,15 +235,15 @@ fn write_ass_number(out: &mut String, val: f64) {
     }
 }
 
-fn write_events_section(out: &mut String, sec: &EventsSection, nl: &str, first_line: &mut bool) {
-    start_line(out, nl, first_line);
+fn write_events_section(out: &mut String, sec: &EventsSection, nl: &mut NewlineWriter<'_>) {
+    nl.start_line(out);
     out.push_str(&sec.header);
 
     if let Some(raw_fmt) = &sec.raw_format_line {
-        start_line(out, nl, first_line);
+        nl.start_line(out);
         out.push_str(raw_fmt);
     } else if !sec.format.is_empty() {
-        start_line(out, nl, first_line);
+        nl.start_line(out);
         out.push_str("Format: ");
         for (i, col) in sec.format.iter().enumerate() {
             if i > 0 {
@@ -231,7 +256,7 @@ fn write_events_section(out: &mut String, sec: &EventsSection, nl: &str, first_l
     let is_standard_order = is_default_event_format(&sec.format);
 
     for entry in &sec.entries {
-        start_line(out, nl, first_line);
+        nl.start_line(out);
         match entry {
             EventEntry::Event(ev) => {
                 if let Some(raw) = &ev.raw_line {
