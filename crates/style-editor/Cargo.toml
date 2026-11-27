@@ -1,0 +1,20 @@
+[package]
+name = "style-editor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ass-core = { path = "../ass-core" }
+styles-catalog = { path = "../styles-catalog" }
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "style_editor"
+harness = false
+
+[lints]
+workspace = true
