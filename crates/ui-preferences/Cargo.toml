@@ -1,0 +1,26 @@
+[package]
+name = "ui-preferences"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+aegisub-config = { path = "../aegisub-config" }
+commands = { path = "../commands" }
+egui = { workspace = true, features = ["default_fonts"] }
+i18n-catalog = { path = "../i18n-catalog" }
+settings = { path = "../settings" }
+theme = { path = "../theme" }
+ui-theme = { path = "../ui-theme" }
+
+[dev-dependencies]
+criterion = "0.5"
+egui_kittest = "0.37.0"
+tempfile = "3.14"
+
+[[bench]]
+name = "ui_preferences"
+harness = false

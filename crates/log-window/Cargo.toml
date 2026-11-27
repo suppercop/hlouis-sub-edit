@@ -1,0 +1,24 @@
+[package]
+name = "log-window"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+egui = { workspace = true, features = ["default_fonts"] }
+i18n-catalog = { path = "../i18n-catalog" }
+settings = { path = "../settings" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[dev-dependencies]
+criterion = "0.5"
+egui_kittest = "0.37.0"
+tempfile = "3.14"
+
+[[bench]]
+name = "log_window"
+harness = false

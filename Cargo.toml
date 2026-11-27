@@ -61,6 +61,11 @@ members = [
     "crates/ui-shell",
     "crates/kara-templater",
     "crates/spectrum",
+    "crates/ui-preferences",
+    "crates/log-window",
+    "crates/recovery",
+    "crates/version-check",
+    "crates/perf-report",
 ]
 
 [workspace.package]
