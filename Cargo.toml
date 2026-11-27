@@ -60,6 +60,7 @@ members = [
     "crates/ui-dialogs",
     "crates/ui-shell",
     "crates/kara-templater",
+    "crates/spectrum",
 ]
 
 [workspace.package]
