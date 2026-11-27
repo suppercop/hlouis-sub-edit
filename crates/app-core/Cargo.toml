@@ -1,0 +1,58 @@
+[package]
+name = "app-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+aegisub-config = { path = "../aegisub-config" }
+ass-core = { path = "../ass-core" }
+ass-tools = { path = "../ass-tools" }
+audio-peaks = { path = "../audio-peaks" }
+audio-view = { path = "../audio-view" }
+autosave = { path = "../autosave" }
+commands = { path = "../commands" }
+dialogs-model = { path = "../dialogs-model" }
+document = { path = "../document" }
+edit-ops = { path = "../edit-ops" }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+egui = { workspace = true, features = ["default_fonts"] }
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
+hlouis-tools = { path = "../hlouis-tools" }
+hound = "3.5"
+i18n-catalog = { path = "../i18n-catalog" }
+kara-templater = { path = "../kara-templater" }
+karaoke-timing = { path = "../karaoke-timing" }
+karaskel = { path = "../karaskel" }
+keyframes = { path = "../keyframes" }
+layout = { path = "../layout" }
+mkv-import = { path = "../mkv-import" }
+mkv-subs = { path = "../mkv-subs" }
+perf-metrics = { path = "../perf-metrics" }
+playback = { path = "../playback" }
+png = "0.17"
+settings = { path = "../settings" }
+template-doctor = { path = "../template-doctor" }
+theme = { path = "../theme" }
+thiserror = { workspace = true }
+timing-controller = { path = "../timing-controller" }
+ui-audio = { path = "../ui-audio" }
+ui-dialogs = { path = "../ui-dialogs" }
+ui-editbox = { path = "../ui-editbox" }
+ui-grid = { path = "../ui-grid" }
+ui-mkv-import = { path = "../ui-mkv-import" }
+ui-preferences = { path = "../ui-preferences" }
+ui-shell = { path = "../ui-shell" }
+ui-theme = { path = "../ui-theme" }
+ui-video = { path = "../ui-video" }
+
+[dev-dependencies]
+golden-tools = { path = "../golden-tools" }
+tempfile = "3"
+
+[[bin]]
+name = "hlouis-ui-demo"
+path = "src/bin/hlouis-ui-demo.rs"
