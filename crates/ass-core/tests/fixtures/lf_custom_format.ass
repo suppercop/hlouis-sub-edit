@@ -1,0 +1,10 @@
+[Script Info]
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize
+Style: Mini,Arial,36
+
+[Events]
+Format: Start, End, Style, Layer, Text
+Dialogue: 0:00:00.50,0:00:02.00,Mini,2,Custom order, with comma
