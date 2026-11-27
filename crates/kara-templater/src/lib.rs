@@ -536,10 +536,10 @@ impl KaraTemplater {
                         if pt.noblank && syl_text.trim().is_empty() {
                             continue;
                         }
-                        if let Some(ref req_fx) = pt.fx
-                            && karaskel_out.syllable_fx(syl) != req_fx
-                        {
-                            continue;
+                        if let Some(ref req_fx) = pt.fx {
+                            if karaskel_out.syllable_fx(syl) != req_fx {
+                                continue;
+                            }
                         }
                         set_syl_globals(&lua, line, syl, syl_text)?;
 
@@ -907,7 +907,7 @@ fn create_sandbox(config: &EngineConfig) -> Result<Lua, KaraError> {
     Ok(lua)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 fn install_tenv_helpers(
     lua: &Lua,
     meta: &ScriptMeta,
@@ -1023,6 +1023,76 @@ fn install_tenv_helpers(
         })
         .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
     let _ = globals.set("maxloop", maxloop_fn);
+
+    // Install LuaJIT-compatible `bit` library when running under vendored PUC Lua 5.1.
+    if globals.get::<Table>("bit").is_err() {
+        let bit_tbl = lua
+            .create_table()
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let tobit = lua
+            .create_function(|_, x: f64| {
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(x as i32)
+            })
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let bnot = lua
+            .create_function(|_, x: i32| Ok(!x))
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let band = lua
+            .create_function(|_, args: mlua::Variadic<i32>| {
+                Ok(args.into_iter().fold(!0i32, |acc, v| acc & v))
+            })
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let bor = lua
+            .create_function(|_, args: mlua::Variadic<i32>| {
+                Ok(args.into_iter().fold(0i32, |acc, v| acc | v))
+            })
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let bxor = lua
+            .create_function(|_, args: mlua::Variadic<i32>| {
+                Ok(args.into_iter().fold(0i32, |acc, v| acc ^ v))
+            })
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let lshift = lua
+            .create_function(|_, (x, n): (i32, u32)| Ok(x.wrapping_shl(n & 31)))
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let rshift = lua
+            .create_function(|_, (x, n): (i32, u32)| {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+                Ok(((x as u32).wrapping_shr(n & 31)) as i32)
+            })
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let arshift = lua
+            .create_function(|_, (x, n): (i32, u32)| Ok(x.wrapping_shr(n & 31)))
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let tohex = lua
+            .create_function(|_, (x, n): (i32, Option<i32>)| {
+                #[allow(clippy::cast_sign_loss)]
+                let u = x as u32;
+                let width = n.unwrap_or(8);
+                let upper = width < 0;
+                let digits = usize::try_from(width.unsigned_abs())
+                    .unwrap_or(8)
+                    .clamp(1, 8);
+                let full = if upper {
+                    format!("{u:08X}")
+                } else {
+                    format!("{u:08x}")
+                };
+                Ok(full[8 - digits..].to_owned())
+            })
+            .map_err(|e| KaraError::SandboxInit(e.to_string()))?;
+        let _ = bit_tbl.set("tobit", tobit);
+        let _ = bit_tbl.set("bnot", bnot);
+        let _ = bit_tbl.set("band", band);
+        let _ = bit_tbl.set("bor", bor);
+        let _ = bit_tbl.set("bxor", bxor);
+        let _ = bit_tbl.set("lshift", lshift);
+        let _ = bit_tbl.set("rshift", rshift);
+        let _ = bit_tbl.set("arshift", arshift);
+        let _ = bit_tbl.set("tohex", tohex);
+        let _ = globals.set("bit", bit_tbl);
+    }
 
     Ok(())
 }
@@ -1478,5 +1548,19 @@ mod tests {
             .apply(&mut s2, &MonoExtents)
             .expect_err("infinite loop must time out");
         assert!(matches!(err2, KaraError::LuaError { line_index: 0, .. }));
+    }
+
+    #[test]
+    fn bit_library_compat_works_under_lua51_and_luajit() {
+        let ass = format!(
+            "{}{}",
+            base_header(),
+            r"Comment: 0,0:00:00.00,0:00:00.00,Default,,0,0,0,template syl,{\1c&H!bit.tohex(bit.bor(bit.lshift(0x12,8),0x34), -4)!&}
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,karaoke,{\k50}bit
+"
+        );
+        let (script, report) = run_ass(&ass);
+        assert_eq!(report.generated_fx_lines, 1);
+        assert_eq!(fx_lines(&script)[0].text(), r"{\1c&H1234&}bit");
     }
 }

@@ -12,6 +12,11 @@ use ass_tools::{
 };
 use std::collections::BTreeSet;
 
+fn apply_resample(script: &mut ScriptFile, opts: &ResampleOptions) -> Result<(), String> {
+    let cmd = resample_resolution(script, opts).map_err(|e| e.to_string())?;
+    cmd.apply(script).map_err(|e| e.to_string())
+}
+
 /// All 10 golden fixture cases covered by the regression harness.
 pub const GOLDEN_CASES: [&str; 10] = [
     "01_shift_forward_2s",
@@ -134,20 +139,15 @@ pub fn run_golden_case(case_name: &str, input_ass: &str) -> Result<String, Strin
             cmd.apply(&mut script).map_err(|e| e.to_string())?;
         }
         "08_resample_720p_to_1080p" => {
-            let cmd = resample_resolution(&script, &ResampleOptions::new(1920, 1080))
-                .map_err(|e| e.to_string())?;
-            cmd.apply(&mut script).map_err(|e| e.to_string())?;
+            apply_resample(&mut script, &ResampleOptions::new(1920, 1080))?;
         }
         "09_resample_1080p_to_720p" => {
-            let cmd = resample_resolution(&script, &ResampleOptions::new(1280, 720))
-                .map_err(|e| e.to_string())?;
-            cmd.apply(&mut script).map_err(|e| e.to_string())?;
+            apply_resample(&mut script, &ResampleOptions::new(1280, 720))?;
         }
         "10_resample_stretch_pos_clip" => {
             let mut opts = ResampleOptions::new(1920, 1080);
             opts.ar_mode = AspectRatioMode::Stretch;
-            let cmd = resample_resolution(&script, &opts).map_err(|e| e.to_string())?;
-            cmd.apply(&mut script).map_err(|e| e.to_string())?;
+            apply_resample(&mut script, &opts)?;
         }
         other => return Err(format!("unknown golden case: {other}")),
     }

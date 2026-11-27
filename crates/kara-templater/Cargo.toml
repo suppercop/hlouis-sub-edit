@@ -7,10 +7,18 @@ license = "MIT OR Apache-2.0"
 [lints]
 workspace = true
 
+[features]
+# Vendored PUC Lua 5.1 builds out-of-the-box with `cc` on Windows/MSVC from any normal shell
+# (no vcvarsall/msvcbuild required) and includes full LuaJIT `bit.*` library compatibility.
+# Enable `--no-default-features --features luajit` when building with an MSVC dev shell or Linux.
+default = ["lua51"]
+lua51 = ["mlua/lua51"]
+luajit = ["mlua/luajit"]
+
 [dependencies]
 ass-core = { path = "../ass-core" }
 karaskel = { path = "../karaskel" }
-mlua = { version = "0.10", features = ["luajit", "vendored"] }
+mlua = { version = "0.10", default-features = false, features = ["vendored"] }
 template-doctor = { path = "../template-doctor" }
 thiserror = "2.0"
 
