@@ -11,7 +11,7 @@ Trống (Claude chính sắp hết hạn mức 5 giờ, Claude thứ hai có th�
 - **PR #1 (`phase-0`)**: đã sửa theo review (47e7833, a27603a), CI xanh, merge được. **Chưa merge.**
 - **PR #2 (`perf-budget`)**: CI xanh. RAM private khoảng 360–400 MiB (trước là 921 MB), hết vẽ lại khi rảnh, benchmark Criterion và cổng CI chặn khi chậm đi quá 10%. Số liệu do agent tự đo. **Agent đang rebase PR #2 lên phase-0 mới** (model high).
 - **Nhánh `phase-1`** (76c0818): crate `ass-core` (do Gemini Neon web viết, Claude áp và sửa). Đọc rồi ghi file golden-ass thật (6.865 dòng do Aegisub 3.5.1 lưu) ra giống hệt từng byte. Đọc 20k dòng 6,9 ms, ghi 5 ms, undo 53 µs. **Agent KHÔNG áp lại ass-core.patch.**
-- **Gemini Neon web**: được giao phần tiếp theo của Phase 1, gồm các sửa cho ass-core và crate `mkv-subs` (đọc phụ đề MKV không giới hạn số track). Đề bài nằm trong thread dự án; patch trả về sẽ đặt trong `Downloads\Claude Code\gemini-web-review\`.
+- **Gemini Neon web**: đang làm `ass-core-followups.patch` (giữ CRLF/LF lẫn lộn, Windows-1258 câu ngắn, che raw_line, file mẫu dạng văn bản) và `ass-tools.patch` (Shift Times, Find & Replace, Select Lines, Join/Split, TPP). Đề bài: `gemini-web-review\PROMPT-PHASE1-FOLLOWUP.txt`. Việc tiếp theo cho Neon: crate `mkv-subs` (đọc phụ đề MKV không giới hạn track), đề bài đã soạn sẵn trong thread dự án (khối "Part B").
 
 ## Bước kế tiếp
 
