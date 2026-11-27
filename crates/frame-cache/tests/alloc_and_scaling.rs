@@ -84,27 +84,30 @@ fn scaling_n_vs_2n_get_insert() {
         c2.insert(b);
     }
 
-    // Use min-of-3 to filter scheduler noise: O(1) per op means 2n ops take ≤ 2×
-    // wall time of n ops.  Allow ×8 tolerance to cover loaded CI runners.
-    let mut d1_min = u128::MAX;
-    let mut d2_min = u128::MAX;
-    for _ in 0..3 {
-        let t1 = Instant::now();
-        for i in 0..5_000u32 {
-            let _ = std::hint::black_box(c1.get(i % 64));
-        }
-        d1_min = d1_min.min(t1.elapsed().as_nanos().max(1));
+    // Wall-clock ratios are noisy on a shared runner: each attempt takes the
+    // min of 3 repetitions per size, and the test passes if any of 5 attempts
+    // is within the original 5x tolerance (2n ops should take ~2x of n ops).
+    let attempt = |c1: &mut FrameCache, c2: &mut FrameCache| {
+        let mut d1_min = u128::MAX;
+        let mut d2_min = u128::MAX;
+        for _ in 0..3 {
+            let t1 = Instant::now();
+            for i in 0..5_000u32 {
+                let _ = std::hint::black_box(c1.get(i % 64));
+            }
+            d1_min = d1_min.min(t1.elapsed().as_nanos().max(1));
 
-        let t2 = Instant::now();
-        for i in 0..10_000u32 {
-            let _ = std::hint::black_box(c2.get(i % 128));
+            let t2 = Instant::now();
+            for i in 0..10_000u32 {
+                let _ = std::hint::black_box(c2.get(i % 128));
+            }
+            d2_min = d2_min.min(t2.elapsed().as_nanos().max(1));
         }
-        d2_min = d2_min.min(t2.elapsed().as_nanos().max(1));
-    }
-
+        d2_min <= d1_min * 5
+    };
     assert!(
-        d2_min <= d1_min * 8,
-        "expected O(1) per op (min-of-3): n={d1_min}ns, 2n={d2_min}ns"
+        (0..5).any(|_| attempt(&mut c1, &mut c2)),
+        "expected O(1) per op (5x tolerance) in 5 consecutive attempts"
     );
 }
 
