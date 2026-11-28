@@ -15,62 +15,13 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use ass_core::{AssEvent, AssTime, EventKind, ScriptFile};
-use egui::{
-    Align, Color32, FontId, Galley, Key, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2,
-};
+use egui::{Align, Color32, FontId, Key, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2};
 use grid_model::{ColumnVisibility, GridColumn, GridModel, KeyNav, RowFlags, RowTiming};
 use i18n_catalog::Catalog;
 use std::fmt::Write as _;
-use std::sync::Arc;
 use syntax_highlight::{GridDisplayConfig, format_grid_text_into};
 use theme::Palette;
 use ui_theme::{one_px_stroke, rgba, snap_px};
-
-#[derive(Clone)]
-struct CachedHeaderGalley {
-    label: String,
-    font_bits: u32,
-    color: Color32,
-    galley: Arc<Galley>,
-}
-
-impl std::fmt::Debug for CachedHeaderGalley {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedHeaderGalley")
-            .field("label", &self.label)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone)]
-struct CachedGridRowGalleys {
-    row_idx: usize,
-    rev: u64,
-    text_col: Color32,
-    font_bits: u32,
-    cols: [Option<Arc<Galley>>; 12],
-}
-
-impl Default for CachedGridRowGalleys {
-    fn default() -> Self {
-        Self {
-            row_idx: usize::MAX,
-            rev: 0,
-            text_col: Color32::TRANSPARENT,
-            font_bits: 0,
-            cols: std::array::from_fn(|_| None),
-        }
-    }
-}
-
-impl std::fmt::Debug for CachedGridRowGalleys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedGridRowGalleys")
-            .field("row_idx", &self.row_idx)
-            .field("rev", &self.rev)
-            .finish_non_exhaustive()
-    }
-}
 
 /// Action emitted by the subtitle grid (mouse/keyboard selection or context menu).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +67,6 @@ pub struct SubtitleGridState {
     time_buf_start: String,
     time_buf_end: String,
     num_buf: String,
-    header_galleys: [Option<CachedHeaderGalley>; 12],
-    row_galley_cache: Vec<CachedGridRowGalleys>,
 }
 
 impl Default for SubtitleGridState {
@@ -176,8 +125,6 @@ impl Default for SubtitleGridState {
             time_buf_start: String::with_capacity(16),
             time_buf_end: String::with_capacity(16),
             num_buf: String::with_capacity(16),
-            header_galleys: std::array::from_fn(|_| None),
-            row_galley_cache: vec![CachedGridRowGalleys::default(); 128],
         }
     }
 }
@@ -475,7 +422,6 @@ pub fn show_subtitle_grid(
     );
 
     let ctx = ui.ctx().clone();
-    let font_bits = font_body.size.to_bits();
     let mut hx = header_rect.left();
     for &col in &state.column_order {
         if !SubtitleGridState::is_column_visible(&state.model.columns, col) {
@@ -490,25 +436,10 @@ pub fn show_subtitle_grid(
         let label = catalog
             .get(SubtitleGridState::column_header_key(col))
             .unwrap_or("?");
-        let hgalley = match &mut state.header_galleys[col_idx] {
-            Some(c)
-                if c.font_bits == font_bits && c.color == header_text_col && c.label == label =>
-            {
-                Arc::clone(&c.galley)
-            }
-            slot => {
-                let built = ctx.fonts_mut(|f| {
-                    f.layout_no_wrap(label.to_owned(), font_body.clone(), header_text_col)
-                });
-                *slot = Some(CachedHeaderGalley {
-                    label: label.to_owned(),
-                    font_bits,
-                    color: header_text_col,
-                    galley: Arc::clone(&built),
-                });
-                built
-            }
-        };
+        // No cross-frame galley cache: galleys embed font-atlas UVs, which go stale when
+        // egui grows or rebuilds the atlas. egui's own layout cache is atlas-aware.
+        let hgalley = ctx
+            .fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font_body.clone(), header_text_col));
         let gh = hgalley.size().y;
         painter.galley(
             Pos2::new(hx + 4.0, header_rect.center().y - gh * 0.5),
@@ -653,20 +584,6 @@ pub fn show_subtitle_grid(
 
             let mut cx = row_rect.left();
             let cy = row_rect.center().y;
-            let cache_slot = &mut state.row_galley_cache[row_idx & 127];
-            if cache_slot.row_idx != row_idx
-                || cache_slot.rev != row.rev
-                || cache_slot.text_col != text_col
-                || cache_slot.font_bits != font_bits
-            {
-                cache_slot.row_idx = row_idx;
-                cache_slot.rev = row.rev;
-                cache_slot.text_col = text_col;
-                cache_slot.font_bits = font_bits;
-                for c in &mut cache_slot.cols {
-                    *c = None;
-                }
-            }
             for &col in &state.column_order {
                 if !SubtitleGridState::is_column_visible(&state.model.columns, col) {
                     continue;
@@ -708,9 +625,7 @@ pub fn show_subtitle_grid(
                     }
                 }
 
-                let cell_galley = if let Some(ref existing) = cache_slot.cols[col_idx] {
-                    Arc::clone(existing)
-                } else {
+                let cell_galley = {
                     let cell_txt: &str = match col {
                         GridColumn::LineNumber => {
                             state.num_buf.clear();
@@ -764,7 +679,6 @@ pub fn show_subtitle_grid(
                     let built = ctx.fonts_mut(|f| {
                         f.layout_no_wrap(cell_txt.to_owned(), font_body.clone(), text_col)
                     });
-                    cache_slot.cols[col_idx] = Some(Arc::clone(&built));
                     built
                 };
                 let gsize = cell_galley.size();
@@ -969,5 +883,54 @@ mod tests {
             let _ = show_subtitle_grid(ui, &script, &mut state, Some(150), &pal, &cat);
         });
         harness.run();
+    }
+
+    /// Regression: cross-frame `Arc<Galley>` caches kept stale atlas UVs / pixels-per-point
+    /// after egui rebuilt its font atlas (garbled header and cells in the first real build).
+    #[test]
+    fn grid_galleys_are_fresh_after_atlas_rebuild() {
+        let mut script = sample_script(40);
+        let mut state = SubtitleGridState::default();
+        state.sync_from_script(&script);
+        let pal = theme::palette(ThemeSpec::Light);
+        let cat = Catalog::for_locale(Locale::En);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(ui_theme::build_font_definitions(
+            &ui_theme::FontConfig::default(),
+        ));
+        let frame = |ctx: &egui::Context, script: &ScriptFile, state: &mut SubtitleGridState| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = show_subtitle_grid(ui, script, state, None, &pal, &cat);
+            });
+            out.textures_delta.clear();
+            let galleys = ui_theme::galley_check::text_galleys(&out.shapes);
+            assert!(
+                galleys.iter().any(|g| g.job.text == "Start"),
+                "header must be painted"
+            );
+            ui_theme::galley_check::count_stale(ctx, &out.shapes)
+        };
+        assert_eq!(frame(&ctx, &script, &mut state), 0);
+        assert_eq!(frame(&ctx, &script, &mut state), 0);
+
+        // New glyphs (Vietnamese + CJK) land in the atlas, then the scale changes.
+        let sec = script.ensure_events_section_mut();
+        for i in 0..40usize {
+            sec.insert_event(
+                i,
+                AssEvent::dialogue(
+                    AssTime::from_cs(1_000),
+                    AssTime::from_cs(2_000),
+                    "Tiếng Việt ắặẳẵ ứừửữự ờởỡợ 日本語の字幕テスト 漢字かな",
+                ),
+            );
+        }
+        state.sync_from_script(&script);
+        assert_eq!(frame(&ctx, &script, &mut state), 0);
+        ctx.set_pixels_per_point(1.5);
+        assert_eq!(frame(&ctx, &script, &mut state), 0);
+        assert_eq!(frame(&ctx, &script, &mut state), 0);
+        ctx.set_pixels_per_point(1.0);
+        assert_eq!(frame(&ctx, &script, &mut state), 0);
     }
 }

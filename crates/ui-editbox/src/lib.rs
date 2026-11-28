@@ -22,66 +22,13 @@ use edit_box_ops::{
     toggle_bold, toggle_italic, toggle_strikeout, toggle_underline,
 };
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, Galley, Key, Pos2, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
+use egui::{Color32, FontId, Key, Pos2, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
 use i18n_catalog::Catalog;
 use keyframes::{TimeType, Timecodes};
 use std::fmt::Write as _;
-use std::sync::Arc;
 use syntax_highlight::{IncrementalTokenizer, TokenKind, TokenSpan, tokenize_into};
 use theme::Palette;
 use ui_theme::rgba;
-
-#[derive(Clone)]
-struct CachedEditGalley {
-    text: String,
-    wrap_width_bits: u32,
-    use_monospace: bool,
-    pal_sig: [u32; 9],
-    galley: Arc<Galley>,
-}
-
-impl std::fmt::Debug for CachedEditGalley {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedEditGalley")
-            .field("len", &self.text.len())
-            .field("wrap_width_bits", &self.wrap_width_bits)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone)]
-struct CachedAbGalley {
-    color: Color32,
-    galley: Arc<Galley>,
-}
-
-impl std::fmt::Debug for CachedAbGalley {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedAbGalley")
-            .field("color", &self.color)
-            .finish_non_exhaustive()
-    }
-}
-
-#[inline]
-const fn rgba_u32(c: theme::Rgba8) -> u32 {
-    u32::from_le_bytes([c.r, c.g, c.b, c.a])
-}
-
-#[inline]
-const fn palette_syntax_sig(p: &Palette) -> [u32; 9] {
-    [
-        rgba_u32(p.syntax_plain),
-        rgba_u32(p.syntax_brace),
-        rgba_u32(p.syntax_tag_name),
-        rgba_u32(p.syntax_tag_value),
-        rgba_u32(p.syntax_karaoke),
-        rgba_u32(p.syntax_escape),
-        rgba_u32(p.syntax_comment),
-        rgba_u32(p.syntax_drawing),
-        rgba_u32(p.syntax_error),
-    ]
-}
 
 /// Persistent UI state for the subtitle edit box.
 #[derive(Debug, Clone)]
@@ -111,8 +58,6 @@ pub struct EditBoxState {
     max_len_buf: String,
     last_max_len: Option<usize>,
     span_scratch: Vec<TokenSpan>,
-    galley_cache: Option<CachedEditGalley>,
-    ab_galleys: [Option<CachedAbGalley>; 4],
 }
 
 impl Default for EditBoxState {
@@ -145,8 +90,6 @@ impl Default for EditBoxState {
             max_len_buf: String::with_capacity(12),
             last_max_len: None,
             span_scratch: Vec::with_capacity(128),
-            galley_cache: None,
-            ab_galleys: [None, None, None, None],
         }
     }
 }
@@ -323,32 +266,17 @@ pub fn count_visible_chars_and_cps(text: &str, dur_cs: u32) -> (usize, u32) {
 }
 
 /// Paints a classic Aegisub `"AB"` colour-picker button (primary, secondary, outline, shadow).
-fn paint_ab_colour_button(
-    ui: &mut Ui,
-    fg_color: Color32,
-    cached: &mut Option<CachedAbGalley>,
-    pal: &Palette,
-    tooltip: &str,
-) -> bool {
+fn paint_ab_colour_button(ui: &mut Ui, fg_color: Color32, pal: &Palette, tooltip: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(22.0, 18.0), Sense::click());
     let bg = if resp.hovered() {
         rgba(pal.hover)
     } else {
         rgba(pal.toolbar_bg)
     };
-    let galley = match cached {
-        Some(entry) if entry.color == fg_color => Arc::clone(&entry.galley),
-        slot => {
-            let g = ui.fonts_mut(|f| {
-                f.layout_no_wrap("AB".to_owned(), FontId::proportional(10.5), fg_color)
-            });
-            *slot = Some(CachedAbGalley {
-                color: fg_color,
-                galley: Arc::clone(&g),
-            });
-            g
-        }
-    };
+    // No cross-frame galley cache: galleys embed font-atlas UVs that go stale when egui
+    // rebuilds the atlas (new glyphs). egui's own layout cache already deduplicates.
+    let galley =
+        ui.fonts_mut(|f| f.layout_no_wrap("AB".to_owned(), FontId::proportional(10.5), fg_color));
     let p = ui.painter();
     p.rect_filled(rect, 2.0, bg);
     p.rect_stroke(
@@ -791,13 +719,7 @@ pub fn show_edit_box(
             (3usize, r"{\4c&H000000&}", "Shadow colour (\\4c)"),
         ];
         for (idx, tag, tip) in ab_tags {
-            if paint_ab_colour_button(
-                ui,
-                state.colour_swatches[idx],
-                &mut state.ab_galleys[idx],
-                palette,
-                tip,
-            ) {
+            if paint_ab_colour_button(ui, state.colour_swatches[idx], palette, tip) {
                 let pos = state.last_cursor_byte.min(state.text_buf.len());
                 state.text_buf.insert_str(pos, tag);
                 let _ = doc.amend_text(line_idx, "colour", &state.text_buf);
@@ -849,7 +771,6 @@ pub fn show_edit_box(
 
     // ── Row 4: White (in Light mode) proportional UI font syntax-highlighted multiline TextEdit.
     let pal_clone = palette.clone();
-    let pal_sig = palette_syntax_sig(palette);
     let use_monospace = state.use_monospace;
     let edit_font = if use_monospace {
         FontId::monospace(12.5)
@@ -866,43 +787,14 @@ pub fn show_edit_box(
     } else {
         rgba(palette.grid_bg)
     };
-    let mut galley_cache = state.galley_cache.take();
     let mut span_scratch = std::mem::take(&mut state.span_scratch);
     let output = {
         let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
             let s = text.as_str();
-            let wrap_bits = wrap_width.to_bits();
-            if let Some(ref c) = galley_cache
-                && c.wrap_width_bits == wrap_bits
-                && c.use_monospace == use_monospace
-                && c.pal_sig == pal_sig
-                && c.text == s
-            {
-                return Arc::clone(&c.galley);
-            }
             tokenize_into(s, &mut span_scratch);
             let job =
                 build_highlighted_layout_job(s, &span_scratch, &pal_clone, &edit_font, wrap_width);
-            let g = ui.fonts_mut(|f| f.layout_job(job));
-            let cached_text = if let Some(mut old) = galley_cache.take() {
-                old.text.clear();
-                old.text.push_str(s);
-                old.wrap_width_bits = wrap_bits;
-                old.use_monospace = use_monospace;
-                old.pal_sig = pal_sig;
-                old.galley = Arc::clone(&g);
-                old
-            } else {
-                CachedEditGalley {
-                    text: s.to_owned(),
-                    wrap_width_bits: wrap_bits,
-                    use_monospace,
-                    pal_sig,
-                    galley: Arc::clone(&g),
-                }
-            };
-            galley_cache = Some(cached_text);
-            g
+            ui.fonts_mut(|f| f.layout_job(job))
         };
 
         TextEdit::multiline(&mut state.text_buf)
@@ -913,7 +805,6 @@ pub fn show_edit_box(
             .layouter(&mut layouter)
             .show(ui)
     };
-    state.galley_cache = galley_cache;
     state.span_scratch = span_scratch;
 
     if let Some(range) = output.cursor_range {
@@ -984,5 +875,45 @@ mod tests {
             let _ = show_edit_box(ui, &mut doc, &mut state, None, &pal, &cat);
         });
         harness.run();
+    }
+
+    /// Regression: the edit box (text layouter and the four "AB" colour buttons) must never
+    /// paint galleys cached across a font-atlas rebuild.
+    #[test]
+    fn edit_box_galleys_are_fresh_after_atlas_rebuild() {
+        let mut script = ScriptFile::new_default();
+        script.ensure_events_section_mut().insert_event(
+            0,
+            AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(250), r"{\an5}Hello\Nworld"),
+        );
+        let mut doc = DocumentController::new(script);
+        let mut state = EditBoxState::default();
+        let pal = theme::palette(ThemeSpec::Light);
+        let cat = Catalog::for_locale(Locale::En);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(ui_theme::build_font_definitions(
+            &ui_theme::FontConfig::default(),
+        ));
+        let frame =
+            |ctx: &egui::Context, doc: &mut DocumentController, state: &mut EditBoxState| {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let _ = show_edit_box(ui, doc, state, None, &pal, &cat);
+                });
+                out.textures_delta.clear();
+                let galleys = ui_theme::galley_check::text_galleys(&out.shapes);
+                assert!(
+                    galleys.iter().any(|g| g.job.text == "AB"),
+                    "AB buttons must be painted"
+                );
+                ui_theme::galley_check::count_stale(ctx, &out.shapes)
+            };
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        let _ = doc.amend_text(0, "test", "Tiếng Việt ắặẳẵ ứừửữự 日本語の字幕");
+        state.sync_active_line(&doc, None);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        ctx.set_pixels_per_point(1.5);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
     }
 }

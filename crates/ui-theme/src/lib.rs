@@ -501,3 +501,55 @@ mod tests {
         }
     }
 }
+
+/// Helpers for tests that guard against stale `Arc<Galley>` values (galleys embed font-atlas
+/// UVs and the pixels-per-point they were laid out at, so keeping one across frames breaks
+/// as soon as egui grows or rebuilds its font atlas).
+pub mod galley_check {
+    use egui::epaint::{ClippedShape, Shape};
+    use egui::{Context, Galley};
+    use std::sync::Arc;
+
+    fn collect(shape: &Shape, out: &mut Vec<Arc<Galley>>) {
+        match shape {
+            Shape::Text(t) => out.push(Arc::clone(&t.galley)),
+            Shape::Vec(v) => v.iter().for_each(|s| collect(s, out)),
+            _ => {}
+        }
+    }
+
+    /// Every text galley painted by `shapes`.
+    #[must_use]
+    pub fn text_galleys(shapes: &[ClippedShape]) -> Vec<Arc<Galley>> {
+        let mut out = Vec::new();
+        for cs in shapes {
+            collect(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    fn uvs(g: &Galley) -> Vec<[u32; 2]> {
+        g.rows
+            .iter()
+            .flat_map(|r| r.row.visuals.mesh.vertices.iter())
+            .map(|v| [v.uv.x.to_bits(), v.uv.y.to_bits()])
+            .collect()
+    }
+
+    /// Number of painted galleys that differ from a fresh layout of the same job at the
+    /// current pixels-per-point (wrong scale or stale atlas UVs). Must be `0`.
+    #[must_use]
+    pub fn count_stale(ctx: &Context, shapes: &[ClippedShape]) -> usize {
+        let ppp = ctx.pixels_per_point();
+        text_galleys(shapes)
+            .iter()
+            .filter(|g| {
+                if (g.pixels_per_point - ppp).abs() > f32::EPSILON {
+                    return true;
+                }
+                let fresh = ctx.fonts_mut(|f| f.layout_job((*g.job).clone()));
+                !Arc::ptr_eq(g, &fresh) && uvs(g) != uvs(&fresh)
+            })
+            .count()
+    }
+}
