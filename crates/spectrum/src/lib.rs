@@ -26,6 +26,12 @@ use theme::{Palette, Rgba8};
 /// Width of each cached spectrum tile in horizontal columns (pixels).
 pub const TILE_WIDTH: usize = 256;
 
+/// Derivation scale (gain) used by the editor. Speech recorded at a normal level (around
+/// -25 dBFS RMS) is barely lit at scale `1.0` (about 10% of the speech band), which paints a
+/// dim strip at the bottom of the view; `16.0` lifts quiet speech and music into the visible
+/// range while loud peaks still saturate to the hot end of the colour map.
+pub const DEFAULT_DERIVATION_SCALE: f32 = 16.0;
+
 /// Aegisub-compatible spectrum quality presets (`src/audio_renderer_spectrum.cpp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpectrumQuality {
@@ -99,7 +105,9 @@ impl ColorLut {
                 SpectrumColorScheme::IcyBlue => icy_blue_color(t),
                 SpectrumColorScheme::Green => green_color(t),
                 SpectrumColorScheme::ThemePalette => {
-                    lerp_rgba(palette.audio_bg, palette.audio_waveform, t)
+                    // Reach the full waveform colour at two thirds of the range so mid-level
+                    // energy (speech harmonics) is clearly visible against the background.
+                    lerp_rgba(palette.audio_bg, palette.audio_waveform, (t * 1.5).min(1.0))
                 }
             };
             normal[i] = c;
@@ -445,5 +453,73 @@ mod tests {
         let mut rgba = vec![0u8; 256 * 64 * 4];
         cache.render_viewport_into(0, 0, 256, 64, Some((10, 40)), &lut_icy, &mut rgba);
         assert_eq!(rgba[3], 255);
+    }
+
+    /// Speech-like signal at a normal recording level must light up a clearly visible part of
+    /// the view, and a quiet passage must not vanish (the "almost empty spectrum" bug).
+    #[test]
+    fn default_gain_makes_speech_and_quiet_audio_visible() {
+        let sr = 48_000u32;
+        let make = |level: f32| -> Vec<f32> {
+            let mut seed = 12_345u32;
+            (0..sr as usize * 2)
+                .map(|i| {
+                    let t = i as f32 / sr as f32;
+                    // Harmonics of a 140 Hz voice with a 1/k roll-off, syllable-like envelope.
+                    let env = 0.5 + 0.5 * (2.0 * PI * 3.0 * t).sin();
+                    let mut v = 0.0;
+                    for k in 1..=24 {
+                        v += (2.0 * PI * 140.0 * k as f32 * t).sin() / k as f32;
+                    }
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let noise = (seed >> 8) as f32 / 8_388_608.0 - 1.0;
+                    level * (v * env * 0.35 + noise * 0.02)
+                })
+                .collect()
+        };
+        let share_scaled = |level: f32, scale: f32| -> f32 {
+            let cache =
+                SpectrumCache::build_from_mono(&make(level), sr, SpectrumQuality::Better, scale);
+            let tile = cache
+                .tiles
+                .get(&TileKey {
+                    zoom_level: 0,
+                    tile_index: 0,
+                })
+                .expect("tile");
+            let bins = SpectrumQuality::Better.freq_bins();
+            // Speech band: 0..4 kHz of the 0..24 kHz range.
+            let band = bins / 6;
+            let mut lit = 0usize;
+            let mut total = 0usize;
+            for col in 0..tile.width {
+                for bin in 0..band {
+                    total += 1;
+                    if tile.intensities[col * bins + bin] >= 90 {
+                        lit += 1;
+                    }
+                }
+            }
+            lit as f32 / total as f32
+        };
+        let share_bright = |level: f32| share_scaled(level, DEFAULT_DERIVATION_SCALE);
+        // About -20 dBFS RMS speech-like level: a large part of the speech band is lit,
+        // far more than with the old unit gain (about 10%).
+        assert!(share_bright(0.5) > 0.30, "speech band too dark");
+        assert!(share_bright(0.5) > 3.0 * share_scaled(0.5, 1.0));
+        // A passage 20 dB quieter is still visible (it was completely black at unit gain).
+        assert_eq!(share_scaled(0.05, 1.0), 0.0);
+        assert!(share_bright(0.05) > 0.02, "quiet audio vanished");
+
+        // The theme colour map must be clearly different from the background at mid intensity.
+        let pal = theme::palette(ThemeSpec::Dark);
+        let lut = ColorLut::build(SpectrumColorScheme::ThemePalette, &pal);
+        let bg = lut.normal[0];
+        let mid = lut.normal[128];
+        let d = i32::from(mid.g) - i32::from(bg.g);
+        assert!(
+            d > 60,
+            "mid intensity not distinguishable from background: {d}"
+        );
     }
 }

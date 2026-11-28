@@ -49,6 +49,9 @@ struct Loaded {
 struct SpectrumChunk {
     start_frame: u64,
     end_frame: u64,
+    /// Frames of the audio cache that were already decoded when the chunk was built; anything
+    /// beyond is silence in the chunk and must be rebuilt once more audio has been decoded.
+    filled_at_build: u64,
     cache: SpectrumCache,
 }
 
@@ -453,10 +456,14 @@ impl AudioProvider for NativeAudio {
             .max(want_s + 1);
         let span = want_e - want_s;
         let mut sc = self.scratch.borrow_mut();
-        let covered = sc
-            .chunk
-            .as_ref()
-            .is_some_and(|c| c.start_frame <= want_s && c.end_frame >= want_e);
+        let filled_now = l.cache.filled_frames();
+        let covered = sc.chunk.as_ref().is_some_and(|c| {
+            c.start_frame <= want_s
+                && c.end_frame >= want_e
+                // A chunk built while the decoder had not reached this range holds silence:
+                // rebuild as soon as the decoder made progress.
+                && (c.filled_at_build >= want_e || filled_now <= c.filled_at_build)
+        });
         if !covered {
             let c_s = want_s.saturating_sub(span);
             let c_e = (want_e + span).min(l.total_frames);
@@ -470,10 +477,16 @@ impl AudioProvider for NativeAudio {
                 let sum: f32 = f.iter().map(|&s| f32::from(s)).sum();
                 sum / (32_768.0 * ch as f32)
             }));
-            let cache = SpectrumCache::build_from_mono(mono, l.sample_rate, quality, 1.0);
+            let cache = SpectrumCache::build_from_mono(
+                mono,
+                l.sample_rate,
+                quality,
+                spectrum::DEFAULT_DERIVATION_SCALE,
+            );
             sc.chunk = Some(SpectrumChunk {
                 start_frame: c_s,
                 end_frame: c_e,
+                filled_at_build: filled_now,
                 cache,
             });
         }
@@ -511,5 +524,80 @@ impl AudioProvider for NativeAudio {
         }
         *rgba_buf = rgba;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use theme::ThemeSpec;
+
+    fn tone_block(block: usize, frames: usize, total: usize) -> Box<[i16]> {
+        let start = block * 65_536;
+        (0..frames.min(total - start))
+            .map(|i| {
+                let t = (start + i) as f32 / 48_000.0;
+                (f32::from(i16::MAX) * 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()) as i16
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    /// The spectrum chunk built while the decoder had not yet reached the visible range is
+    /// silence; it must be rebuilt once the audio has been decoded (the "almost empty
+    /// spectrum" bug: the panel kept showing the stale silent chunk).
+    #[test]
+    fn spectrum_chunk_is_rebuilt_after_decoder_catches_up() {
+        const TOTAL: usize = 48_000 * 8;
+        let cfg = AudioCacheConfig::new(48_000, 1, TOTAL as u64, 64 * 1024 * 1024);
+        let cache = Arc::new(AudioCache::<i16>::new(cfg).expect("cache"));
+        let (_tx, rx) = mpsc::channel();
+        let pyramid: Pyramid = Arc::new(Mutex::new(WaveformPyramid::new(48_000, 1).expect("pyr")));
+        let audio = NativeAudio {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            loaded: Some(Loaded {
+                cache: Arc::clone(&cache),
+                pyramid,
+                sample_rate: 48_000,
+                total_frames: TOTAL as u64,
+            }),
+            out: None,
+            channels: 1,
+            scratch: RefCell::new(Scratch {
+                chunk: None,
+                rgba: Vec::new(),
+                mono: Vec::new(),
+                pcm: Vec::new(),
+            }),
+            volume: 1.0,
+        };
+        let blocks = TOTAL.div_ceil(65_536);
+        // Only the first block is decoded; the view (4.0 - 5.0 s) is still undecoded.
+        cache
+            .put_block(0, tone_block(0, 65_536, TOTAL))
+            .expect("block 0");
+        let pal = theme::palette(ThemeSpec::Dark);
+        let lut = ColorLut::build(SpectrumColorScheme::ThemePalette, &pal);
+        let bg = lut.normal[0];
+        let bg32 = egui::Color32::from_rgb(bg.r, bg.g, bg.b);
+        let lit = |px: &[egui::Color32]| px.iter().filter(|&&c| c != bg32).count();
+
+        let mut px = Vec::new();
+        assert!(audio.render_spectrum_into(4_000, 5_000, 200, 100, &pal, &mut px));
+        assert_eq!(lit(&px), 0, "undecoded range must be background");
+
+        for b in 1..blocks {
+            cache
+                .put_block(b, tone_block(b, 65_536, TOTAL))
+                .expect("block");
+        }
+        assert!(audio.render_spectrum_into(4_000, 5_000, 200, 100, &pal, &mut px));
+        assert!(
+            lit(&px) > 200 * 100 / 50,
+            "decoded tone must be visible, lit pixels: {}",
+            lit(&px)
+        );
     }
 }

@@ -297,3 +297,45 @@ fn e2e_selecting_line_seeks_to_first_visible_frame_23_976() {
         "the sought frame must be displayed at or after the line start"
     );
 }
+
+/// Selecting a line must leave its start, end and the selection overlay inside the audio view,
+/// also for lines much longer than the initial visible span.
+#[test]
+fn e2e_selecting_line_keeps_whole_line_visible_in_audio_view() {
+    let mut script = ScriptFile::new_default();
+    let sec = script.ensure_events_section_mut();
+    sec.insert_event(
+        0,
+        AssEvent::dialogue(AssTime::from_cs(500), AssTime::from_cs(900), "short"),
+    );
+    sec.insert_event(
+        1,
+        AssEvent::dialogue(AssTime::from_cs(300), AssTime::from_cs(2_700), "long line"),
+    );
+    let mut app = EditorApp::new(script);
+    app.shell.doc.set_selection(Some(1), &[1]);
+    app.shell.grid.model.click(1);
+    let mut harness = Harness::builder()
+        .with_size(Vec2::new(1280.0, 800.0))
+        .with_accessibility_check(false)
+        .build_ui_state(
+            |ui, app: &mut EditorApp| {
+                app.show(ui, &ZeroClock);
+            },
+            app,
+        );
+    harness.run();
+    let app = harness.state();
+    let vis = app.shell.audio.viewport.visible_range_ms();
+    let sel = app.shell.audio.active_selection;
+    assert_eq!((sel.start_ms, sel.end_ms), (3_000, 27_000));
+    assert!(
+        vis.start_ms <= sel.start_ms && vis.end_ms >= sel.end_ms,
+        "line {sel:?} not inside the audio view {vis:?}"
+    );
+    assert!(
+        vis.end_ms - vis.start_ms >= 8_000,
+        "initial audio zoom shows only {} ms",
+        vis.end_ms - vis.start_ms
+    );
+}

@@ -606,6 +606,19 @@ impl EditorApp {
                     end_ms: e,
                 };
                 let vp = &mut self.shell.audio.viewport;
+                // Keep the whole line (start and end marker, selection overlay) in view: zoom
+                // out when the line is longer than most of the visible width.
+                #[allow(clippy::cast_precision_loss)]
+                let line_ms = (e - s).max(1) as f64;
+                if line_ms > f64::from(vp.width_px) * vp.ms_per_px * 0.8 {
+                    vp.ms_per_px = (line_ms / (f64::from(vp.width_px).max(1.0) * 0.6))
+                        .clamp(vp.ms_per_px, 200.0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        self.shell.audio.h_zoom = (12.0 / vp.ms_per_px).clamp(0.25, 8.0) as f32;
+                    }
+                }
+                let vp = &mut self.shell.audio.viewport;
                 let width_ms = f64::from(vp.width_px) * vp.ms_per_px;
                 #[allow(clippy::cast_precision_loss)]
                 let centre = (s + e) as f64 / 2.0;
