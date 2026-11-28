@@ -478,10 +478,10 @@ impl EditorApp {
     }
 
     /// Handles command IDs the shell forwards (open/save/audio...). Failures are always shown.
-    fn handle_pending_commands(&mut self, ctx: &egui::Context) {
+    fn handle_pending_commands(&mut self, ctx: &egui::Context, clock: &dyn Clock) {
         let cmds = std::mem::take(&mut self.shell.pending_commands);
         for cmd in cmds {
-            let res = self.run_host_command(&cmd, ctx);
+            let res = self.run_host_command(&cmd, ctx, clock);
             if let Err(e) = res {
                 self.notify_error(format!("{cmd}: {e}"));
             }
@@ -492,7 +492,13 @@ impl EditorApp {
         self.file_dialogs.as_mut().and_then(|d| d.pick_file(kind))
     }
 
-    fn run_host_command(&mut self, cmd: &str, ctx: &egui::Context) -> Result<(), AppError> {
+    #[allow(clippy::too_many_lines)]
+    fn run_host_command(
+        &mut self,
+        cmd: &str,
+        ctx: &egui::Context,
+        clock: &dyn Clock,
+    ) -> Result<(), AppError> {
         match cmd {
             "subtitle/open" => {
                 if let Some(p) = self.pick(PickKind::Subtitles) {
@@ -504,7 +510,7 @@ impl EditorApp {
                 if self.current_path.is_some() {
                     self.save()?;
                 } else {
-                    self.run_host_command("subtitle/save/as", ctx)?;
+                    self.run_host_command("subtitle/save/as", ctx, clock)?;
                 }
             }
             "subtitle/save/as" => {
@@ -553,6 +559,97 @@ impl EditorApp {
                 self.audio_path = None;
                 self.shell.detach_audio();
             }
+            "audio/play/selection" => {
+                self.handle_audio_action(AudioPanelAction::Play(PlayRangeKind::Selection), clock);
+            }
+            "audio/play/line" => {
+                self.handle_audio_action(AudioPanelAction::Play(PlayRangeKind::CurrentLine), clock);
+            }
+            "audio/play/selection/before" => {
+                self.handle_audio_action(
+                    AudioPanelAction::Play(PlayRangeKind::BeforeStart500ms),
+                    clock,
+                );
+            }
+            "audio/play/selection/after" => {
+                self.handle_audio_action(
+                    AudioPanelAction::Play(PlayRangeKind::AfterEnd500ms),
+                    clock,
+                );
+            }
+            "audio/play/selection/begin" => {
+                self.handle_audio_action(AudioPanelAction::Play(PlayRangeKind::First500ms), clock);
+            }
+            "audio/play/selection/end" => {
+                self.handle_audio_action(AudioPanelAction::Play(PlayRangeKind::Last500ms), clock);
+            }
+            "audio/play/to_end" => {
+                self.handle_audio_action(AudioPanelAction::PlayToEnd, clock);
+            }
+            "audio/stop" => {
+                self.handle_audio_action(AudioPanelAction::Stop, clock);
+            }
+            "audio/lead_in/add" => {
+                self.handle_audio_action(AudioPanelAction::AddLeadIn, clock);
+            }
+            "audio/lead_out/add" => {
+                self.handle_audio_action(AudioPanelAction::AddLeadOut, clock);
+            }
+            "audio/go_to" => {
+                let sel = self.shell.audio.active_selection;
+                let vp = &mut self.shell.audio.viewport;
+                let width_ms = f64::from(vp.width_px) * vp.ms_per_px;
+                #[allow(clippy::cast_precision_loss)]
+                let centre = (sel.start_ms + sel.end_ms) as f64 / 2.0;
+                vp.scroll_ms = (centre - width_ms / 2.0).max(0.0);
+                vp.target_scroll_ms = vp.scroll_ms;
+            }
+            "time/prev" => {
+                self.handle_audio_action(AudioPanelAction::PrevLine, clock);
+            }
+            "time/next" => {
+                self.handle_audio_action(AudioPanelAction::NextLine, clock);
+            }
+            "video/play" => {
+                if let Some(pb) = self.shell.playback.as_mut() {
+                    if pb.is_playing() {
+                        pb.pause();
+                    } else {
+                        pb.play(clock);
+                    }
+                }
+                self.handle_video_action(VideoPanelAction::PlayToggle, clock);
+            }
+            "video/frame/next" => {
+                if let Some(pb) = self.shell.playback.as_mut() {
+                    pb.step_frame(1);
+                }
+                self.stop_audio_only();
+            }
+            "video/frame/prev" => {
+                if let Some(pb) = self.shell.playback.as_mut() {
+                    pb.step_frame(-1);
+                }
+                self.stop_audio_only();
+            }
+            "video/frame/next/keyframe" => {
+                if let Some(pb) = self.shell.playback.as_mut() {
+                    let _ = pb.seek_keyframe(true);
+                }
+            }
+            "video/frame/prev/keyframe" => {
+                if let Some(pb) = self.shell.playback.as_mut() {
+                    let _ = pb.seek_keyframe(false);
+                }
+            }
+            "video/focus_seek" => {
+                self.notify_status("Video seek focused");
+            }
+            "app/exit" => {
+                if self.request_close() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
             other => {
                 // Remaining IDs are handled by the editing command layer.
                 self.execute_command(other)?;
@@ -564,7 +661,7 @@ impl EditorApp {
     /// Per-frame work after the UI was laid out: handle forwarded commands and panel actions,
     /// keep audio cursor / selection / video frame / subtitle script in sync.
     pub fn media_post_show(&mut self, ctx: &egui::Context, clock: &dyn Clock) {
-        self.handle_pending_commands(ctx);
+        self.handle_pending_commands(ctx, clock);
 
         if let Some(act) = self.shell.last_video_action.take() {
             self.handle_video_action(act, clock);

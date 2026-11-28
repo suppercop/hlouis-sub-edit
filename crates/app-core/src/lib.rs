@@ -27,8 +27,9 @@ use autosave::{
 };
 use document::{CommitType, DocumentController};
 use edit_ops::{
-    PasteOverMask, SortKey, copy_lines, cut_lines, delete_selected, duplicate_selected,
-    insert_after, insert_before, paste_lines, paste_over, stable_sort, toggle_comment_selected,
+    PasteOverMask, SortKey, build_inserted_event, copy_lines, cut_lines, delete_selected,
+    duplicate_selected, insert_after, insert_before, paste_lines, paste_over, stable_sort,
+    toggle_comment_selected,
 };
 use egui::{Order, Ui};
 use hlouis_tools::{build_style_counts, clean_whitespace, quick_select_by_style};
@@ -97,6 +98,7 @@ pub struct EditorApp {
     pub settings_path: Option<PathBuf>,
     pub clipboard: String,
     pub close_prompt_open: bool,
+    pub close_confirmed: bool,
     pub first_run_import: owner_defaults::FirstRunImportState,
     pub recovery_candidates: Vec<RecoveryCandidate>,
     pub video: Box<dyn VideoProvider>,
@@ -145,6 +147,7 @@ impl EditorApp {
             settings_path: None,
             clipboard: String::new(),
             close_prompt_open: false,
+            close_confirmed: false,
             first_run_import: owner_defaults::FirstRunImportState::default(),
             recovery_candidates: Vec::new(),
             video: Box::new(dummy_video),
@@ -171,6 +174,7 @@ impl EditorApp {
         );
         self.shell.doc = DocumentController::new(script);
         self.current_path = None;
+        self.close_confirmed = false;
         "Untitled.ass".clone_into(&mut self.shell.script_name);
         self.sync_ui_from_doc();
     }
@@ -209,6 +213,7 @@ impl EditorApp {
             DocumentController::open_file(path).map_err(|e| AppError::Document(e.to_string()))?;
         self.shell.doc = doc;
         self.current_path = Some(path.to_path_buf());
+        self.close_confirmed = false;
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
             name.clone_into(&mut self.shell.script_name);
         }
@@ -246,6 +251,28 @@ impl EditorApp {
             name.clone_into(&mut self.shell.script_name);
         }
         Ok(())
+    }
+
+    /// Saves to `current_path`, or opens the Save As file dialog for an untitled script.
+    ///
+    /// Returns `Ok(true)` if the script was saved, `Ok(false)` if the user cancelled Save As,
+    /// or `Err` if saving failed (or no file dialog is available for an untitled script).
+    pub fn save_or_save_as(&mut self) -> Result<bool, AppError> {
+        if self.current_path.is_some() {
+            let _ = self.save()?;
+            return Ok(true);
+        }
+        let name = self.shell.script_name.clone();
+        let Some(dialogs) = self.file_dialogs.as_mut() else {
+            return Err(AppError::Document(
+                "no file path set; use Save As".to_owned(),
+            ));
+        };
+        let Some(dest) = dialogs.pick_save(&name) else {
+            return Ok(false);
+        };
+        self.save_as(&dest)?;
+        Ok(true)
     }
 
     /// Polls the autosave interval and writes an atomic autosave snapshot when due.
@@ -311,11 +338,11 @@ impl EditorApp {
 
     /// Handles a window close request: prompts if unsaved changes exist, otherwise permits close.
     pub fn request_close(&mut self) -> bool {
-        if self.shell.doc.is_dirty() {
+        if self.close_confirmed || !self.shell.doc.is_dirty() {
+            true
+        } else {
             self.close_prompt_open = true;
             false
-        } else {
-            true
         }
     }
 
@@ -482,16 +509,59 @@ impl EditorApp {
                 }
             }
             "subtitle/insert/before" => {
-                let ev = AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(500), "");
-                let cmd = insert_before(self.shell.doc.script(), active, ev)
+                let count = self
+                    .shell
+                    .doc
+                    .script()
+                    .events_section()
+                    .map_or(0, ass_core::EventsSection::event_count);
+                let target_idx = if count == 0 { 0 } else { active.min(count - 1) };
+                let ev = build_inserted_event(
+                    self.shell.doc.script(),
+                    target_idx,
+                    false,
+                    self.shell.settings.timing.default_duration_ms,
+                );
+                let cmd = insert_before(self.shell.doc.script(), target_idx, ev)
                     .map_err(|e| AppError::Edit(e.to_string()))?;
                 self.commit_and_sync("insert before", cmd, CommitType::ORDER)?;
+                self.shell
+                    .doc
+                    .set_selection(Some(target_idx), &[target_idx]);
+                self.shell.editbox.request_focus = true;
             }
             "subtitle/insert/after" => {
-                let ev = AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(500), "");
-                let cmd = insert_after(self.shell.doc.script(), active, ev)
-                    .map_err(|e| AppError::Edit(e.to_string()))?;
+                let count = self
+                    .shell
+                    .doc
+                    .script()
+                    .events_section()
+                    .map_or(0, ass_core::EventsSection::event_count);
+                let (new_idx, cmd) = if count == 0 {
+                    let ev = build_inserted_event(
+                        self.shell.doc.script(),
+                        0,
+                        true,
+                        self.shell.settings.timing.default_duration_ms,
+                    );
+                    let cmd = insert_before(self.shell.doc.script(), 0, ev)
+                        .map_err(|e| AppError::Edit(e.to_string()))?;
+                    (0, cmd)
+                } else {
+                    let target_idx = active.min(count - 1);
+                    let ev = build_inserted_event(
+                        self.shell.doc.script(),
+                        target_idx,
+                        true,
+                        self.shell.settings.timing.default_duration_ms,
+                    );
+                    let cmd = insert_after(self.shell.doc.script(), target_idx, ev)
+                        .map_err(|e| AppError::Edit(e.to_string()))?;
+                    (target_idx + 1, cmd)
+                };
                 self.commit_and_sync("insert after", cmd, CommitType::ORDER)?;
+                self.shell.doc.set_selection(Some(new_idx), &[new_idx]);
+                self.shell.editbox.request_focus = true;
             }
             "edit/line/duplicate" => {
                 let cmd = duplicate_selected(self.shell.doc.script(), &sel)
@@ -627,19 +697,30 @@ impl EditorApp {
                 let s_cs = (r.start_ms.max(0) / 10) as u32;
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let e_cs = (r.end_ms.max(0) / 10) as u32;
-                self.shell
+                let new_start = AssTime::from_cs(s_cs);
+                let new_end = AssTime::from_cs(e_cs);
+                let unchanged = self
+                    .shell
                     .doc
-                    .amend_time(active, false, "audio timing start", AssTime::from_cs(s_cs))
-                    .map_err(|e| AppError::Document(e.to_string()))?;
-                self.shell
-                    .doc
-                    .amend_time(active, true, "audio timing end", AssTime::from_cs(e_cs))
-                    .map_err(|e| AppError::Document(e.to_string()))?;
-                self.shell
-                    .doc
-                    .flush_amend()
-                    .map_err(|e| AppError::Document(e.to_string()))?;
-                self.sync_ui_from_doc();
+                    .script()
+                    .events_section()
+                    .and_then(|s| s.get_event(active))
+                    .is_some_and(|ev| ev.start() == new_start && ev.end() == new_end);
+                if !unchanged {
+                    self.shell
+                        .doc
+                        .amend_time(active, false, "audio timing start", new_start)
+                        .map_err(|e| AppError::Document(e.to_string()))?;
+                    self.shell
+                        .doc
+                        .amend_time(active, true, "audio timing end", new_end)
+                        .map_err(|e| AppError::Document(e.to_string()))?;
+                    self.shell
+                        .doc
+                        .flush_amend()
+                        .map_err(|e| AppError::Document(e.to_string()))?;
+                    self.sync_ui_from_doc();
+                }
             }
             _ => {
                 self.shell.execute_command(cmd_id);
@@ -827,33 +908,63 @@ impl EditorApp {
             }
         }
 
-        // Unsaved changes prompt on close.
         if self.close_prompt_open {
-            let mut close_now = false;
-            egui::Window::new("Unsaved Changes")
-                .order(Order::Foreground)
-                .collapsible(false)
-                .show(ui.ctx(), |ui| {
-                    ui.label(format!(
-                        "Save changes to '{}' before closing?",
-                        self.shell.script_name
-                    ));
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            let _ = self.save();
-                            close_now = true;
-                        }
-                        if ui.button("Discard").clicked() {
-                            close_now = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.close_prompt_open = false;
-                        }
-                    });
+            self.show_close_prompt(&ctx);
+        }
+    }
+
+    fn show_close_prompt(&mut self, ctx: &egui::Context) {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum CloseChoice {
+            None,
+            Save,
+            Discard,
+            Cancel,
+        }
+        let mut choice = CloseChoice::None;
+        egui::Window::new("Unsaved Changes")
+            .order(Order::Foreground)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Save changes to '{}' before closing?",
+                    self.shell.script_name
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        choice = CloseChoice::Save;
+                    }
+                    if ui.button("Discard").clicked() {
+                        choice = CloseChoice::Discard;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = CloseChoice::Cancel;
+                    }
                 });
-            if close_now {
+            });
+        match choice {
+            CloseChoice::Save => {
+                self.close_prompt_open = false;
+                match self.save_or_save_as() {
+                    Ok(true) => {
+                        self.close_confirmed = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        self.notify_error(format!("Save failed: {e}"));
+                    }
+                }
+            }
+            CloseChoice::Discard => {
+                self.close_prompt_open = false;
+                self.close_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            CloseChoice::Cancel => {
                 self.close_prompt_open = false;
             }
+            CloseChoice::None => {}
         }
     }
 }

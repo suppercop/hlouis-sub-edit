@@ -1417,6 +1417,15 @@ impl CommandRegistry {
         }
     }
 
+    /// Looks up the command ID bound to `chord` strictly in `context` (no fallback).
+    #[inline]
+    #[must_use]
+    pub fn lookup_in_context(&self, context: HotkeyContext, chord: KeyChord) -> Option<&str> {
+        self.bindings[context as usize]
+            .get(&chord)
+            .map(String::as_str)
+    }
+
     /// Looks up the command ID bound to `chord` in `context`, falling back to `Default` and
     /// `Always` (matches Aegisub `hotkey::Hotkey::Scan`). Zero heap allocations, < 50 ns.
     #[inline]
@@ -1532,6 +1541,12 @@ impl CommandRegistry {
             ),
             (HotkeyContext::Default, KeyChord::CTRL, "I", "time/shift"),
             (
+                HotkeyContext::Default,
+                KeyChord::CTRL,
+                "Space",
+                "video/focus_seek",
+            ),
+            (
                 HotkeyContext::SubtitleGrid,
                 KeyChord::CTRL,
                 "C",
@@ -1568,6 +1583,7 @@ impl CommandRegistry {
                 "edit/line/duplicate",
             ),
             (HotkeyContext::Audio, 0, "S", "audio/play/selection"),
+            (HotkeyContext::Audio, 0, "Space", "audio/play/selection"),
             (HotkeyContext::Audio, 0, "G", "audio/commit"),
             (HotkeyContext::Audio, 0, "Return", "audio/commit"),
             (HotkeyContext::Audio, 0, "A", "audio/go_to"),
@@ -1672,6 +1688,12 @@ impl CommandRegistry {
                 KeyChord::CTRL,
                 "U",
                 "edit/style/underline",
+            ),
+            (
+                HotkeyContext::SubtitleEditBox,
+                KeyChord::CTRL | KeyChord::SHIFT,
+                "K",
+                "edit/line/split/by_karaoke",
             ),
             (
                 HotkeyContext::SubtitleGrid,
@@ -1903,5 +1925,50 @@ mod tests {
         let exported = reg.export_hotkeys_json();
         assert!(exported.contains("\"Audio\""));
         assert!(exported.contains("\"Styling Assistant\""));
+    }
+
+    #[test]
+    fn default_hotkeys_match_owner_fixture_and_space_bindings() {
+        let fixture = include_str!("../../aegisub-config/tests/fixtures/hotkey.json");
+        let parsed = aegisub_config::import_hotkey_json(fixture).expect("parse owner hotkey.json");
+        let reg = CommandRegistry::new_default();
+
+        for (ctx_name, entries) in &parsed.by_context {
+            let ctx = HotkeyContext::from_aegisub_name(ctx_name)
+                .unwrap_or_else(|| panic!("unknown context {ctx_name}"));
+            for entry in entries {
+                if reg.get(&entry.aegisub_name).is_none() {
+                    continue;
+                }
+                for combo in &entry.combos {
+                    let chord = KeyChord::from_aegisub(&combo.modifiers, &combo.key)
+                        .unwrap_or_else(|| panic!("invalid combo {combo:?}"));
+                    assert_eq!(
+                        reg.lookup_in_context(ctx, chord),
+                        Some(entry.aegisub_name.as_str()),
+                        "default binding mismatch for {ctx_name} {combo:?}"
+                    );
+                }
+            }
+        }
+
+        // Audio context: audio/play/selection = S and Space.
+        let s = KeyChord::from_parts(0, "S").expect("S");
+        let space = KeyChord::from_parts(0, "Space").expect("Space");
+        assert_eq!(
+            reg.lookup_in_context(HotkeyContext::Audio, s),
+            Some("audio/play/selection")
+        );
+        assert_eq!(
+            reg.lookup_in_context(HotkeyContext::Audio, space),
+            Some("audio/play/selection")
+        );
+
+        // Default context: video/focus_seek = Ctrl-Space.
+        let ctrl_space = KeyChord::from_parts(KeyChord::CTRL, "Space").expect("Ctrl+Space");
+        assert_eq!(
+            reg.lookup_in_context(HotkeyContext::Default, ctrl_space),
+            Some("video/focus_seek")
+        );
     }
 }

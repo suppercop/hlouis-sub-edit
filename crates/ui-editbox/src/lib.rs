@@ -111,6 +111,8 @@ pub struct EditBoxState {
     pub cps_error_threshold: u32,
     /// Set to `true` when the user clicks the `Edit` button beside the Style combo.
     pub edit_style_requested: bool,
+    /// Set to `true` to focus the subtitle text field on the next frame (e.g. after insert).
+    pub request_focus: bool,
     /// 4 active ASS colour swatches (Primary, Secondary, Outline, Shadow) rendered as `"AB"`.
     pub colour_swatches: [Color32; 4],
     cached_event: Option<AssEvent>,
@@ -147,6 +149,7 @@ impl Default for EditBoxState {
             cps_warn_threshold: 20,
             cps_error_threshold: 30,
             edit_style_requested: false,
+            request_focus: false,
             colour_swatches: [
                 Color32::from_rgb(20, 90, 210),
                 Color32::from_rgb(210, 120, 16),
@@ -1082,6 +1085,11 @@ pub fn show_edit_box(
     };
     state.galley_cache = galley_cache;
     state.span_scratch = span_scratch;
+
+    if state.request_focus {
+        output.response.request_focus();
+        state.request_focus = false;
+    }
 
     if let Some(range) = output.cursor_range {
         let char_idx = range.primary.index;

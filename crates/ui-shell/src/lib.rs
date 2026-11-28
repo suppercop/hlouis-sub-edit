@@ -720,16 +720,76 @@ impl AppShell {
             }
         });
 
-        // Global hotkey dispatch (Ctrl+Shift+P opens command palette; otherwise consults registry).
-        if !ctx.egui_wants_keyboard_input() {
-            if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(Key::P)) {
-                self.command_palette_open = !self.command_palette_open;
-            } else if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Z))
-                && let Some(chord) = KeyChord::from_parts(KeyChord::CTRL, "Z")
-                && let Some(cmd) = self.commands.lookup(HotkeyContext::Default, chord)
-            {
-                let owned = cmd.to_owned();
-                self.execute_command(&owned);
+        // Global hotkey dispatch with Aegisub-like focus routing:
+        // - When focus is NOT in a text field (grid, audio, video): Audio-context keys (e.g.
+        //   Space / S -> audio/play/selection), then SubtitleGrid, Video, Default, Always.
+        // - When focus IS in a text field (e.g. edit box): plain keys go to the text field so
+        //   Space types a space; only modifier chords in SubtitleEditBox / Always / Ctrl+Space
+        //   fire.
+        if self.dialogs.open.is_none() && !self.command_palette_open {
+            let in_text = ctx.egui_wants_keyboard_input();
+            let pressed: Vec<(egui::Modifiers, Key)> = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|ev| match *ev {
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } => Some((modifiers, key)),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for (mods, key) in pressed {
+                if !in_text && mods.ctrl && mods.shift && key == Key::P {
+                    self.command_palette_open = !self.command_palette_open;
+                    continue;
+                }
+                let Some(chord) = egui_key_to_chord(mods, key) else {
+                    continue;
+                };
+                let cmd = if in_text {
+                    if mods.ctrl || mods.alt {
+                        self.commands
+                            .lookup_in_context(HotkeyContext::SubtitleEditBox, chord)
+                            .or_else(|| {
+                                self.commands
+                                    .lookup_in_context(HotkeyContext::Always, chord)
+                            })
+                            .or_else(|| {
+                                (key == Key::Space)
+                                    .then(|| {
+                                        self.commands
+                                            .lookup_in_context(HotkeyContext::Default, chord)
+                                    })
+                                    .flatten()
+                            })
+                    } else {
+                        None
+                    }
+                } else {
+                    self.commands
+                        .lookup_in_context(HotkeyContext::Audio, chord)
+                        .or_else(|| {
+                            self.commands
+                                .lookup_in_context(HotkeyContext::SubtitleGrid, chord)
+                        })
+                        .or_else(|| self.commands.lookup_in_context(HotkeyContext::Video, chord))
+                        .or_else(|| {
+                            self.commands
+                                .lookup_in_context(HotkeyContext::Default, chord)
+                        })
+                        .or_else(|| {
+                            self.commands
+                                .lookup_in_context(HotkeyContext::Always, chord)
+                        })
+                };
+                if let Some(cmd_id) = cmd {
+                    let owned = cmd_id.to_owned();
+                    self.execute_command(&owned);
+                }
             }
         }
 
@@ -1566,6 +1626,86 @@ impl AppShell {
             }
         }
     }
+}
+
+fn egui_key_to_chord(mods: egui::Modifiers, key: Key) -> Option<KeyChord> {
+    let mut mask = 0u8;
+    if mods.ctrl || mods.command {
+        mask |= KeyChord::CTRL;
+    }
+    if mods.shift {
+        mask |= KeyChord::SHIFT;
+    }
+    if mods.alt {
+        mask |= KeyChord::ALT;
+    }
+    let name = match key {
+        Key::A => "A",
+        Key::B => "B",
+        Key::C => "C",
+        Key::D => "D",
+        Key::E => "E",
+        Key::F => "F",
+        Key::G => "G",
+        Key::H => "H",
+        Key::I => "I",
+        Key::J => "J",
+        Key::K => "K",
+        Key::L => "L",
+        Key::M => "M",
+        Key::N => "N",
+        Key::O => "O",
+        Key::P => "P",
+        Key::Q => "Q",
+        Key::R => "R",
+        Key::S => "S",
+        Key::T => "T",
+        Key::U => "U",
+        Key::V => "V",
+        Key::W => "W",
+        Key::X => "X",
+        Key::Y => "Y",
+        Key::Z => "Z",
+        Key::Num0 => "0",
+        Key::Num1 => "1",
+        Key::Num2 => "2",
+        Key::Num3 => "3",
+        Key::Num4 => "4",
+        Key::Num5 => "5",
+        Key::Num6 => "6",
+        Key::Num7 => "7",
+        Key::Num8 => "8",
+        Key::Num9 => "9",
+        Key::Space => "Space",
+        Key::Enter => "Return",
+        Key::Escape => "Escape",
+        Key::Tab => "Tab",
+        Key::Backspace => "Back",
+        Key::Delete => "Delete",
+        Key::Insert => "Insert",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "PageUp",
+        Key::PageDown => "PageDown",
+        Key::ArrowLeft => "Left",
+        Key::ArrowRight => "Right",
+        Key::ArrowUp => "Up",
+        Key::ArrowDown => "Down",
+        Key::F1 => "F1",
+        Key::F2 => "F2",
+        Key::F3 => "F3",
+        Key::F4 => "F4",
+        Key::F5 => "F5",
+        Key::F6 => "F6",
+        Key::F7 => "F7",
+        Key::F8 => "F8",
+        Key::F9 => "F9",
+        Key::F10 => "F10",
+        Key::F11 => "F11",
+        Key::F12 => "F12",
+        _ => return None,
+    };
+    KeyChord::from_parts(mask, name)
 }
 
 #[cfg(test)]
