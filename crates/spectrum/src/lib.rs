@@ -84,6 +84,8 @@ pub enum SpectrumColorScheme {
     Green,
     /// Derived from active [`theme::Palette`] (respects Light / Dark / `EyeComfort`).
     ThemePalette,
+    /// Modern perceptual, eye-comfort-friendly gradient (deep slate -> indigo-teal -> amber -> soft cream).
+    Perceptual,
 }
 
 /// 256-entry RGBA lookup table for instant O(1) pixel colouring.
@@ -109,6 +111,7 @@ impl ColorLut {
                     // energy (speech harmonics) is clearly visible against the background.
                     lerp_rgba(palette.audio_bg, palette.audio_waveform, (t * 1.5).min(1.0))
                 }
+                SpectrumColorScheme::Perceptual => perceptual_color(t, palette),
             };
             normal[i] = c;
             selected[i] = lerp_rgba(c, palette.audio_selection, 0.35);
@@ -149,6 +152,31 @@ fn green_color(t: f32) -> Rgba8 {
             (30.0 + k * 200.0) as u8,
         )
     }
+}
+
+/// Modern perceptual, eye-comfort colour ramp: smooth luminance progression without harsh
+/// pure-white glare or saturated neon clipping, gently anchored to the theme's `audio_bg`.
+fn perceptual_color(t: f32, palette: &Palette) -> Rgba8 {
+    let t = t.clamp(0.0, 1.0);
+    // Floor integrates subtly with dark/eye-comfort backgrounds while keeping deep contrast.
+    let floor = lerp_rgba(Rgba8::rgb(11, 15, 26), palette.audio_bg, 0.25);
+    let stops: [(f32, Rgba8); 6] = [
+        (0.00, floor),
+        (0.24, Rgba8::rgb(18, 34, 62)),
+        (0.48, Rgba8::rgb(26, 78, 108)),
+        (0.72, Rgba8::rgb(64, 132, 126)),
+        (0.88, Rgba8::rgb(176, 136, 74)),
+        (1.00, Rgba8::rgb(226, 206, 168)),
+    ];
+    for w in stops.windows(2) {
+        let (t0, c0) = w[0];
+        let (t1, c1) = w[1];
+        if t <= t1 {
+            let local = ((t - t0) / (t1 - t0).max(f32::EPSILON)).clamp(0.0, 1.0);
+            return lerp_rgba(c0, c1, local);
+        }
+    }
+    stops[stops.len() - 1].1
 }
 
 fn lerp_rgba(a: Rgba8, b: Rgba8, t: f32) -> Rgba8 {
@@ -409,6 +437,224 @@ impl SpectrumCache {
     }
 }
 
+/// Minimum frequency (Hz) shown at the bottom of the logarithmic spectrum axis.
+pub const SPECTRUM_MIN_HZ: f32 = 65.0;
+/// Lower bound of the auto-adjusted spectrum dynamic range (dBFS).
+pub const SPECTRUM_MIN_DBFS: f32 = -90.0;
+/// Upper bound of the auto-adjusted spectrum dynamic range (dBFS).
+pub const SPECTRUM_MAX_DBFS: f32 = -4.0;
+
+/// Viewport geometry and audio timing parameters for [`RealtimeSpectrumRenderer`].
+#[derive(Debug, Clone, Copy)]
+pub struct SpectrumViewportSpec {
+    pub width_px: usize,
+    pub height_px: usize,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub sample_rate: u32,
+    pub v_zoom: f32,
+}
+
+/// Reusable, zero-steady-state-allocation STFT spectrum column renderer with a logarithmic
+/// frequency axis (`65 Hz..Nyquist`) and auto-adjusted `-90..-10 dBFS` dynamic range.
+pub struct RealtimeSpectrumRenderer {
+    fft_size: usize,
+    bins: usize,
+    fft: Arc<dyn rustfft::Fft<f32>>,
+    window: Vec<f32>,
+    fft_buf: Vec<Complex<f32>>,
+    fft_scratch: Vec<Complex<f32>>,
+    sample_scratch: Vec<i16>,
+    bin_db: Vec<f32>,
+    auto_samples_scratch: Vec<f32>,
+    row_bins: Vec<(usize, usize, f32)>,
+    cached_row_key: (usize, u32),
+    auto_db_floor: f32,
+    auto_db_ceil: f32,
+}
+
+impl RealtimeSpectrumRenderer {
+    /// Creates a new renderer using a power-of-two `fft_size` (clamped to `256..=2048`, default 512).
+    #[must_use]
+    pub fn new(fft_size: usize) -> Self {
+        let size = fft_size.clamp(256, 2048).next_power_of_two();
+        let bins = size / 2;
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(size);
+        let scratch_len = fft.get_inplace_scratch_len();
+        let window: Vec<f32> = (0..size)
+            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (size - 1) as f32).cos()))
+            .collect();
+        Self {
+            fft_size: size,
+            bins,
+            fft,
+            window,
+            fft_buf: vec![Complex::new(0.0, 0.0); size],
+            fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
+            sample_scratch: Vec::with_capacity(size),
+            bin_db: vec![SPECTRUM_MIN_DBFS; bins],
+            auto_samples_scratch: Vec::with_capacity(4096),
+            row_bins: Vec::with_capacity(256),
+            cached_row_key: (0, 0),
+            auto_db_floor: -84.0,
+            auto_db_ceil: -16.0,
+        }
+    }
+
+    /// Returns the currently active `(db_floor, db_ceil)` range inside `[-90.0, -10.0]` dBFS.
+    #[must_use]
+    pub const fn auto_db_range(&self) -> (f32, f32) {
+        (self.auto_db_floor, self.auto_db_ceil)
+    }
+
+    fn ensure_row_lut(&mut self, height_px: usize, sample_rate: u32) {
+        if self.cached_row_key == (height_px, sample_rate) && self.row_bins.len() == height_px {
+            return;
+        }
+        self.row_bins.clear();
+        let sr = sample_rate.max(1) as f32;
+        let nyquist = (sr * 0.5).max(SPECTRUM_MIN_HZ * 2.0);
+        let f_min = SPECTRUM_MIN_HZ.min(nyquist * 0.5);
+        let ratio = nyquist / f_min;
+        let max_bin = self.bins.saturating_sub(1);
+        let denom = height_px.saturating_sub(1).max(1) as f32;
+
+        for y in 0..height_px {
+            // y = 0 is top (Nyquist), y = height_px - 1 is bottom (65 Hz).
+            let frac = (height_px - 1 - y) as f32 / denom;
+            let freq = f_min * ratio.powf(frac);
+            let bin_f = (freq * (self.fft_size as f32) / sr).clamp(0.0, max_bin as f32);
+            let b0 = (bin_f.floor() as usize).min(max_bin);
+            let b1 = (b0 + 1).min(max_bin);
+            let alpha = (bin_f - b0 as f32).clamp(0.0, 1.0);
+            self.row_bins.push((b0, b1, alpha));
+        }
+        self.cached_row_key = (height_px, sample_rate);
+    }
+
+    fn compute_column_db<F>(&mut self, center_sample: usize, read_samples: &mut F)
+    where
+        F: FnMut(usize, usize, &mut Vec<i16>),
+    {
+        let half = self.fft_size / 2;
+        let s0 = center_sample.saturating_sub(half);
+        read_samples(s0, self.fft_size, &mut self.sample_scratch);
+
+        let avail = self.sample_scratch.len().min(self.fft_size);
+        let inv_i16 = 1.0 / 32_768.0f32;
+        for i in 0..avail {
+            let s = f32::from(self.sample_scratch[i]) * inv_i16;
+            self.fft_buf[i] = Complex::new(s * self.window[i], 0.0);
+        }
+        self.fft_buf[avail..self.fft_size].fill(Complex::new(0.0, 0.0));
+        self.fft
+            .process_with_scratch(&mut self.fft_buf, &mut self.fft_scratch);
+
+        // Single-sided Hann-compensated amplitude normalization -> dBFS.
+        let norm = 4.0 / (self.fft_size as f32);
+        let norm_sq = norm * norm;
+        for bin in 0..self.bins {
+            let c = self.fft_buf[bin];
+            let p = (c.re * c.re + c.im * c.im) * norm_sq;
+            self.bin_db[bin] = 10.0 * p.max(1e-12).log10();
+        }
+    }
+
+    fn calibrate_auto_range<F>(&mut self, spec: SpectrumViewportSpec, read_samples: &mut F)
+    where
+        F: FnMut(usize, usize, &mut Vec<i16>),
+    {
+        self.auto_samples_scratch.clear();
+        let probes = 24usize.min(spec.width_px).max(1);
+        let span_ms = (spec.end_ms - spec.start_ms).max(1) as f64;
+        let sr_f = f64::from(spec.sample_rate.max(1));
+
+        for p in 0..probes {
+            let frac = (p as f64 + 0.5) / (probes as f64);
+            let t_ms = spec.start_ms as f64 + frac * span_ms;
+            let center_s = ((t_ms.max(0.0) * sr_f) / 1_000.0) as usize;
+            self.compute_column_db(center_s, read_samples);
+            for &db in &self.bin_db[1..] {
+                if db > -105.0 {
+                    self.auto_samples_scratch.push(db);
+                }
+            }
+        }
+
+        if self.auto_samples_scratch.len() < 16 {
+            self.auto_db_floor = -84.0;
+            self.auto_db_ceil = -16.0;
+            return;
+        }
+        self.auto_samples_scratch.sort_unstable_by(f32::total_cmp);
+        let n = self.auto_samples_scratch.len();
+        let p15 = self.auto_samples_scratch[(n * 15) / 100];
+        let p99 = self.auto_samples_scratch[(n * 99) / 100];
+
+        let floor = (p15 - 6.0).clamp(SPECTRUM_MIN_DBFS, -48.0);
+        let ceil = (p99 + 10.0).clamp(floor + 36.0, SPECTRUM_MAX_DBFS);
+        self.auto_db_floor = floor;
+        self.auto_db_ceil = ceil;
+    }
+
+    /// Renders only the columns in `col_range` into `out_rgba` (row-major `width_px * height_px`).
+    ///
+    /// On a full-screen render (`col_range == 0..width_px`), auto-calibrates the dynamic range
+    /// inside `[-90, -10]` dBFS; on partial scroll updates, reuses the calibrated range so only
+    /// `col_range.len()` FFTs are computed with zero flicker.
+    pub fn render_columns_range_with<F>(
+        &mut self,
+        spec: SpectrumViewportSpec,
+        col_range: std::ops::Range<usize>,
+        lut: &ColorLut,
+        mut read_samples: F,
+        out_rgba: &mut [Rgba8],
+    ) where
+        F: FnMut(usize, usize, &mut Vec<i16>),
+    {
+        if spec.width_px == 0
+            || spec.height_px == 0
+            || spec.sample_rate == 0
+            || out_rgba.len() < spec.width_px.saturating_mul(spec.height_px)
+        {
+            return;
+        }
+        let c0 = col_range.start.min(spec.width_px);
+        let c1 = col_range.end.min(spec.width_px);
+        if c0 >= c1 {
+            return;
+        }
+
+        self.ensure_row_lut(spec.height_px, spec.sample_rate);
+        if c0 == 0 && c1 == spec.width_px {
+            self.calibrate_auto_range(spec, &mut read_samples);
+        }
+
+        let span_ms = (spec.end_ms - spec.start_ms).max(1) as f64;
+        let sr_f = f64::from(spec.sample_rate);
+        let width_f = spec.width_px as f64;
+        let boost_db = (spec.v_zoom - 1.0) * 10.0;
+        let inv_span = 1.0 / (self.auto_db_ceil - self.auto_db_floor).max(1.0);
+        let floor_db = self.auto_db_floor;
+
+        for x in c0..c1 {
+            let t_ms = spec.start_ms as f64 + ((x as f64 + 0.5) / width_f) * span_ms;
+            let center_s = ((t_ms.max(0.0) * sr_f) / 1_000.0) as usize;
+            self.compute_column_db(center_s, &mut read_samples);
+
+            for y in 0..spec.height_px {
+                let (b0, b1, alpha) = self.row_bins[y];
+                let db = self.bin_db[b0] * (1.0 - alpha) + self.bin_db[b1] * alpha;
+                let linear = ((db + boost_db - floor_db) * inv_span).clamp(0.0, 1.0);
+                let norm = linear.powf(1.55);
+                let idx = (norm * 255.0) as usize;
+                out_rgba[y * spec.width_px + x] = lut.normal[idx.min(255)];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +767,73 @@ mod tests {
             d > 60,
             "mid intensity not distinguishable from background: {d}"
         );
+    }
+
+    #[test]
+    fn realtime_spectrum_log_axis_and_partial_column_render() {
+        let sr = 16_000u32;
+        let samples: Vec<i16> = (0..32_000)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let s = 0.4 * (2.0 * PI * 440.0 * t).sin() + 0.25 * (2.0 * PI * 2_200.0 * t).sin();
+                (s * 32_767.0) as i16
+            })
+            .collect();
+        let pal = theme::palette(ThemeSpec::Dark);
+        let lut = ColorLut::build(SpectrumColorScheme::Perceptual, &pal);
+        let mut renderer = RealtimeSpectrumRenderer::new(512);
+        let w = 128usize;
+        let h = 64usize;
+        let mut out = vec![Rgba8::rgb(0, 0, 0); w * h];
+        let spec = SpectrumViewportSpec {
+            width_px: w,
+            height_px: h,
+            start_ms: 0,
+            end_ms: 2_000,
+            sample_rate: sr,
+            v_zoom: 1.0,
+        };
+        let mut calls = 0usize;
+        renderer.render_columns_range_with(
+            spec,
+            0..w,
+            &lut,
+            |s0, count, buf| {
+                calls += 1;
+                buf.clear();
+                if s0 < samples.len() {
+                    let end = (s0 + count).min(samples.len());
+                    buf.extend_from_slice(&samples[s0..end]);
+                }
+            },
+            &mut out,
+        );
+        let (fl, cl) = renderer.auto_db_range();
+        assert!(fl >= SPECTRUM_MIN_DBFS && cl <= SPECTRUM_MAX_DBFS && cl > fl);
+        // Distinct non-floor pixels should be present (spectrum fills the panel).
+        let bg = lut.normal[0];
+        let non_bg = out.iter().filter(|&&c| c != bg).count();
+        assert!(
+            non_bg > (w * h) / 4,
+            "expected populated spectrum, got {non_bg}"
+        );
+
+        // Partial render of 8 columns calls read_samples exactly 8 times (no recalibration).
+        calls = 0;
+        renderer.render_columns_range_with(
+            spec,
+            (w - 8)..w,
+            &lut,
+            |s0, count, buf| {
+                calls += 1;
+                buf.clear();
+                if s0 < samples.len() {
+                    let end = (s0 + count).min(samples.len());
+                    buf.extend_from_slice(&samples[s0..end]);
+                }
+            },
+            &mut out,
+        );
+        assert_eq!(calls, 8);
     }
 }

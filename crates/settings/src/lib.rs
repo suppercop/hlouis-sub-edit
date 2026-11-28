@@ -162,6 +162,9 @@ pub struct AudioPrefs {
     pub lead_in_ms: i64,
     pub lead_out_ms: i64,
     pub cache_ram_mb: u32,
+    pub auto_snap_keyframes: bool,
+    pub snap_to_lines: bool,
+    pub snap_distance_px: u32,
 }
 
 impl Default for AudioPrefs {
@@ -177,6 +180,9 @@ impl Default for AudioPrefs {
             lead_in_ms: 200,
             lead_out_ms: 300,
             cache_ram_mb: 512,
+            auto_snap_keyframes: true,
+            snap_to_lines: true,
+            snap_distance_px: 10,
         }
     }
 }
@@ -437,6 +443,7 @@ impl AppSettings {
         self.audio.lead_in_ms = self.audio.lead_in_ms.clamp(0, 10_000);
         self.audio.lead_out_ms = self.audio.lead_out_ms.clamp(0, 10_000);
         self.audio.cache_ram_mb = self.audio.cache_ram_mb.clamp(32, 4096);
+        self.audio.snap_distance_px = self.audio.snap_distance_px.clamp(1, 64);
         self.video.default_zoom_idx = self.video.default_zoom_idx.min(20);
         self.video.fast_jump_step = self.video.fast_jump_step.clamp(1, 1000);
         self.video.check_script_res = self.video.check_script_res.min(3);
@@ -606,5 +613,21 @@ mod tests {
             AppSettings::load_json_with_report(&AppSettings::default().save_json().unwrap())
                 .unwrap();
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn audio_snap_defaults_and_clamping() {
+        let mut s = AppSettings::default();
+        assert!(s.audio.auto_snap_keyframes);
+        assert!(s.audio.snap_to_lines);
+        assert_eq!(s.audio.snap_distance_px, 10);
+
+        s.audio.snap_distance_px = 0;
+        s.validate_and_clamp();
+        assert_eq!(s.audio.snap_distance_px, 1);
+
+        s.audio.snap_distance_px = 500;
+        s.validate_and_clamp();
+        assert_eq!(s.audio.snap_distance_px, 64);
     }
 }

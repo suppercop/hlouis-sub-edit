@@ -430,6 +430,59 @@ Dialogue: 0,0:00:06.00,0:00:08.00,Default,,0,0,0,,Plain line with stacked diacri
             }
             saved += 1;
         }
+
+        // Patch 70 audio snapshots at 100% and 200% DPI in all 3 themes:
+        // waveform, spectrum, ruler, keyframes, selection, and snap hint while dragging.
+        let audio_cases: &[(&str, bool, f32, bool)] = &[
+            ("audio_waveform_100dpi", false, 1.0, false),
+            ("audio_waveform_200dpi", false, 2.0, false),
+            ("audio_spectrum_100dpi", true, 1.0, false),
+            ("audio_spectrum_200dpi", true, 2.0, false),
+            ("audio_snap_hint_200dpi", false, 2.0, true),
+        ];
+        for &(a_name, is_spectrum, ppp, show_snap) in audio_cases {
+            let mut app = build_demo_editor(60);
+            app.shell.set_theme(spec);
+            app.shell.layout_state.mode = ViewMode::AudioAndSubs;
+            app.shell.audio.spectrum_mode = is_spectrum;
+            app.shell.audio.viewport.ms_per_px = 5.0;
+            app.shell.audio.viewport.scroll_ms = 500.0;
+            app.shell.audio.active_selection = timing_controller::TimeRangeMs {
+                start_ms: 1_000,
+                end_ms: 2_500,
+            };
+            if show_snap {
+                app.shell.audio.dragging = Some(timing_controller::DragTarget::Start);
+                app.shell.audio.active_snap_hint = Some(ui_audio::SnapHint {
+                    time_ms: 1_000,
+                    is_keyframe: true,
+                });
+            }
+            let size = Vec2::new(1280.0, 520.0);
+            let path = out_dir.join(format!("{a_name}_{t_name}.png"));
+            let rendered = {
+                let mut harness = Harness::builder()
+                    .with_size(size)
+                    .with_pixels_per_point(ppp)
+                    .with_accessibility_check(false)
+                    .build_ui(|ui| {
+                        app.show(ui, &clock);
+                    });
+                harness.run();
+                harness.render()
+            };
+            let write_res = match rendered {
+                Ok(img) => img.save(&path).map_err(|e| e.to_string()),
+                Err(_) => {
+                    render_fallback_png(&path, (size.x * ppp) as u32, (size.y * ppp) as u32, &app)
+                }
+            };
+            if let Err(e) = write_res {
+                eprintln!("failed to save {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            saved += 1;
+        }
     }
     println!(
         "hlouis-ui-demo: saved {saved} PNG snapshots to {}",

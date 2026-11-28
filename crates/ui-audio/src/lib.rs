@@ -19,22 +19,27 @@
 use audio_peaks::PeakBucket;
 use audio_view::{
     AudioFrameInput, AudioFrameLayout, AudioViewport, ColorRole, HitTarget, TimelineMarkerIndex,
-    build_frame_layout,
+    build_frame_layout, compute_ruler_ticks,
 };
 use egui::{
-    Color32, ColorImage, FontId, Galley, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions,
-    Ui, Vec2,
+    Align2, Color32, ColorImage, FontId, Galley, Pos2, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, Vec2,
 };
 use i18n_catalog::Catalog;
 use karaoke_timing::KaraokeTimingController;
+use spectrum::{ColorLut, RealtimeSpectrumRenderer, SpectrumColorScheme, SpectrumViewportSpec};
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::Arc;
-use theme::Palette;
-use timing_controller::{DialogueTimingController, DragTarget, PlayRangeKind, TimeRangeMs};
+use theme::{Palette, Rgba8};
+use timing_controller::{
+    DialogueTimingController, DragTarget, PlayRangeKind, TimeRangeMs, threshold_ms_from_px,
+};
 use ui_theme::{rgba, snap_px};
 
-/// Trait supplying waveform peak columns for a requested `[start_ms, end_ms]` range into a
-/// caller-owned buffer, and optionally pre-rendered STFT spectrum pixels.
+/// Trait supplying waveform peak columns (and optional mono PCM samples for the real FFT
+/// spectrogram) for a requested `[start_ms, end_ms]` range into caller-owned buffers, and
+/// optionally pre-rendered STFT spectrum pixels.
 pub trait AudioColumnProvider {
     /// Total audio duration in milliseconds.
     fn duration_ms(&self) -> i64;
@@ -59,6 +64,15 @@ pub trait AudioColumnProvider {
     ) -> bool {
         false
     }
+    /// Sample rate in Hz (`0` when raw PCM is unavailable, falling back to the provider's own
+    /// spectrum renderer / peak columns).
+    fn sample_rate(&self) -> u32 {
+        0
+    }
+    /// Reads up to `count` mono `i16` PCM samples starting at `start_sample` into `out`.
+    fn read_mono_i16(&self, _start_sample: usize, _count: usize, out: &mut Vec<i16>) {
+        out.clear();
+    }
 }
 
 /// Action emitted by the audio panel toolbar or mouse interactions.
@@ -77,6 +91,13 @@ pub enum AudioPanelAction {
     SelectionChanged(TimeRangeMs),
 }
 
+/// Active magnetic snap target shown while dragging a timing boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapHint {
+    pub time_ms: i64,
+    pub is_keyframe: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TextureCacheKey {
     start_ms: i64,
@@ -85,15 +106,28 @@ struct TextureCacheKey {
     height_px: usize,
     spectrum_mode: bool,
     v_zoom_bits: u32,
+    ms_per_px_bits: u64,
     palette_rev: u64,
+}
+
+/// Baked ruler tick texture cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RulerCacheKey {
+    start_ms: i64,
+    end_ms: i64,
+    phys_w: usize,
+    phys_h: usize,
+    palette_rev: u64,
+    ppp_bits: u32,
 }
 
 /// Ruler label cache key; `generation` is the [`ui_theme::GalleyEpoch`] generation so labels laid
 /// out before an atlas reset are never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RulerCacheKey {
+struct RulerLabelKey {
     start_ms: i64,
     end_ms: i64,
+    ms_per_px_bits: u64,
     width_bits: u32,
     ppp_bits: u32,
     generation: u64,
@@ -108,6 +142,9 @@ pub struct AudioPanelState {
     pub auto_commit: bool,
     pub auto_next: bool,
     pub auto_scroll: bool,
+    pub auto_snap_keyframes: bool,
+    pub snap_to_lines: bool,
+    pub snap_distance_px: f32,
     pub h_zoom: f32,
     pub v_zoom: f32,
     pub volume: f32,
@@ -115,18 +152,33 @@ pub struct AudioPanelState {
     pub play_cursor_ms: Option<i64>,
     pub video_marker_ms: Option<i64>,
     pub active_selection: TimeRangeMs,
+    pub inactive_spans: Vec<TimeRangeMs>,
     pub dragging: Option<DragTarget>,
-    // Cached GPU texture + dirty key (ensures 0 re-uploads when unchanged).
+    pub active_snap_hint: Option<SnapHint>,
+    // Cached GPU texture + dirty key + ring-buffer head (0 re-uploads when unchanged,
+    // partial-strip set_partial on horizontal scroll instead of full-buffer clone).
     texture: Option<TextureHandle>,
     cache_key: Option<TextureCacheKey>,
+    ring_head: usize,
     texture_uploads: u64,
+    // Cached physical-resolution time ruler tick texture (0 per-frame tick line segments).
+    ruler_texture: Option<TextureHandle>,
+    ruler_cache_key: Option<RulerCacheKey>,
+    ruler_pixel_buf: Vec<Color32>,
     // Reusable scratch buffers (0 heap allocations in steady state).
     columns_buf: Vec<PeakBucket>,
+    partial_columns_buf: Vec<PeakBucket>,
     pixel_buf: Vec<Color32>,
+    partial_pixel_buf: Vec<Color32>,
+    spectrum_renderer: RealtimeSpectrumRenderer,
+    spectrum_lut: Option<(u64, ColorLut)>,
+    spectrum_rgba_buf: Vec<Rgba8>,
     frame_layout: AudioFrameLayout,
     ruler_buf: String,
+    last_computed_columns: usize,
+    total_computed_columns: u64,
     galley_epoch: ui_theme::GalleyEpoch,
-    ruler_key: Option<RulerCacheKey>,
+    ruler_key: Option<RulerLabelKey>,
     ruler_ticks: Vec<(f32, Arc<Galley>)>,
 }
 
@@ -153,9 +205,12 @@ impl AudioPanelState {
             auto_commit: false,
             auto_next: true,
             auto_scroll: true,
+            auto_snap_keyframes: true,
+            snap_to_lines: true,
+            snap_distance_px: 10.0,
             // Matches the viewport default of 10 ms/px through `ms_per_px = 12 / h_zoom`.
             h_zoom: 3.2,
-            v_zoom: 2.1,
+            v_zoom: 1.4,
             volume: 1.2,
             link_zoom_volume: true,
             play_cursor_ms: None,
@@ -164,14 +219,27 @@ impl AudioPanelState {
                 start_ms: 0,
                 end_ms: 2_000,
             },
+            inactive_spans: Vec::with_capacity(4),
             dragging: None,
+            active_snap_hint: None,
             texture: None,
             cache_key: None,
+            ring_head: 0,
             texture_uploads: 0,
+            ruler_texture: None,
+            ruler_cache_key: None,
+            ruler_pixel_buf: Vec::with_capacity(2048 * 32),
             columns_buf: Vec::with_capacity(2048),
+            partial_columns_buf: Vec::with_capacity(256),
             pixel_buf: Vec::with_capacity(2048 * 160),
+            partial_pixel_buf: Vec::with_capacity(256 * 160),
+            spectrum_renderer: RealtimeSpectrumRenderer::new(512),
+            spectrum_lut: None,
+            spectrum_rgba_buf: Vec::with_capacity(2048 * 160),
             frame_layout: AudioFrameLayout::with_capacity(2048),
             ruler_buf: String::with_capacity(16),
+            last_computed_columns: 0,
+            total_computed_columns: 0,
             galley_epoch: ui_theme::GalleyEpoch::default(),
             ruler_key: None,
             ruler_ticks: Vec::with_capacity(32),
@@ -185,36 +253,95 @@ impl AudioPanelState {
         self.texture_uploads
     }
 
-    /// Rasterizes waveform or classic Aegisub spectrum (dark blue bg, cyan/white energy) into
-    /// `self.pixel_buf` without allocating once sized.
+    /// Number of audio columns computed during the most recent frame (`0` on idle frames,
+    /// `N` on an `N`-pixel horizontal scroll).
+    #[inline]
+    #[must_use]
+    pub const fn last_computed_columns(&self) -> usize {
+        self.last_computed_columns
+    }
+
+    /// Cumulative count of audio columns computed across all frames.
+    #[inline]
+    #[must_use]
+    pub const fn total_computed_columns(&self) -> u64 {
+        self.total_computed_columns
+    }
+
+    fn ensure_spectrum_lut(&mut self, palette: &Palette, palette_rev: u64) {
+        if self
+            .spectrum_lut
+            .as_ref()
+            .is_none_or(|(r, _)| *r != palette_rev)
+        {
+            let lut = ColorLut::build(SpectrumColorScheme::Perceptual, palette);
+            self.spectrum_lut = Some((palette_rev, lut));
+        }
+    }
+
+    /// Rasterizes the full `0..width_px` waveform or fallback spectrum into `self.pixel_buf`
+    /// without allocating once sized.
     pub fn rasterize_columns(&mut self, width_px: usize, height_px: usize, palette: &Palette) {
+        self.rasterize_columns_range(width_px, height_px, 0..width_px, palette);
+    }
+
+    /// Rasterizes only the columns in `col_range` into `self.pixel_buf` (anti-aliased min/max
+    /// waveform with RMS layer, subtle vertical gradient, and clear zero line; or perceptual
+    /// spectrum fallback when raw PCM is unavailable). Zero heap allocations once sized.
+    #[allow(clippy::too_many_lines)]
+    pub fn rasterize_columns_range(
+        &mut self,
+        width_px: usize,
+        height_px: usize,
+        col_range: Range<usize>,
+        palette: &Palette,
+    ) {
         let total = width_px.saturating_mul(height_px);
-        let bg = if self.spectrum_mode {
-            Color32::from_rgb(8, 16, 40)
+        let bg_base = if self.spectrum_mode {
+            Color32::from_rgb(11, 15, 26)
         } else {
             rgba(palette.audio_bg)
         };
-        if self.pixel_buf.len() == total {
-            self.pixel_buf.fill(bg);
-        } else {
-            self.pixel_buf.resize(total, bg);
+        if self.pixel_buf.len() != total {
+            self.pixel_buf.resize(total, bg_base);
         }
         if width_px == 0 || height_px == 0 {
             return;
         }
-        let mid_y = (height_px / 2) as f32;
-        let wave_col = rgba(palette.audio_waveform);
-        // Classic Aegisub spectrum stops: dark blue -> blue -> teal -> bright cyan -> white.
+        let c0 = col_range.start.min(width_px);
+        let c1 = col_range.end.min(width_px);
+        if c0 >= c1 {
+            return;
+        }
+
+        let mid_y_idx = height_px / 2;
+        let mid_y = (height_px as f32) * 0.5;
+        let wave_peak = rgba(palette.audio_waveform);
+        let wave_rms = brighten_color(wave_peak, 34);
+        let zero_line_col = blend_color(bg_base, rgba(palette.border), 0.42);
+
+        // Perceptual eye-comfort stops used when spectrum mode falls back to peak columns.
         let stops: [Color32; 5] = [
-            Color32::from_rgb(12, 32, 82),
-            Color32::from_rgb(20, 74, 152),
-            Color32::from_rgb(36, 158, 206),
-            Color32::from_rgb(132, 232, 245),
-            Color32::from_rgb(242, 252, 255),
+            Color32::from_rgb(18, 34, 62),
+            Color32::from_rgb(26, 78, 108),
+            Color32::from_rgb(64, 132, 126),
+            Color32::from_rgb(176, 136, 74),
+            Color32::from_rgb(226, 206, 168),
         ];
 
-        for (x, col) in self.columns_buf.iter().take(width_px).enumerate() {
+        let max_y_f = (height_px - 1) as f32;
+        let inv_mid = 1.0 / mid_y.max(1.0);
+
+        for x in c0..c1 {
+            let col = self.columns_buf.get(x).copied().unwrap_or(PeakBucket {
+                min: 0,
+                max: 0,
+                rms: 0,
+            });
             if self.spectrum_mode {
+                for y in 0..height_px {
+                    self.pixel_buf[y * width_px + x] = bg_base;
+                }
                 let max_f = f32::from(col.max) / 32_768.0;
                 let min_f = f32::from(col.min) / 32_768.0;
                 let amp = (max_f.abs().max(min_f.abs()) * self.v_zoom).clamp(0.0, 1.0);
@@ -228,31 +355,157 @@ impl AudioPanelState {
                     self.pixel_buf[y * width_px + x] = stops[stop_idx];
                 }
             } else {
-                let max_f = f32::from(col.max) / 32_768.0;
-                let min_f = f32::from(col.min) / 32_768.0;
-                let y_hi = (mid_y - max_f * self.v_zoom * mid_y).clamp(0.0, (height_px - 1) as f32);
-                let y_lo = (mid_y - min_f * self.v_zoom * mid_y).clamp(0.0, (height_px - 1) as f32);
+                // Subtle vertical background gradient + clear horizontal zero line.
+                for y in 0..height_px {
+                    let dist = ((y as f32) - mid_y).abs() * inv_mid;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let delta = (6.0 - dist * 12.0) as i16;
+                    self.pixel_buf[y * width_px + x] = if y == mid_y_idx {
+                        zero_line_col
+                    } else {
+                        shade_color(bg_base, delta)
+                    };
+                }
+
+                // Anti-aliased min/max peak envelope (no horizontal smoothing so transients stay sharp).
+                let max_f = (f32::from(col.max) / 32_768.0 * self.v_zoom).clamp(-1.0, 1.0);
+                let min_f = (f32::from(col.min) / 32_768.0 * self.v_zoom).clamp(-1.0, 1.0);
+                let y_hi = (mid_y - max_f * (mid_y - 1.0)).clamp(0.0, max_y_f);
+                let y_lo = (mid_y - min_f * (mid_y - 1.0)).clamp(0.0, max_y_f);
+                let y_top_f = y_hi.min(y_lo);
+                let y_bot_f = y_hi.max(y_lo);
+
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let top = (y_hi.min(y_lo) as usize).min(height_px - 1);
+                let top_i = (y_top_f.floor() as usize).min(height_px - 1);
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let bot = (y_hi.max(y_lo) as usize).min(height_px - 1);
-                for y in top..=bot {
-                    self.pixel_buf[y * width_px + x] = wave_col;
+                let bot_i = (y_bot_f.floor() as usize).min(height_px - 1);
+
+                if top_i == bot_i {
+                    let cov = (y_bot_f - y_top_f).clamp(0.35, 1.0);
+                    let bg_px = self.pixel_buf[top_i * width_px + x];
+                    self.pixel_buf[top_i * width_px + x] = blend_color(bg_px, wave_peak, cov);
+                } else {
+                    let top_cov = (1.0 - (y_top_f - top_i as f32)).clamp(0.0, 1.0);
+                    let bot_cov = (y_bot_f - bot_i as f32).clamp(0.0, 1.0);
+                    let bg_top = self.pixel_buf[top_i * width_px + x];
+                    self.pixel_buf[top_i * width_px + x] = blend_color(bg_top, wave_peak, top_cov);
+                    for y in (top_i + 1)..bot_i {
+                        let dist = ((y as f32) - mid_y).abs() * inv_mid;
+                        let col_y = blend_color(wave_peak, wave_rms, dist * 0.35);
+                        self.pixel_buf[y * width_px + x] = col_y;
+                    }
+                    let bg_bot = self.pixel_buf[bot_i * width_px + x];
+                    self.pixel_buf[bot_i * width_px + x] = blend_color(bg_bot, wave_peak, bot_cov);
+                }
+
+                // Inner RMS energy layer (brighter core with anti-aliased edges).
+                let rms_f = (f32::from(col.rms) / 32_768.0 * self.v_zoom).clamp(0.0, 1.0);
+                if rms_f > 0.002 {
+                    let r_top_f = (mid_y - rms_f * (mid_y - 1.0)).clamp(0.0, max_y_f);
+                    let r_bot_f = (mid_y + rms_f * (mid_y - 1.0)).clamp(0.0, max_y_f);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let r_top = (r_top_f.floor() as usize).min(height_px - 1);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let r_bot = (r_bot_f.floor() as usize).min(height_px - 1);
+                    if r_top < r_bot {
+                        let tc = (1.0 - (r_top_f - r_top as f32)).clamp(0.0, 1.0);
+                        let bc = (r_bot_f - r_bot as f32).clamp(0.0, 1.0);
+                        let p_top = self.pixel_buf[r_top * width_px + x];
+                        self.pixel_buf[r_top * width_px + x] =
+                            blend_color(p_top, wave_rms, tc * 0.85);
+                        for y in (r_top + 1)..r_bot {
+                            self.pixel_buf[y * width_px + x] = wave_rms;
+                        }
+                        let p_bot = self.pixel_buf[r_bot * width_px + x];
+                        self.pixel_buf[r_bot * width_px + x] =
+                            blend_color(p_bot, wave_rms, bc * 0.85);
+                    }
                 }
             }
         }
     }
 }
 
+/// Applies magnetic keyframe / neighbouring-line snapping to `raw_ms` unless `shift_held` is true.
+#[must_use]
+pub fn apply_snap(
+    raw_ms: i64,
+    shift_held: bool,
+    state: &AudioPanelState,
+    markers: &TimelineMarkerIndex,
+) -> (i64, Option<SnapHint>) {
+    if shift_held || (!state.auto_snap_keyframes && !state.snap_to_lines) {
+        return (raw_ms, None);
+    }
+    let threshold_ms = threshold_ms_from_px(state.snap_distance_px, state.viewport.ms_per_px);
+    if let Some((snapped_ms, is_keyframe)) = markers.snap_target(
+        raw_ms,
+        threshold_ms,
+        state.auto_snap_keyframes,
+        state.snap_to_lines,
+    ) {
+        (
+            snapped_ms,
+            Some(SnapHint {
+                time_ms: snapped_ms,
+                is_keyframe,
+            }),
+        )
+    } else {
+        (raw_ms, None)
+    }
+}
+
+#[inline]
+fn blend_color(bg: Color32, fg: Color32, alpha: f32) -> Color32 {
+    let a = alpha.clamp(0.0, 1.0);
+    let inv = 1.0 - a;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let r = (f32::from(bg.r()) * inv + f32::from(fg.r()) * a).clamp(0.0, 255.0) as u8;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let g = (f32::from(bg.g()) * inv + f32::from(fg.g()) * a).clamp(0.0, 255.0) as u8;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let b = (f32::from(bg.b()) * inv + f32::from(fg.b()) * a).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(r, g, b)
+}
+
+#[inline]
+fn shade_color(c: Color32, delta: i16) -> Color32 {
+    let r = (i16::from(c.r()) + delta).clamp(0, 255);
+    let g = (i16::from(c.g()) + delta).clamp(0, 255);
+    let b = (i16::from(c.b()) + delta).clamp(0, 255);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Color32::from_rgb(r as u8, g as u8, b as u8)
+}
+
+#[inline]
+fn brighten_color(c: Color32, amount: u8) -> Color32 {
+    Color32::from_rgb(
+        c.r().saturating_add(amount),
+        c.g().saturating_add(amount),
+        c.b().saturating_add(amount),
+    )
+}
+
 #[inline]
 fn role_color(role: ColorRole, pal: &Palette) -> Color32 {
     match role {
-        ColorRole::SelectionFill | ColorRole::VideoFrameArea => rgba(pal.audio_selection),
-        ColorRole::InactiveFill | ColorRole::InactiveBoundary => rgba(pal.audio_inactive),
-        ColorRole::SelectionStartMarker => Color32::from_rgb(235, 65, 65),
-        ColorRole::SelectionEndMarker => Color32::from_rgb(235, 110, 185),
+        ColorRole::SelectionFill => {
+            let s = rgba(pal.audio_selection);
+            Color32::from_rgba_unmultiplied(s.r(), s.g(), s.b(), 82)
+        }
+        ColorRole::VideoFrameArea => rgba(pal.audio_selection),
+        ColorRole::InactiveFill => {
+            let c = rgba(pal.audio_inactive);
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 64)
+        }
+        ColorRole::InactiveBoundary => rgba(pal.audio_inactive),
+        ColorRole::SelectionStartMarker => Color32::from_rgb(238, 72, 72),
+        ColorRole::SelectionEndMarker => Color32::from_rgb(64, 148, 255),
         ColorRole::LineBoundary => rgba(pal.audio_line_boundary),
-        ColorRole::KeyframeLine => rgba(pal.audio_keyframe),
+        // Bright pink/magenta keyframe line, clearly visible over waveform, spectrum, and selection
+        // in Light, Dark, and EyeComfort themes.
+        ColorRole::KeyframeLine => Color32::from_rgb(255, 48, 200),
         ColorRole::PlayCursor => rgba(pal.audio_play_cursor),
         ColorRole::VideoCursor => rgba(pal.audio_video_marker),
         ColorRole::KaraokeBoundary
@@ -260,6 +513,107 @@ fn role_color(role: ColorRole, pal: &Palette) -> Color32 {
         | ColorRole::KaraokeLabelActiveBg => rgba(pal.audio_karaoke_label),
         ColorRole::WaveformPeak | ColorRole::WaveformRms => rgba(pal.audio_waveform),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_ruler_texture(
+    state: &mut AudioPanelState,
+    ctx: &egui::Context,
+    start_ms: i64,
+    end_ms: i64,
+    phys_w: usize,
+    phys_h: usize,
+    ppp: f32,
+    palette: &Palette,
+    palette_rev: u64,
+) {
+    let key = RulerCacheKey {
+        start_ms,
+        end_ms,
+        phys_w,
+        phys_h,
+        palette_rev,
+        ppp_bits: ppp.to_bits(),
+    };
+    if state.ruler_cache_key == Some(key) && state.ruler_texture.is_some() {
+        return;
+    }
+
+    let is_light =
+        u16::from(palette.grid_bg.r) + u16::from(palette.grid_bg.g) + u16::from(palette.grid_bg.b)
+            > 384;
+    let bg = if is_light {
+        Color32::from_rgb(22, 26, 34)
+    } else {
+        shade_color(rgba(palette.panel_bg), -8)
+    };
+    let border_col = Color32::from_rgb(104, 152, 214);
+    let minor_col = Color32::from_rgb(112, 138, 174);
+    let medium_col = Color32::from_rgb(142, 178, 224);
+    let major_col = Color32::from_rgb(184, 212, 248);
+
+    let total = phys_w.saturating_mul(phys_h);
+    if state.ruler_pixel_buf.len() == total {
+        state.ruler_pixel_buf.fill(bg);
+    } else {
+        state.ruler_pixel_buf.resize(total, bg);
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let tick_w = (ppp.round() as usize).clamp(1, 4);
+    let span_ms = (end_ms - start_ms).max(1) as f64;
+    let spec = compute_ruler_ticks(state.viewport.ms_per_px);
+
+    // Bottom horizontal baseline.
+    let base_y0 = phys_h.saturating_sub(tick_w);
+    for y in base_y0..phys_h {
+        let row = y * phys_w;
+        state.ruler_pixel_buf[row..row + phys_w].fill(border_col);
+    }
+
+    // Adaptive minor (0.10 s) / medium (0.50 s) / major (1.00 s) vertical ticks baked into texture.
+    let first_tick = if start_ms >= 0 {
+        ((start_ms + spec.minor_ms - 1) / spec.minor_ms) * spec.minor_ms
+    } else {
+        (start_ms / spec.minor_ms) * spec.minor_ms
+    };
+    let mut t = first_tick;
+    let minor_h = ((phys_h * 26) / 100).max(tick_w + 1);
+    let medium_h = ((phys_h * 44) / 100).max(minor_h + 1);
+    let major_h = ((phys_h * 66) / 100).max(medium_h + 1);
+
+    while t <= end_ms {
+        let frac = ((t - start_ms) as f64 / span_ms).clamp(0.0, 1.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let x0 = ((frac * (phys_w.saturating_sub(1) as f64)).round() as usize).min(phys_w - 1);
+        let (th, col) = if t % spec.major_ms == 0 {
+            (major_h, major_col)
+        } else if t % spec.medium_ms == 0 {
+            (medium_h, medium_col)
+        } else {
+            (minor_h, minor_col)
+        };
+        let y0 = phys_h.saturating_sub(th);
+        let x1 = (x0 + tick_w).min(phys_w);
+        for y in y0..phys_h {
+            let row = y * phys_w;
+            state.ruler_pixel_buf[(row + x0)..(row + x1)].fill(col);
+        }
+        t = t.saturating_add(spec.minor_ms);
+    }
+
+    let img = ColorImage {
+        size: [phys_w, phys_h],
+        source_size: Vec2::new(phys_w as f32, phys_h as f32),
+        pixels: state.ruler_pixel_buf.clone(),
+    };
+    if let Some(ref mut tex) = state.ruler_texture {
+        tex.set(img, TextureOptions::NEAREST);
+    } else {
+        state.ruler_texture =
+            Some(ctx.load_texture("hlouis_audio_ruler", img, TextureOptions::NEAREST));
+    }
+    state.ruler_cache_key = Some(key);
 }
 
 /// Custom aligned vertical slider matching Aegisub: thin light track + short wide blue bar thumb.
@@ -738,48 +1092,67 @@ pub fn show_audio_panel(
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
 
-            // 1. Dark top time ruler ("0:05:12" then "13", "14", ...).
+            // 1. Dark top time ruler with physical-resolution baked 0.10 s / 0.50 s / 1.00 s ticks;
+            //    second labels come from a galley cache validated by `GalleyEpoch`.
             let (ruler_rect, _) =
                 ui.allocate_exact_size(Vec2::new(canvas_w, ruler_h), Sense::hover());
-            let rp = ui.painter_at(ruler_rect);
-            rp.rect_filled(ruler_rect, 0.0, Color32::from_rgb(24, 28, 36));
-            let ry_bot = snap_px(ruler_rect.bottom(), ppp);
-            rp.line_segment(
-                [
-                    Pos2::new(ruler_rect.left(), ry_bot),
-                    Pos2::new(ruler_rect.right(), ry_bot),
-                ],
-                Stroke::new(1.0 / ppp.max(0.5), Color32::from_rgb(68, 76, 92)),
-            );
 
             state.viewport.width_px = canvas_w.max(1.0);
             state.viewport.height_px = wave_h.max(1.0);
             let vis = state.viewport.visible_range_ms();
             let span_ms = (vis.end_ms - vis.start_ms).max(100);
-            let step_ms: i64 = if span_ms <= 15_000 {
-                1_000
-            } else if span_ms <= 40_000 {
-                2_000
+
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let ruler_phys_w = ((ruler_rect.width() * ppp).round() as usize).clamp(1, 8192);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let ruler_phys_h = ((ruler_rect.height() * ppp).round() as usize).clamp(1, 128);
+            ensure_ruler_texture(
+                state,
+                ui.ctx(),
+                vis.start_ms,
+                vis.end_ms,
+                ruler_phys_w,
+                ruler_phys_h,
+                ppp,
+                palette,
+                palette_rev,
+            );
+
+            let rp = ui.painter_at(ruler_rect);
+            if let Some(ref rtex) = state.ruler_texture {
+                rp.image(
+                    rtex.id(),
+                    ruler_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
             } else {
-                5_000
-            };
-            let first_tick = ((vis.start_ms + step_ms - 1) / step_ms) * step_ms;
+                rp.rect_filled(ruler_rect, 0.0, Color32::from_rgb(22, 26, 34));
+            }
+
+            // Non-overlapping second labels over the baked tick texture (cached galleys).
             let tick_font = FontId::proportional(9.5);
-            let tick_col = Color32::from_rgb(208, 216, 230);
-            // Ruler labels are cached across frames, but only while egui has not invalidated its
-            // layouts (atlas reset, new fonts / pixels-per-point): see `GalleyEpoch`.
+            let tick_col = Color32::from_rgb(164, 206, 250);
             let generation = state.galley_epoch.sync(ui.ctx());
-            let rkey = RulerCacheKey {
+            let rkey = RulerLabelKey {
                 start_ms: vis.start_ms,
                 end_ms: vis.end_ms,
+                ms_per_px_bits: state.viewport.ms_per_px.to_bits(),
                 width_bits: canvas_w.to_bits(),
                 ppp_bits: ppp.to_bits(),
                 generation,
             };
             if state.ruler_key != Some(rkey) {
                 state.ruler_ticks.clear();
-                let mut t_ms = first_tick;
+                let step_ms = compute_ruler_ticks(state.viewport.ms_per_px).major_ms;
+                let first_label = if vis.start_ms >= 0 {
+                    ((vis.start_ms + step_ms - 1) / step_ms) * step_ms
+                } else {
+                    (vis.start_ms / step_ms) * step_ms
+                };
+                let mut t_ms = first_label;
                 let mut tick_idx = 0usize;
+                let mut last_label_right = -100.0f32;
                 while t_ms <= vis.end_ms {
                     let frac = (t_ms - vis.start_ms) as f32 / span_ms as f32;
                     let rel_x = frac * ruler_rect.width();
@@ -788,31 +1161,30 @@ pub fn show_audio_panel(
                     let m = (total_s / 60) % 60;
                     let s = total_s % 60;
                     state.ruler_buf.clear();
-                    if tick_idx == 0 || s == 0 {
+                    let is_full = tick_idx == 0 || s == 0;
+                    if is_full {
                         let _ = write!(state.ruler_buf, "{h}:{m:02}:{s:02}");
                     } else {
                         let _ = write!(state.ruler_buf, "{s:02}");
                     }
-                    let g = ui.fonts_mut(|f| {
-                        f.layout_no_wrap(state.ruler_buf.clone(), tick_font.clone(), tick_col)
-                    });
-                    state.ruler_ticks.push((rel_x, g));
-                    t_ms += step_ms;
+                    let est_w = if is_full { 44.0 } else { 20.0 };
+                    if rel_x >= last_label_right + 6.0 && rel_x + est_w <= ruler_rect.width() + 4.0
+                    {
+                        let g = ui.fonts_mut(|f| {
+                            f.layout_no_wrap(state.ruler_buf.clone(), tick_font.clone(), tick_col)
+                        });
+                        state.ruler_ticks.push((rel_x, g));
+                        last_label_right = rel_x + est_w;
+                    }
+                    t_ms = t_ms.saturating_add(step_ms);
                     tick_idx += 1;
                 }
                 state.ruler_key = Some(rkey);
             }
             for (rel_x, g) in &state.ruler_ticks {
                 let tx = snap_px(ruler_rect.left() + *rel_x, ppp);
-                rp.line_segment(
-                    [
-                        Pos2::new(tx, ruler_rect.bottom() - 4.0),
-                        Pos2::new(tx, ruler_rect.bottom()),
-                    ],
-                    Stroke::new(1.0 / ppp.max(0.5), tick_col),
-                );
                 rp.galley(
-                    Pos2::new(tx + 2.0, ruler_rect.top() + 2.0),
+                    Pos2::new(tx + 2.0, ruler_rect.top() + 1.0),
                     Arc::clone(g),
                     tick_col,
                 );
@@ -834,64 +1206,274 @@ pub fn show_audio_panel(
                 height_px: tex_h,
                 spectrum_mode: state.spectrum_mode,
                 v_zoom_bits: state.v_zoom.to_bits(),
+                ms_per_px_bits: state.viewport.ms_per_px.to_bits(),
                 palette_rev,
             };
 
-            if state.cache_key != Some(key) {
-                let spectrum_ok = state.spectrum_mode
-                    && provider.render_spectrum_into(
-                        vis.start_ms,
-                        vis.end_ms,
-                        tex_w,
-                        tex_h,
-                        palette,
-                        &mut state.pixel_buf,
-                    )
-                    && state.pixel_buf.len() == tex_w.saturating_mul(tex_h);
-                if !spectrum_ok {
-                    provider.query_columns_into(
-                        vis.start_ms,
-                        vis.end_ms,
-                        tex_w,
-                        &mut state.columns_buf,
-                    );
-                    state.rasterize_columns(tex_w, tex_h, palette);
-                }
-                let img = ColorImage {
-                    size: [tex_w, tex_h],
-                    source_size: Vec2::new(tex_w as f32, tex_h as f32),
-                    pixels: state.pixel_buf.clone(),
-                };
-                if let Some(ref mut tex) = state.texture {
-                    tex.set(img, TextureOptions::NEAREST);
+            if state.cache_key == Some(key) {
+                state.last_computed_columns = 0;
+            } else {
+                // Detect pure horizontal scroll by N pixels -> ring-buffer set_partial of ONLY N
+                // columns (zero full-buffer copy_within, zero full-texture clone/upload).
+                let sr = provider.sample_rate();
+                let scroll_shift: Option<isize> = state.cache_key.and_then(|prev| {
+                    if state.texture.is_some()
+                        && (!key.spectrum_mode || sr > 0)
+                        && prev.width_px == key.width_px
+                        && prev.height_px == key.height_px
+                        && prev.spectrum_mode == key.spectrum_mode
+                        && prev.v_zoom_bits == key.v_zoom_bits
+                        && prev.ms_per_px_bits == key.ms_per_px_bits
+                        && prev.palette_rev == key.palette_rev
+                        && prev.start_ms != key.start_ms
+                    {
+                        let d_f = (key.start_ms - prev.start_ms) as f64
+                            / state.viewport.ms_per_px.max(f64::EPSILON);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let d = d_f.round() as isize;
+                        if d != 0 && d.unsigned_abs() < tex_w {
+                            return Some(d);
+                        }
+                    }
+                    None
+                });
+
+                if let Some(delta_px) = scroll_shift {
+                    let d = delta_px.unsigned_abs();
+                    let (dirty_range, write_x) = if delta_px > 0 {
+                        // Scrolled right: overwrite old leftmost d cols at ring_head, advance head.
+                        let wx = state.ring_head;
+                        state.ring_head = (state.ring_head + d) % tex_w;
+                        ((tex_w - d)..tex_w, wx)
+                    } else {
+                        // Scrolled left: step head back by d, overwrite those d cols.
+                        state.ring_head = (state.ring_head + tex_w - d) % tex_w;
+                        (0..d, state.ring_head)
+                    };
+
+                    let strip_total = d.saturating_mul(tex_h);
+                    state.partial_pixel_buf.resize(strip_total, Color32::BLACK);
+
+                    if state.spectrum_mode && sr > 0 {
+                        state.ensure_spectrum_lut(palette, palette_rev);
+                        let total = tex_w.saturating_mul(tex_h);
+                        if state.spectrum_rgba_buf.len() != total {
+                            state
+                                .spectrum_rgba_buf
+                                .resize(total, Rgba8::rgb(11, 15, 26));
+                        }
+                        let spec = SpectrumViewportSpec {
+                            width_px: tex_w,
+                            height_px: tex_h,
+                            start_ms: vis.start_ms,
+                            end_ms: vis.end_ms,
+                            sample_rate: sr,
+                            v_zoom: state.v_zoom,
+                        };
+                        if let Some((_, ref lut)) = state.spectrum_lut {
+                            state.spectrum_renderer.render_columns_range_with(
+                                spec,
+                                dirty_range.clone(),
+                                lut,
+                                |s0, count, buf| provider.read_mono_i16(s0, count, buf),
+                                &mut state.spectrum_rgba_buf,
+                            );
+                        }
+                        for y in 0..tex_h {
+                            let src_row = y * tex_w + dirty_range.start;
+                            let dst_row = y * d;
+                            for i in 0..d {
+                                let c = state.spectrum_rgba_buf[src_row + i];
+                                state.partial_pixel_buf[dst_row + i] =
+                                    Color32::from_rgb(c.r, c.g, c.b);
+                            }
+                        }
+                    } else {
+                        let span_f = (vis.end_ms - vis.start_ms).max(1) as f64;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let sub_s = vis.start_ms
+                            + ((dirty_range.start as f64 / tex_w as f64) * span_f).round() as i64;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let sub_e = vis.start_ms
+                            + ((dirty_range.end as f64 / tex_w as f64) * span_f).round() as i64;
+                        provider.query_columns_into(
+                            sub_s,
+                            sub_e.max(sub_s + 1),
+                            d,
+                            &mut state.partial_columns_buf,
+                        );
+                        // Swap scratch buffers briefly to rasterize only the d-wide strip.
+                        std::mem::swap(&mut state.columns_buf, &mut state.partial_columns_buf);
+                        std::mem::swap(&mut state.pixel_buf, &mut state.partial_pixel_buf);
+                        state.rasterize_columns_range(d, tex_h, 0..d, palette);
+                        std::mem::swap(&mut state.columns_buf, &mut state.partial_columns_buf);
+                        std::mem::swap(&mut state.pixel_buf, &mut state.partial_pixel_buf);
+                    }
+
+                    if let Some(ref mut tex) = state.texture {
+                        let first_w = d.min(tex_w - write_x);
+                        let second_w = d - first_w;
+                        if second_w == 0 {
+                            let img = ColorImage {
+                                size: [d, tex_h],
+                                source_size: Vec2::new(d as f32, tex_h as f32),
+                                pixels: state.partial_pixel_buf[..strip_total].to_vec(),
+                            };
+                            tex.set_partial([write_x, 0], img, TextureOptions::NEAREST);
+                        } else {
+                            let mut p1 = Vec::with_capacity(first_w * tex_h);
+                            let mut p2 = Vec::with_capacity(second_w * tex_h);
+                            for y in 0..tex_h {
+                                let row = y * d;
+                                p1.extend_from_slice(
+                                    &state.partial_pixel_buf[row..(row + first_w)],
+                                );
+                                p2.extend_from_slice(
+                                    &state.partial_pixel_buf[(row + first_w)..(row + d)],
+                                );
+                            }
+                            tex.set_partial(
+                                [write_x, 0],
+                                ColorImage {
+                                    size: [first_w, tex_h],
+                                    source_size: Vec2::new(first_w as f32, tex_h as f32),
+                                    pixels: p1,
+                                },
+                                TextureOptions::NEAREST,
+                            );
+                            tex.set_partial(
+                                [0, 0],
+                                ColorImage {
+                                    size: [second_w, tex_h],
+                                    source_size: Vec2::new(second_w as f32, tex_h as f32),
+                                    pixels: p2,
+                                },
+                                TextureOptions::NEAREST,
+                            );
+                        }
+                    }
+
+                    state.cache_key = Some(key);
+                    state.texture_uploads += 1;
+                    state.last_computed_columns = d;
+                    state.total_computed_columns += d as u64;
                 } else {
-                    state.texture = Some(ui.ctx().load_texture(
-                        "hlouis_audio_waveform",
-                        img,
-                        TextureOptions::NEAREST,
-                    ));
+                    state.ring_head = 0;
+                    if state.spectrum_mode && sr > 0 {
+                        state.ensure_spectrum_lut(palette, palette_rev);
+                        let total = tex_w.saturating_mul(tex_h);
+                        if state.spectrum_rgba_buf.len() != total {
+                            state
+                                .spectrum_rgba_buf
+                                .resize(total, Rgba8::rgb(11, 15, 26));
+                        }
+                        if state.pixel_buf.len() != total {
+                            state.pixel_buf.resize(total, Color32::from_rgb(11, 15, 26));
+                        }
+                        let spec = SpectrumViewportSpec {
+                            width_px: tex_w,
+                            height_px: tex_h,
+                            start_ms: vis.start_ms,
+                            end_ms: vis.end_ms,
+                            sample_rate: sr,
+                            v_zoom: state.v_zoom,
+                        };
+                        if let Some((_, ref lut)) = state.spectrum_lut {
+                            state.spectrum_renderer.render_columns_range_with(
+                                spec,
+                                0..tex_w,
+                                lut,
+                                |s0, count, buf| provider.read_mono_i16(s0, count, buf),
+                                &mut state.spectrum_rgba_buf,
+                            );
+                        }
+                        for y in 0..tex_h {
+                            let row = y * tex_w;
+                            for x in 0..tex_w {
+                                let c = state.spectrum_rgba_buf[row + x];
+                                state.pixel_buf[row + x] = Color32::from_rgb(c.r, c.g, c.b);
+                            }
+                        }
+                    } else {
+                        // No raw PCM: use the provider's own spectrum renderer (e.g. the native
+                        // STFT) in spectrum mode, otherwise (or on failure) the peak columns.
+                        let spectrum_ok = state.spectrum_mode
+                            && provider.render_spectrum_into(
+                                vis.start_ms,
+                                vis.end_ms,
+                                tex_w,
+                                tex_h,
+                                palette,
+                                &mut state.pixel_buf,
+                            )
+                            && state.pixel_buf.len() == tex_w.saturating_mul(tex_h);
+                        if !spectrum_ok {
+                            provider.query_columns_into(
+                                vis.start_ms,
+                                vis.end_ms,
+                                tex_w,
+                                &mut state.columns_buf,
+                            );
+                            state.rasterize_columns_range(tex_w, tex_h, 0..tex_w, palette);
+                        }
+                    }
+
+                    let img = ColorImage {
+                        size: [tex_w, tex_h],
+                        source_size: Vec2::new(tex_w as f32, tex_h as f32),
+                        pixels: state.pixel_buf.clone(),
+                    };
+                    if let Some(ref mut tex) = state.texture {
+                        tex.set(img, TextureOptions::NEAREST);
+                    } else {
+                        state.texture = Some(ui.ctx().load_texture(
+                            "hlouis_audio_waveform",
+                            img,
+                            TextureOptions::NEAREST,
+                        ));
+                    }
+                    state.cache_key = Some(key);
+                    state.texture_uploads += 1;
+                    state.last_computed_columns = tex_w;
+                    state.total_computed_columns += tex_w as u64;
                 }
-                state.cache_key = Some(key);
-                state.texture_uploads += 1;
             }
 
             let painter = ui.painter_at(rect);
             if let Some(ref tex) = state.texture {
-                painter.image(
-                    tex.id(),
-                    rect,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                if state.ring_head == 0 || state.ring_head >= tex_w {
+                    painter.image(
+                        tex.id(),
+                        rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    let u_split = state.ring_head as f32 / tex_w as f32;
+                    let left_frac = (tex_w - state.ring_head) as f32 / tex_w as f32;
+                    let x_split = rect.left() + left_frac * rect.width();
+                    painter.image(
+                        tex.id(),
+                        Rect::from_min_max(rect.min, Pos2::new(x_split, rect.bottom())),
+                        Rect::from_min_max(Pos2::new(u_split, 0.0), Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    painter.image(
+                        tex.id(),
+                        Rect::from_min_max(Pos2::new(x_split, rect.top()), rect.max),
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(u_split, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
             } else {
-                painter.rect_filled(rect, 0.0, Color32::from_rgb(8, 16, 40));
+                painter.rect_filled(rect, 0.0, Color32::from_rgb(11, 15, 26));
             }
 
             let kara_bounds = karaoke.map_or(&[][..], KaraokeTimingController::boundaries_ms);
             let input = AudioFrameInput {
                 viewport: state.viewport,
                 selection: state.active_selection,
-                inactive_spans: &[],
+                inactive_spans: &state.inactive_spans,
                 markers,
                 play_cursor_ms: state.play_cursor_ms,
                 video_marker: state.video_marker_ms.map(|ms| {
@@ -933,23 +1515,94 @@ pub fn show_audio_panel(
                 painter.rect_filled(sr, 0.0, role_color(span.role, palette));
             }
 
+            // Pass 1: subtle line boundaries, video cursor, karaoke boundaries.
+            let thin_w = 1.0 / ppp.max(0.5);
             for m in &state.frame_layout.markers {
-                let sx = snap_px(rect.left() + m.x, ppp);
-                let is_sel_edge = matches!(
+                if matches!(
                     m.role,
-                    ColorRole::SelectionStartMarker | ColorRole::SelectionEndMarker
-                );
-                let width = if is_sel_edge {
-                    2.0 / ppp.max(0.5)
-                } else {
-                    1.0 / ppp.max(0.5)
-                };
+                    ColorRole::KeyframeLine
+                        | ColorRole::SelectionStartMarker
+                        | ColorRole::SelectionEndMarker
+                        | ColorRole::PlayCursor
+                ) {
+                    continue;
+                }
+                let sx = snap_px(rect.left() + m.x, ppp);
                 painter.line_segment(
                     [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
-                    Stroke::new(width, role_color(m.role, palette)),
+                    Stroke::new(thin_w, role_color(m.role, palette)),
                 );
             }
 
+            // Pass 2: bright pink/magenta full-height keyframes drawn over waveform, spectrum & selection.
+            let kf_w = (1.5 / ppp.max(0.5)).max(1.0);
+            for m in &state.frame_layout.markers {
+                if m.role != ColorRole::KeyframeLine {
+                    continue;
+                }
+                let sx = snap_px(rect.left() + m.x, ppp);
+                painter.line_segment(
+                    [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
+                    Stroke::new(kf_w, role_color(m.role, palette)),
+                );
+            }
+
+            // Pass 3: active selection start/end boundary lines + crisp corner notches (no Vec alloc).
+            let edge_w = (2.0 / ppp.max(0.5)).max(1.5);
+            for m in &state.frame_layout.markers {
+                if !matches!(
+                    m.role,
+                    ColorRole::SelectionStartMarker
+                        | ColorRole::SelectionEndMarker
+                        | ColorRole::PlayCursor
+                ) {
+                    continue;
+                }
+                let sx = snap_px(rect.left() + m.x, ppp);
+                let col = role_color(m.role, palette);
+                let w = if m.role == ColorRole::PlayCursor {
+                    thin_w
+                } else {
+                    edge_w
+                };
+                painter.line_segment(
+                    [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
+                    Stroke::new(w, col),
+                );
+                if m.role == ColorRole::SelectionStartMarker {
+                    painter.rect_filled(
+                        Rect::from_min_size(Pos2::new(sx, rect.top()), Vec2::new(4.0, 4.0)),
+                        0.0,
+                        col,
+                    );
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            Pos2::new(sx, rect.bottom() - 4.0),
+                            Vec2::new(4.0, 4.0),
+                        ),
+                        0.0,
+                        col,
+                    );
+                } else if m.role == ColorRole::SelectionEndMarker {
+                    painter.rect_filled(
+                        Rect::from_min_size(Pos2::new(sx - 4.0, rect.top()), Vec2::new(4.0, 4.0)),
+                        0.0,
+                        col,
+                    );
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            Pos2::new(sx - 4.0, rect.bottom() - 4.0),
+                            Vec2::new(4.0, 4.0),
+                        ),
+                        0.0,
+                        col,
+                    );
+                }
+            }
+
+            // Interaction: drag/click start & end boundaries with magnetic keyframe/line snapping
+            // (hold Shift to temporarily disable snapping).
+            let shift_held = ui.input(|i| i.modifiers.shift);
             if let Some(pos) = resp.interact_pointer_pos() {
                 let local_x = pos.x - rect.left();
                 let local_y = pos.y - rect.top();
@@ -965,19 +1618,25 @@ pub fn show_audio_panel(
                         HitTarget::StartMarker => state.dragging = Some(DragTarget::Start),
                         HitTarget::EndMarker => state.dragging = Some(DragTarget::End),
                         _ => {
-                            let ms = state.viewport.x_to_ms(local_x).max(0);
+                            let raw_ms = state.viewport.x_to_ms(local_x).max(0);
+                            let (ms, hint) = apply_snap(raw_ms, shift_held, state, markers);
                             state.active_selection.start_ms = ms;
                             if state.active_selection.end_ms < ms {
                                 state.active_selection.end_ms = ms + 500;
                             }
                             state.dragging = Some(DragTarget::End);
+                            state.active_snap_hint = hint;
+                            action =
+                                Some(AudioPanelAction::SelectionChanged(state.active_selection));
                         }
                     }
                 }
                 if resp.dragged()
                     && let Some(target) = state.dragging
                 {
-                    let ms = state.viewport.x_to_ms(local_x).max(0);
+                    let raw_ms = state.viewport.x_to_ms(local_x).max(0);
+                    let (ms, hint) = apply_snap(raw_ms, shift_held, state, markers);
+                    state.active_snap_hint = hint;
                     match target {
                         DragTarget::Start => {
                             state.active_selection.start_ms = ms.min(state.active_selection.end_ms);
@@ -991,6 +1650,48 @@ pub fn show_audio_panel(
                 }
                 if resp.drag_stopped() {
                     state.dragging = None;
+                    state.active_snap_hint = None;
+                }
+            } else if state.dragging.is_none() {
+                state.active_snap_hint = None;
+            }
+
+            // Snap halo + "KF" badge ONLY while actively dragging (never in the static view).
+            if state.dragging.is_some()
+                && let Some(hint) = state.active_snap_hint
+            {
+                let hx = snap_px(rect.left() + state.viewport.ms_to_x(hint.time_ms), ppp);
+                if hx >= rect.left() && hx <= rect.right() {
+                    let halo_col = if hint.is_keyframe {
+                        Color32::from_rgba_unmultiplied(255, 48, 200, 68)
+                    } else {
+                        Color32::from_rgba_unmultiplied(96, 184, 255, 68)
+                    };
+                    let badge_bg = if hint.is_keyframe {
+                        Color32::from_rgb(214, 36, 168)
+                    } else {
+                        Color32::from_rgb(48, 122, 210)
+                    };
+                    painter.rect_filled(
+                        Rect::from_center_size(
+                            Pos2::new(hx, rect.center().y),
+                            Vec2::new(7.0, rect.height()),
+                        ),
+                        0.0,
+                        halo_col,
+                    );
+                    let badge_rect = Rect::from_min_size(
+                        Pos2::new((hx + 3.0).min(rect.right() - 22.0), rect.top() + 3.0),
+                        Vec2::new(20.0, 13.0),
+                    );
+                    painter.rect_filled(badge_rect, 2.0, badge_bg);
+                    painter.text(
+                        badge_rect.center(),
+                        Align2::CENTER_CENTER,
+                        if hint.is_keyframe { "KF" } else { "LN" },
+                        FontId::proportional(8.5),
+                        Color32::WHITE,
+                    );
                 }
             }
 
@@ -1431,7 +2132,8 @@ mod tests {
                 vis.end_ms - vis.start_ms >= 6_000,
                 "visible span too small: {vis:?}"
             );
-            let sel = ui_theme::rgba(pal.audio_selection);
+            let sel_rgb = ui_theme::rgba(pal.audio_selection);
+            let sel = Color32::from_rgba_unmultiplied(sel_rgb.r(), sel_rgb.g(), sel_rgb.b(), 82);
             let has_fill = shapes.iter().any(|s| {
                 matches!(s, egui::epaint::Shape::Rect(r) if r.fill == sel && r.rect.width() > 20.0)
             });
@@ -1446,14 +2148,15 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let key = ui_theme::rgba(pal.audio_keyframe);
+            // Bright pink keyframe lines (theme-independent so they stay visible over any audio).
+            let key = Color32::from_rgb(255, 48, 200);
             assert!(
                 line_colours.iter().filter(|&&c| c == key).count() >= 2,
                 "keyframe lines not painted (spectrum={spectrum})"
             );
             for c in [
-                Color32::from_rgb(235, 65, 65),
-                Color32::from_rgb(235, 110, 185),
+                Color32::from_rgb(238, 72, 72),
+                Color32::from_rgb(64, 148, 255),
             ] {
                 assert!(
                     line_colours.contains(&c),
@@ -1507,5 +2210,248 @@ mod tests {
         ctx.set_fonts(egui::FontDefinitions::default());
         assert_eq!(frame(&ctx), 0);
         assert_eq!(frame(&ctx), 0);
+    }
+
+    struct SpeechLikePcmProvider {
+        samples: Vec<i16>,
+        sr: u32,
+    }
+    impl SpeechLikePcmProvider {
+        fn new(duration_ms: i64, sr: u32) -> Self {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let len = ((duration_ms.max(100) as u64 * u64::from(sr)) / 1_000) as usize;
+            let mut samples = Vec::with_capacity(len);
+            let mut rng = 0x1234_5678u32;
+            for i in 0..len {
+                rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((rng >> 16) as f32 / 32_768.0 - 1.0) * 0.015;
+                let t = i as f32 / sr as f32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let env = if ((t * 2.5) as usize).is_multiple_of(3) {
+                    0.05
+                } else {
+                    0.65
+                };
+                let s = noise
+                    + env
+                        * (0.5 * (std::f32::consts::TAU * 175.0 * t).sin()
+                            + 0.3 * (std::f32::consts::TAU * 720.0 * t).sin()
+                            + 0.2 * (std::f32::consts::TAU * 2_200.0 * t).sin());
+                #[allow(clippy::cast_possible_truncation)]
+                samples.push((s.clamp(-1.0, 1.0) * 30_000.0) as i16);
+            }
+            Self { samples, sr }
+        }
+    }
+    impl AudioColumnProvider for SpeechLikePcmProvider {
+        fn duration_ms(&self) -> i64 {
+            #[allow(clippy::cast_possible_wrap)]
+            let n = self.samples.len() as i64;
+            (n * 1_000) / i64::from(self.sr.max(1))
+        }
+        fn sample_rate(&self) -> u32 {
+            self.sr
+        }
+        fn read_mono_i16(&self, start_sample: usize, count: usize, out: &mut Vec<i16>) {
+            out.clear();
+            if start_sample >= self.samples.len() {
+                return;
+            }
+            let end = (start_sample + count).min(self.samples.len());
+            out.extend_from_slice(&self.samples[start_sample..end]);
+        }
+        fn query_columns_into(
+            &self,
+            start_ms: i64,
+            end_ms: i64,
+            width_px: usize,
+            out: &mut Vec<PeakBucket>,
+        ) {
+            out.clear();
+            let span = (end_ms - start_ms).max(1) as f64;
+            let sr_f = f64::from(self.sr);
+            let n = self.samples.len();
+            for col in 0..width_px {
+                let t0 = start_ms as f64 + (col as f64 / width_px.max(1) as f64) * span;
+                let t1 = start_ms as f64 + ((col + 1) as f64 / width_px.max(1) as f64) * span;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let s0 = ((t0.max(0.0) * sr_f) / 1_000.0) as usize;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let s1 = (((t1.max(0.0) * sr_f) / 1_000.0) as usize).max(s0 + 1);
+                if s0 >= n {
+                    out.push(PeakBucket {
+                        min: 0,
+                        max: 0,
+                        rms: 0,
+                    });
+                    continue;
+                }
+                let mut mn = i16::MAX;
+                let mut mx = i16::MIN;
+                let mut sq = 0u64;
+                let slice = &self.samples[s0..s1.min(n)];
+                for &s in slice {
+                    mn = mn.min(s);
+                    mx = mx.max(s);
+                    let v = i64::from(s);
+                    sq = sq.saturating_add((v * v).unsigned_abs());
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let rms = ((sq as f64 / slice.len().max(1) as f64).sqrt()) as u16;
+                out.push(PeakBucket {
+                    min: mn,
+                    max: mx,
+                    rms,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn column_computation_counts_zero_on_idle_and_n_on_scroll() {
+        let provider = SpeechLikePcmProvider::new(30_000, 16_000);
+        let markers = TimelineMarkerIndex::new(vec![1_000, 2_500, 4_000], vec![500, 2_000]);
+        let pal = theme::palette(ThemeSpec::Dark);
+        let cat = Catalog::for_locale(Locale::En);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(ui_theme::build_font_definitions(
+            &ui_theme::FontConfig::default(),
+        ));
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0))),
+            ..Default::default()
+        };
+
+        let mut state = AudioPanelState::new(30_000);
+        state.viewport.ms_per_px = 5.0; // 1 px = 5 ms
+        state.spectrum_mode = true;
+
+        // Frame 1: full screen computed.
+        let mut out1 = ctx.run_ui(raw.clone(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = show_audio_panel(
+                    ui, &mut state, &provider, &markers, None, None, &pal, 1, &cat,
+                );
+            });
+        });
+        out1.textures_delta.clear();
+        assert!(state.last_computed_columns() > 100);
+        let uploads_after_first = state.texture_uploads();
+
+        // Frame 2: idle -> 0 columns computed, 0 texture uploads.
+        let mut out2 = ctx.run_ui(raw.clone(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = show_audio_panel(
+                    ui, &mut state, &provider, &markers, None, None, &pal, 1, &cat,
+                );
+            });
+        });
+        out2.textures_delta.clear();
+        assert_eq!(state.last_computed_columns(), 0);
+        assert_eq!(state.texture_uploads(), uploads_after_first);
+
+        // Frame 3: scroll right by exactly 12 px (60 ms at 5 ms/px) -> computes only 12 columns.
+        state.viewport.scroll_ms += 60.0;
+        let mut out3 = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = show_audio_panel(
+                    ui, &mut state, &provider, &markers, None, None, &pal, 1, &cat,
+                );
+            });
+        });
+        out3.textures_delta.clear();
+        assert_eq!(state.last_computed_columns(), 12);
+    }
+
+    #[test]
+    fn snap_inside_outside_shift_and_zoom() {
+        let mut state = AudioPanelState::new(30_000);
+        state.auto_snap_keyframes = true;
+        state.snap_to_lines = true;
+        state.snap_distance_px = 10.0;
+        state.viewport.ms_per_px = 5.0; // 10 px = 50 ms
+        let markers = TimelineMarkerIndex::new(vec![2_000, 4_000], vec![1_500, 3_000]);
+
+        // Inside 50 ms threshold -> snaps to keyframe 2000.
+        let (ms, hint) = apply_snap(2_040, false, &state, &markers);
+        assert_eq!(ms, 2_000);
+        assert_eq!(
+            hint,
+            Some(SnapHint {
+                time_ms: 2_000,
+                is_keyframe: true,
+            })
+        );
+
+        // Outside 50 ms threshold -> no snap.
+        let (ms_out, hint_out) = apply_snap(2_060, false, &state, &markers);
+        assert_eq!(ms_out, 2_060);
+        assert_eq!(hint_out, None);
+
+        // Shift held -> disables snap even inside threshold.
+        let (ms_shift, hint_shift) = apply_snap(2_005, true, &state, &markers);
+        assert_eq!(ms_shift, 2_005);
+        assert_eq!(hint_shift, None);
+
+        // Zoomed out (20 ms/px -> 10 px = 200 ms): 2_060 is now inside threshold.
+        state.viewport.ms_per_px = 20.0;
+        let (ms_z, hint_z) = apply_snap(2_060, false, &state, &markers);
+        assert_eq!(ms_z, 2_000);
+        assert!(hint_z.is_some_and(|h| h.is_keyframe));
+    }
+
+    #[test]
+    fn audio_panel_renders_waveform_spectrum_and_snap_hint_all_themes_100_200_dpi() {
+        let provider = SpeechLikePcmProvider::new(12_000, 16_000);
+        let markers = TimelineMarkerIndex::new(vec![1_000, 2_500, 4_000], vec![500, 2_200, 3_800]);
+        let cat = Catalog::for_locale(Locale::En);
+        let themes = [
+            ThemeSpec::Light,
+            ThemeSpec::Dark,
+            ThemeSpec::EyeComfort {
+                base: theme::BaseTheme::Dark,
+                strength: 65,
+            },
+        ];
+
+        for spec in themes {
+            let pal = theme::palette(spec);
+            for ppp in [1.0f32, 2.0f32] {
+                for spectrum_mode in [false, true] {
+                    let mut state = AudioPanelState::new(12_000);
+                    state.spectrum_mode = spectrum_mode;
+                    state.viewport.ms_per_px = 5.0;
+                    state.active_selection = TimeRangeMs {
+                        start_ms: 1_000,
+                        end_ms: 2_500,
+                    };
+                    state.inactive_spans.push(TimeRangeMs {
+                        start_ms: 2_600,
+                        end_ms: 3_800,
+                    });
+                    state.dragging = Some(DragTarget::Start);
+                    state.active_snap_hint = Some(SnapHint {
+                        time_ms: 1_000,
+                        is_keyframe: true,
+                    });
+                    let fonts = ui_theme::build_font_definitions(&ui_theme::FontConfig::default());
+                    let mut inited = false;
+                    let mut harness = Harness::builder()
+                        .with_size(Vec2::new(720.0, 220.0))
+                        .with_pixels_per_point(ppp)
+                        .with_accessibility_check(false)
+                        .build_ui(|ui| {
+                            if !inited {
+                                ui.ctx().set_fonts(fonts.clone());
+                                inited = true;
+                            }
+                            let _ = show_audio_panel(
+                                ui, &mut state, &provider, &markers, None, None, &pal, 1, &cat,
+                            );
+                        });
+                    harness.run();
+                }
+            }
+        }
     }
 }

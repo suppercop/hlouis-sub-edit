@@ -103,6 +103,7 @@ pub struct EditorApp {
     pub audio: Option<Box<dyn AudioProvider>>,
     pub renderer: Box<dyn SubtitleRenderer>,
     pub fonts: Box<dyn FontProvider>,
+    last_audio_inactive_line: Option<usize>,
     /// Creates native video/audio providers (None = pure-Rust fallbacks only).
     pub factory: Option<Box<dyn media::MediaFactory>>,
     /// Native file dialogs (None = menu open/save commands report that no dialog is available).
@@ -150,6 +151,7 @@ impl EditorApp {
             audio: Some(Box::new(synth_audio)),
             renderer: Box::new(PlainTextBoxRenderer),
             fonts: Box::new(BasicFontProvider::default()),
+            last_audio_inactive_line: None,
             factory: None,
             file_dialogs: None,
             video_path: None,
@@ -422,10 +424,16 @@ impl EditorApp {
         self.shell.grid.model.columns.margin_l = iface.show_col_margins;
         self.shell.grid.model.columns.margin_r = iface.show_col_margins;
         self.shell.grid.model.columns.margin_v = iface.show_col_margins;
+        let aud = &self.shell.settings.audio;
+        self.shell.audio.spectrum_mode = aud.spectrum;
+        self.shell.audio.auto_snap_keyframes = aud.auto_snap_keyframes;
+        self.shell.audio.snap_to_lines = aud.snap_to_lines;
+        self.shell.audio.snap_distance_px = aud.snap_distance_px as f32;
     }
 
     /// Re-synchronizes grid, edit box, and style manager lists from `shell.doc`.
     pub fn sync_ui_from_doc(&mut self) {
+        self.last_audio_inactive_line = None;
         self.shell.grid.sync_from_script(self.shell.doc.script());
         self.shell.editbox.active_line = None;
         let styles: Vec<String> = self
@@ -715,9 +723,44 @@ impl EditorApp {
         Ok(())
     }
 
+    fn sync_audio_snap_and_spans(&mut self) {
+        // Keep audio snap prefs synced cheaply (3 scalar copies) and cache inactive neighbour
+        // spans keyed by `active_line` (invalidated by `sync_ui_from_doc`) so text-only edits
+        // (`amend_text`) never scan `EventsSection` per frame.
+        self.shell.audio.auto_snap_keyframes = self.shell.settings.audio.auto_snap_keyframes;
+        self.shell.audio.snap_to_lines = self.shell.settings.audio.snap_to_lines;
+        self.shell.audio.snap_distance_px = self.shell.settings.audio.snap_distance_px as f32;
+        let active_idx = self.shell.doc.active_line().unwrap_or(0);
+        if self.last_audio_inactive_line != Some(active_idx) {
+            self.shell.audio.inactive_spans.clear();
+            if let Some(sec) = self.shell.doc.script().events_section() {
+                if let Some(prev_ev) = active_idx.checked_sub(1).and_then(|i| sec.get_event(i)) {
+                    self.shell
+                        .audio
+                        .inactive_spans
+                        .push(timing_controller::TimeRangeMs {
+                            start_ms: prev_ev.start().as_ms().cast_signed(),
+                            end_ms: prev_ev.end().as_ms().cast_signed(),
+                        });
+                }
+                if let Some(next_ev) = sec.get_event(active_idx + 1) {
+                    self.shell
+                        .audio
+                        .inactive_spans
+                        .push(timing_controller::TimeRangeMs {
+                            start_ms: next_ev.start().as_ms().cast_signed(),
+                            end_ms: next_ev.end().as_ms().cast_signed(),
+                        });
+                }
+            }
+            self.last_audio_inactive_line = Some(active_idx);
+        }
+    }
+
     /// Renders one complete application frame into `ui` and processes drag-and-drop + prompts.
     pub fn show(&mut self, ui: &mut Ui, clock: &dyn Clock) {
         self.media_pre_show(clock);
+        self.sync_audio_snap_and_spans();
         let vid_adapter = VideoSupplierAdapter(self.video.as_ref());
         let aud_adapter = self.audio.as_deref().map(AudioColumnAdapter);
         let aud_ref: Option<&dyn ui_audio::AudioColumnProvider> = aud_adapter

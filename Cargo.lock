@@ -5132,6 +5132,7 @@ dependencies = [
  "egui_kittest",
  "i18n-catalog",
  "karaoke-timing",
+ "spectrum",
  "theme",
  "timing-controller",
  "ui-theme",

@@ -243,6 +243,112 @@ impl TimelineMarkerIndex {
             line_boundaries_ms,
         }
     }
+
+    /// Finds the nearest snap target in `keyframes_ms` and/or `line_boundaries_ms` within
+    /// `threshold_ms`, returning `Some((snapped_ms, is_keyframe))` in O(log N) with zero allocs.
+    /// Keyframes win ties over line boundaries.
+    #[inline]
+    #[must_use]
+    pub fn snap_target(
+        &self,
+        target_ms: i64,
+        threshold_ms: i64,
+        snap_keyframes: bool,
+        snap_lines: bool,
+    ) -> Option<(i64, bool)> {
+        if threshold_ms <= 0 {
+            return None;
+        }
+        let mut best: Option<(i64, i64, bool)> = None;
+        if snap_keyframes {
+            if let Some((dist, val)) =
+                nearest_sorted_ms(&self.keyframes_ms, target_ms, threshold_ms)
+            {
+                best = Some((dist, val, true));
+            }
+        }
+        if snap_lines {
+            if let Some((dist, val)) =
+                nearest_sorted_ms(&self.line_boundaries_ms, target_ms, threshold_ms)
+            {
+                if best.is_none_or(|(bd, _, _)| dist < bd) {
+                    best = Some((dist, val, false));
+                }
+            }
+        }
+        best.map(|(_, val, is_kf)| (val, is_kf))
+    }
+}
+
+#[inline]
+fn nearest_sorted_ms(sorted: &[i64], target_ms: i64, threshold_ms: i64) -> Option<(i64, i64)> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let pos = sorted.partition_point(|&t| t < target_ms);
+    let mut best: Option<(i64, i64)> = None;
+    if let Some(&right) = sorted.get(pos) {
+        let d = (right - target_ms).abs();
+        if d <= threshold_ms {
+            best = Some((d, right));
+        }
+    }
+    if pos > 0 {
+        let left = sorted[pos - 1];
+        let d = (target_ms - left).abs();
+        if d <= threshold_ms && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, left));
+        }
+    }
+    best
+}
+
+/// Adaptive tick intervals (in milliseconds) for the audio time ruler so minor ticks are never
+/// denser than ~6 px and labels never overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RulerTickSpec {
+    pub minor_ms: i64,
+    pub medium_ms: i64,
+    pub major_ms: i64,
+}
+
+/// Computes adaptive minor / medium / major ruler tick intervals for `ms_per_px`.
+///
+/// At typical timing zoom (`<= 16.67 ms/px`, e.g. 10 s across 800..2000 px), this yields
+/// 0.10 s minor ticks, 0.50 s medium ticks, and 1.00 s major labeled ticks.
+#[must_use]
+pub fn compute_ruler_ticks(ms_per_px: f64) -> RulerTickSpec {
+    let scale = ms_per_px.max(0.05);
+    if 100.0 / scale >= 6.0 {
+        RulerTickSpec {
+            minor_ms: 100,
+            medium_ms: 500,
+            major_ms: 1_000,
+        }
+    } else if 500.0 / scale >= 6.0 {
+        let major_ms = if 1_000.0 / scale >= 44.0 {
+            1_000
+        } else {
+            5_000
+        };
+        RulerTickSpec {
+            minor_ms: 500,
+            medium_ms: 1_000,
+            major_ms,
+        }
+    } else if 1_000.0 / scale >= 6.0 {
+        RulerTickSpec {
+            minor_ms: 1_000,
+            medium_ms: 5_000,
+            major_ms: 10_000,
+        }
+    } else {
+        RulerTickSpec {
+            minor_ms: 5_000,
+            medium_ms: 10_000,
+            major_ms: 30_000,
+        }
+    }
 }
 
 /// Inputs for a single frame of the audio display.
@@ -441,14 +547,15 @@ pub fn build_frame_layout(
     push_karaoke_layout(input, vis, &vp, out);
 
     // 7. Play cursor
-    if let Some(play_ms) = input.play_cursor_ms {
-        if play_ms >= vis.start_ms && play_ms <= vis.end_ms {
-            out.markers.push(MarkerLine {
-                x: vp.ms_to_x(play_ms),
-                time_ms: play_ms,
-                role: ColorRole::PlayCursor,
-            });
-        }
+    if let Some(play_ms) = input
+        .play_cursor_ms
+        .filter(|&ms| ms >= vis.start_ms && ms <= vis.end_ms)
+    {
+        out.markers.push(MarkerLine {
+            x: vp.ms_to_x(play_ms),
+            time_ms: play_ms,
+            role: ColorRole::PlayCursor,
+        });
     }
 
     // 8. Optional waveform peak query via `audio-peaks`
@@ -616,5 +723,27 @@ mod tests {
             layout.hit_test(vp.ms_to_x(2300), 10.0, 4.0, &vp, sel, &kara),
             HitTarget::SyllableLabel(0)
         );
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn ruler_ticks_adapt_to_zoom_and_never_exceed_density() {
+        let fine = compute_ruler_ticks(5.0);
+        assert_eq!(fine.minor_ms, 100);
+        assert_eq!(fine.medium_ms, 500);
+        assert_eq!(fine.major_ms, 1_000);
+        assert!(fine.minor_ms as f64 / 5.0 >= 6.0);
+
+        let mid = compute_ruler_ticks(25.0);
+        assert_eq!(mid.minor_ms, 500);
+        assert!(mid.minor_ms as f64 / 25.0 >= 6.0);
+
+        let coarse = compute_ruler_ticks(120.0);
+        assert!(coarse.minor_ms as f64 / 120.0 >= 6.0);
+
+        let idx = TimelineMarkerIndex::new(vec![1_000, 3_000], vec![1_010, 2_500]);
+        assert_eq!(idx.snap_target(1_005, 20, true, true), Some((1_000, true)));
+        assert_eq!(idx.snap_target(2_515, 20, true, true), Some((2_500, false)));
+        assert_eq!(idx.snap_target(2_515, 20, true, false), None);
     }
 }

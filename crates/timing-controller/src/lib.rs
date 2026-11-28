@@ -112,6 +112,18 @@ impl Default for TimingControllerConfig {
     }
 }
 
+/// Converts a pixel snap threshold (`distance_px`) at the current horizontal scale (`ms_per_px`)
+/// into milliseconds (`>= 0`).
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn threshold_ms_from_px(distance_px: f32, ms_per_px: f64) -> i64 {
+    if distance_px <= 0.0 || ms_per_px <= 0.0 {
+        return 0;
+    }
+    (f64::from(distance_px) * ms_per_px).round().max(0.0) as i64
+}
+
 /// Pre-indexed sorted snap targets (rebuilt only when script/keyframes change, never per mouse move).
 #[derive(Debug, Default, Clone)]
 pub struct SnapIndex {
@@ -622,6 +634,50 @@ mod tests {
             TimeRangeMs {
                 start_ms: 1250,
                 end_ms: 1750
+            }
+        );
+    }
+
+    #[test]
+    fn snap_threshold_px_scales_with_zoom_and_respects_disable() {
+        let idx = SnapIndex::from_raw(vec![2_000, 5_000], vec![1_500, 3_000]);
+        let cfg = TimingControllerConfig::default();
+
+        // Zoomed in: 2.0 ms/px -> 10 px = 20 ms threshold.
+        let thresh_in = threshold_ms_from_px(10.0, 2.0);
+        assert_eq!(thresh_in, 20);
+        assert_eq!(
+            idx.snap(2_018, thresh_in, None, &cfg, false),
+            SnapResult {
+                snapped_ms: 2_000,
+                source: Some(SnapSource::Keyframe),
+            }
+        );
+        // Outside 20 ms threshold at zoomed-in scale.
+        assert_eq!(
+            idx.snap(2_025, thresh_in, None, &cfg, false),
+            SnapResult {
+                snapped_ms: 2_025,
+                source: None,
+            }
+        );
+
+        // Zoomed out: 10.0 ms/px -> 10 px = 100 ms threshold.
+        let thresh_out = threshold_ms_from_px(10.0, 10.0);
+        assert_eq!(thresh_out, 100);
+        assert_eq!(
+            idx.snap(2_085, thresh_out, None, &cfg, false),
+            SnapResult {
+                snapped_ms: 2_000,
+                source: Some(SnapSource::Keyframe),
+            }
+        );
+        // Shift (disable_snap = true) disables snapping even inside threshold.
+        assert_eq!(
+            idx.snap(2_005, thresh_out, None, &cfg, true),
+            SnapResult {
+                snapped_ms: 2_005,
+                source: None,
             }
         );
     }

@@ -187,6 +187,22 @@ pub fn show_preferences_dialog(
                     ui.checkbox(&mut settings.audio.spectrum, "Default to Spectrum mode");
                     ui.checkbox(&mut settings.audio.medusa_hotkeys, "Enable Medusa numpad hotkeys");
                     ui.checkbox(&mut settings.audio.auto_commit, "Auto-commit timing changes");
+                    ui.separator();
+                    ui.checkbox(
+                        &mut settings.audio.auto_snap_keyframes,
+                        "Auto-snap to keyframes",
+                    );
+                    ui.checkbox(
+                        &mut settings.audio.snap_to_lines,
+                        "Auto-snap to neighbouring line boundaries",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Snap distance (px):");
+                        ui.add(
+                            egui::DragValue::new(&mut settings.audio.snap_distance_px)
+                                .range(1..=64),
+                        );
+                    });
                 }
                 PrefsPage::Video => {
                     ui.heading(catalog.get("prefs-page-video").unwrap_or("Video"));
