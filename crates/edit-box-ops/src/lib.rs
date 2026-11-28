@@ -296,8 +296,7 @@ pub fn toggle_bold(
     styles: &[AssStyle],
 ) -> TextEditResult {
     let sel = TextSelection::clamped(selection.start, selection.end, text);
-    let cur = effective_state_at(text, active_style_name, styles, sel.start).bold;
-    toggle_binary_tag(text, sel, "b", cur)
+    toggle_binary_tag(text, sel, "b", active_style_name, styles, |s| s.bold)
 }
 
 /// Toggles italic (`\i1`/`\i0`) at cursor or around selection.
@@ -309,8 +308,7 @@ pub fn toggle_italic(
     styles: &[AssStyle],
 ) -> TextEditResult {
     let sel = TextSelection::clamped(selection.start, selection.end, text);
-    let cur = effective_state_at(text, active_style_name, styles, sel.start).italic;
-    toggle_binary_tag(text, sel, "i", cur)
+    toggle_binary_tag(text, sel, "i", active_style_name, styles, |s| s.italic)
 }
 
 /// Toggles underline (`\u1`/`\u0`) at cursor or around selection.
@@ -322,8 +320,7 @@ pub fn toggle_underline(
     styles: &[AssStyle],
 ) -> TextEditResult {
     let sel = TextSelection::clamped(selection.start, selection.end, text);
-    let cur = effective_state_at(text, active_style_name, styles, sel.start).underline;
-    toggle_binary_tag(text, sel, "u", cur)
+    toggle_binary_tag(text, sel, "u", active_style_name, styles, |s| s.underline)
 }
 
 /// Toggles strikeout (`\s1`/`\s0`) at cursor or around selection.
@@ -335,8 +332,7 @@ pub fn toggle_strikeout(
     styles: &[AssStyle],
 ) -> TextEditResult {
     let sel = TextSelection::clamped(selection.start, selection.end, text);
-    let cur = effective_state_at(text, active_style_name, styles, sel.start).strikeout;
-    toggle_binary_tag(text, sel, "s", cur)
+    toggle_binary_tag(text, sel, "s", active_style_name, styles, |s| s.strikeout)
 }
 
 /// Sets font name (`\fn`) at cursor or around selection.
@@ -527,14 +523,21 @@ pub fn autocomplete_effects(script: &ScriptFile, query: &str, limit: usize) -> V
     rank_candidates(counts, query, limit)
 }
 
+/// Default fallback CFR timecodes (23.976 fps = `24000/1001`) used in frame mode when no video
+/// is loaded, matching Aegisub's default dummy-video framerate.
+#[must_use]
+pub fn default_fallback_timecodes() -> Timecodes {
+    Timecodes::from_cfr(24_000, 1_001)
+        .unwrap_or_else(|_| Timecodes::from_vfr_ms(vec![0, 42]).unwrap_or_else(|_| unreachable!()))
+}
+
 /// Parses an edit-box time or frame field (mirrors Aegisub `src/timeedit_ctrl.cpp`):
 /// - When `frame_mode` is `true`, parses an unsigned frame number and converts via `timecodes`
-///   using `time_type` (`TimeType::Start` / `TimeType::End`).
+///   (or [`default_fallback_timecodes`] when no video is loaded) using `time_type`.
 /// - Otherwise parses `H:MM:SS.cc` via [`AssTime::parse_ass`].
 ///
 /// # Errors
-/// Returns [`EditBoxError::InvalidTimeOrFrame`] if the input cannot be parsed or `timecodes` is
-/// absent in frame mode.
+/// Returns [`EditBoxError::InvalidTimeOrFrame`] if the input cannot be parsed.
 pub fn parse_time_or_frame(
     input: &str,
     frame_mode: bool,
@@ -543,9 +546,13 @@ pub fn parse_time_or_frame(
 ) -> Result<AssTime, EditBoxError> {
     let trimmed = input.trim();
     if frame_mode {
-        let tc = timecodes.ok_or_else(|| {
-            EditBoxError::InvalidTimeOrFrame("frame mode requires timecodes".to_owned())
-        })?;
+        let fallback;
+        let tc = if let Some(tc) = timecodes {
+            tc
+        } else {
+            fallback = default_fallback_timecodes();
+            &fallback
+        };
         let frame: u32 = trimmed
             .parse()
             .map_err(|_| EditBoxError::InvalidTimeOrFrame(trimmed.to_owned()))?;
@@ -557,7 +564,8 @@ pub fn parse_time_or_frame(
     }
 }
 
-/// Formats an [`AssTime`] for the edit-box time or frame field.
+/// Formats an [`AssTime`] for the edit-box time or frame field (uses [`default_fallback_timecodes`]
+/// in frame mode when no video is loaded).
 #[must_use]
 pub fn format_time_or_frame(
     time: AssTime,
@@ -566,9 +574,14 @@ pub fn format_time_or_frame(
     timecodes: Option<&Timecodes>,
 ) -> String {
     if frame_mode {
-        if let Some(tc) = timecodes {
-            return tc.time_cs_to_frame(time.as_cs(), time_type).to_string();
-        }
+        let fallback;
+        let tc = if let Some(tc) = timecodes {
+            tc
+        } else {
+            fallback = default_fallback_timecodes();
+            &fallback
+        };
+        return tc.time_cs_to_frame(time.as_cs(), time_type).to_string();
     }
     time.to_ass_string()
 }
@@ -583,11 +596,30 @@ fn toggle_binary_tag(
     text: &str,
     sel: TextSelection,
     tag: &str,
-    currently_on: bool,
+    active_style_name: &str,
+    styles: &[AssStyle],
+    flag_of: fn(&EffectiveStyleState) -> bool,
 ) -> TextEditResult {
-    let on_val = if currently_on { "0" } else { "1" };
-    let off_val = if currently_on { "1" } else { "0" };
-    let (after_start, delta_start) = insert_or_merge_tag_at(text, sel.start, tag, on_val);
+    let eff_pos = find_enclosing_or_adjacent_block(text.as_bytes(), sel.start)
+        .map_or(sel.start, |(_, close_idx)| close_idx + 1);
+    let currently_on = flag_of(&effective_state_at(
+        text,
+        active_style_name,
+        styles,
+        eff_pos,
+    ));
+    let target_on = !currently_on;
+
+    let (after_start, delta_start) = set_binary_tag_smart(
+        text,
+        sel.start,
+        false,
+        tag,
+        target_on,
+        active_style_name,
+        styles,
+        flag_of,
+    );
     let new_start = sel.start.saturating_add_signed(delta_start);
     let new_end = sel.end.saturating_add_signed(delta_start);
 
@@ -598,14 +630,112 @@ fn toggle_binary_tag(
         };
     }
 
-    // Wrap non-empty selection: restore previous state at `new_end`.
-    let (final_text, _delta_end) = insert_or_merge_tag_at(&after_start, new_end, tag, off_val);
+    // Restore the state that was active right after the selection prior to toggling.
+    let mut after_sel_pos = sel.end;
+    if after_sel_pos < text.len() && text.as_bytes()[after_sel_pos] == b'{' {
+        if let Some(rel_close) = text.as_bytes()[after_sel_pos + 1..]
+            .iter()
+            .position(|&b| b == b'}')
+        {
+            after_sel_pos += rel_close + 2;
+        }
+    }
+    let restore_on = flag_of(&effective_state_at(
+        text,
+        active_style_name,
+        styles,
+        after_sel_pos,
+    ));
+    let (final_text, _delta_end) = set_binary_tag_smart(
+        &after_start,
+        new_end,
+        true,
+        tag,
+        restore_on,
+        active_style_name,
+        styles,
+        flag_of,
+    );
     TextEditResult {
         text: final_text,
         selection: TextSelection {
             start: new_start,
             end: new_end,
         },
+    }
+}
+
+/// Applies `tag` with boolean state `target_on` at `pos`, removing the tag (and the enclosing
+/// `{}` block if it becomes empty) whenever removing it already produces `target_on` at `pos`.
+#[allow(clippy::too_many_arguments)]
+fn set_binary_tag_smart(
+    text: &str,
+    pos: usize,
+    check_following_block: bool,
+    tag: &str,
+    target_on: bool,
+    active_style_name: &str,
+    styles: &[AssStyle],
+    flag_of: fn(&EffectiveStyleState) -> bool,
+) -> (String, isize) {
+    let bytes = text.as_bytes();
+    let pos = pos.min(bytes.len());
+    let mut block_bounds = find_enclosing_or_adjacent_block(bytes, pos);
+    if block_bounds.is_none() && check_following_block && pos < bytes.len() && bytes[pos] == b'{' {
+        if let Some(rel_close) = bytes[pos + 1..].iter().position(|&b| b == b'}') {
+            block_bounds = Some((pos, pos + 1 + rel_close));
+        }
+    }
+
+    if let Some((open_idx, close_idx)) = block_bounds {
+        let (stripped, strip_end) = remove_all_tag_in_block(text, open_idx, close_idx, tag);
+        let state_without = flag_of(&effective_state_at(
+            &stripped,
+            active_style_name,
+            styles,
+            strip_end,
+        ));
+        if state_without == target_on {
+            let delta = stripped.len().cast_signed() - text.len().cast_signed();
+            return (stripped, delta);
+        }
+        let val = if target_on { "1" } else { "0" };
+        let (merged, _) = insert_or_merge_tag_at(&stripped, strip_end, tag, val);
+        let delta = merged.len().cast_signed() - text.len().cast_signed();
+        return (merged, delta);
+    }
+
+    if flag_of(&effective_state_at(text, active_style_name, styles, pos)) == target_on {
+        return (text.to_owned(), 0);
+    }
+    let val = if target_on { "1" } else { "0" };
+    insert_or_merge_tag_at(text, pos, tag, val)
+}
+
+/// Removes every occurrence of `clean_name` from the `{...}` block at `open_idx..=close_idx`,
+/// deleting the `{}` braces too if nothing remains inside. Returns `(new_text, block_end_in_new)`.
+fn remove_all_tag_in_block(
+    text: &str,
+    open_idx: usize,
+    close_idx: usize,
+    clean_name: &str,
+) -> (String, usize) {
+    let mut body = text[open_idx + 1..close_idx].to_owned();
+    while let Some((rel_start, rel_end)) = find_tag_in_block(&body, clean_name) {
+        body.replace_range(rel_start..rel_end, "");
+    }
+    if body.is_empty() {
+        let mut out = String::with_capacity(text.len().saturating_sub(close_idx + 1 - open_idx));
+        out.push_str(&text[..open_idx]);
+        out.push_str(&text[close_idx + 1..]);
+        (out, open_idx)
+    } else {
+        let mut out = String::with_capacity(text.len());
+        out.push_str(&text[..=open_idx]);
+        out.push_str(&body);
+        out.push_str(&text[close_idx..]);
+        let new_after = open_idx + 1 + body.len() + 1;
+        (out, new_after)
     }
 }
 
@@ -637,26 +767,26 @@ fn insert_or_merge_tag_at(
     let block_bounds = find_enclosing_or_adjacent_block(bytes, pos);
 
     if let Some((open_idx, close_idx)) = block_bounds {
-        let block_body = &text[open_idx + 1..close_idx];
-        // Check if `clean_name` already exists in this override block; if so, replace its value.
-        if let Some((rel_start, rel_end)) = find_tag_in_block(block_body, clean_name) {
-            let abs_start = open_idx + 1 + rel_start;
-            let abs_end = open_idx + 1 + rel_end;
-            let mut out = String::with_capacity(text.len() + 1 + clean_name.len() + value.len());
-            out.push_str(&text[..abs_start]);
-            out.push('\\');
-            out.push_str(clean_name);
-            out.push_str(value);
-            out.push_str(&text[abs_end..]);
-            let delta = out.len().cast_signed() - text.len().cast_signed();
-            return (out, delta);
+        // Strip any existing occurrences of `clean_name` in this block so we never write duplicate
+        // or contradicting tags, replacing at the first occurrence or appending before `}`.
+        let mut body = text[open_idx + 1..close_idx].to_owned();
+        let mut insert_rel = None;
+        while let Some((rel_start, rel_end)) = find_tag_in_block(&body, clean_name) {
+            if insert_rel.is_none() {
+                insert_rel = Some(rel_start);
+            }
+            body.replace_range(rel_start..rel_end, "");
         }
-        // Otherwise append `\clean_name<value>` right before `}`.
-        let mut out = String::with_capacity(text.len() + 1 + clean_name.len() + value.len());
-        out.push_str(&text[..close_idx]);
-        out.push('\\');
-        out.push_str(clean_name);
-        out.push_str(value);
+        let mut tag_str = String::with_capacity(1 + clean_name.len() + value.len());
+        tag_str.push('\\');
+        tag_str.push_str(clean_name);
+        tag_str.push_str(value);
+        let at = insert_rel.unwrap_or(body.len());
+        body.insert_str(at, &tag_str);
+
+        let mut out = String::with_capacity(text.len() + tag_str.len());
+        out.push_str(&text[..=open_idx]);
+        out.push_str(&body);
         out.push_str(&text[close_idx..]);
         let delta = out.len().cast_signed() - text.len().cast_signed();
         return (out, delta);
@@ -841,5 +971,50 @@ mod tests {
         .value;
         let actors = autocomplete_actors(&script, "sa", 10);
         assert_eq!(actors, vec!["Sakura", "Satoshi"]);
+
+        // Frame mode without video uses default 24000/1001 fallback timecodes.
+        let t_fb = parse_time_or_frame("24", true, TimeType::Start, None).expect("fallback frame");
+        assert_eq!(t_fb.as_cs(), 98);
+        assert_eq!(
+            format_time_or_frame(t_fb, true, TimeType::Start, None),
+            "24"
+        );
+    }
+
+    #[test]
+    fn toggle_tags_undo_on_second_press_and_never_duplicate() {
+        // B twice at caret -> text unchanged.
+        let r1 = toggle_bold("Hello", TextSelection::caret(0), "Default", &[]);
+        assert_eq!(r1.text, r"{\b1}Hello");
+        let r2 = toggle_bold(&r1.text, r1.selection, "Default", &[]);
+        assert_eq!(r2.text, "Hello");
+
+        // B on a selection twice -> text unchanged.
+        let s1 = toggle_bold(
+            "Hello world",
+            TextSelection { start: 0, end: 5 },
+            "Default",
+            &[],
+        );
+        assert_eq!(s1.text, r"{\b1}Hello{\b0} world");
+        let s2 = toggle_bold(&s1.text, s1.selection, "Default", &[]);
+        assert_eq!(s2.text, "Hello world");
+
+        // B inside {\an8} -> {\an8\b1}, then B again -> {\an8}.
+        let a1 = toggle_bold(r"{\an8}Hello", TextSelection::caret(3), "Default", &[]);
+        assert_eq!(a1.text, r"{\an8\b1}Hello");
+        let a2 = toggle_bold(&a1.text, a1.selection, "Default", &[]);
+        assert_eq!(a2.text, r"{\an8}Hello");
+
+        // fn / colour twice -> single tag (never duplicated).
+        let f1 = set_font_name("Hello", TextSelection::caret(0), "Arial");
+        assert_eq!(f1.text, r"{\fnArial}Hello");
+        let f2 = set_font_name(&f1.text, f1.selection, "Arial");
+        assert_eq!(f2.text, r"{\fnArial}Hello");
+
+        let c1 = set_color("Hello", TextSelection::caret(0), 1, 0xFF, 0xFF, 0xFF).expect("c1");
+        assert_eq!(c1.text, r"{\1c&HFFFFFF&}Hello");
+        let c2 = set_color(&c1.text, c1.selection, 1, 0xFF, 0xFF, 0xFF).expect("c2");
+        assert_eq!(c2.text, r"{\1c&HFFFFFF&}Hello");
     }
 }

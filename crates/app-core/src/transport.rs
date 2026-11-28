@@ -474,6 +474,26 @@ impl EditorApp {
                 self.shell.dialogs.open = Some(ui_dialogs::ActiveDialog::Preferences);
             }
             AudioPanelAction::SelectionChanged(_) => {}
+            AudioPanelAction::PlayRange(r) => {
+                self.play_range(r.start_ms, r.end_ms, clock);
+            }
+            AudioPanelAction::KaraokeCommit => {
+                if let Some(active) = self.shell.doc.active_line()
+                    && let Some(orig_text) = self
+                        .shell
+                        .doc
+                        .script()
+                        .events_section()
+                        .and_then(|s| s.get_event(active))
+                        .map(|ev| ev.text().to_owned())
+                    && let Some(ref mut k) = self.shell.karaoke
+                    && let Some(cmd) = k.commit(&orig_text)
+                    && let Err(e) =
+                        self.commit_and_sync("karaoke timing", cmd, document::CommitType::TEXT)
+                {
+                    self.notify_error(format!("Karaoke commit failed: {e}"));
+                }
+            }
         }
     }
 

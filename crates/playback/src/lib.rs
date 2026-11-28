@@ -168,6 +168,13 @@ impl PlaybackController {
         !matches!(self.state, PlayState::Paused)
     }
 
+    /// Returns the video timecode table used for frame/time conversion.
+    #[inline]
+    #[must_use]
+    pub const fn timecodes(&self) -> &Timecodes {
+        &self.timecodes
+    }
+
     #[inline]
     #[must_use]
     pub const fn current_frame(&self) -> u32 {

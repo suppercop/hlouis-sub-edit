@@ -18,7 +18,8 @@
 use ass_core::{AssEvent, AssTime, EditCommand, EventKind, ScriptFile};
 use document::{CommitType, DocumentController};
 use edit_box_ops::{
-    ShiftEnterMode, TextSelection, autocomplete_actors, autocomplete_effects, insert_hard_space,
+    ShiftEnterMode, TextSelection, autocomplete_actors, autocomplete_effects,
+    default_fallback_timecodes, insert_hard_space, parse_time_or_frame, set_color, set_font_name,
     toggle_bold, toggle_italic, toggle_strikeout, toggle_underline,
 };
 use egui::text::{LayoutJob, TextFormat};
@@ -107,6 +108,8 @@ pub struct EditBoxState {
     pub effect_buf: String,
     pub tokenizer: IncrementalTokenizer,
     pub last_cursor_byte: usize,
+    pub last_sel_start_byte: usize,
+    pub last_sel_end_byte: usize,
     pub cps_warn_threshold: u32,
     pub cps_error_threshold: u32,
     /// Set to `true` when the user clicks the `Edit` button beside the Style combo.
@@ -146,6 +149,8 @@ impl Default for EditBoxState {
             effect_buf: String::with_capacity(64),
             tokenizer: IncrementalTokenizer::new(),
             last_cursor_byte: 0,
+            last_sel_start_byte: 0,
+            last_sel_end_byte: 0,
             cps_warn_threshold: 20,
             cps_error_threshold: 30,
             edit_style_requested: false,
@@ -234,10 +239,27 @@ impl EditBoxState {
             self.style_buf.push_str(ev.style());
             self.actor_buf.push_str(ev.name());
             self.effect_buf.push_str(ev.effect());
-            format_time_field(ev.start(), self.frame_mode, timecodes, &mut self.start_buf);
-            format_time_field(ev.end(), self.frame_mode, timecodes, &mut self.end_buf);
-            let dur = AssTime::from_cs(ev.end().as_cs().saturating_sub(ev.start().as_cs()));
-            format_time_field(dur, false, None, &mut self.dur_buf);
+            format_time_field_typed(
+                ev.start(),
+                self.frame_mode,
+                TimeType::Start,
+                timecodes,
+                &mut self.start_buf,
+            );
+            format_time_field_typed(
+                ev.end(),
+                self.frame_mode,
+                TimeType::End,
+                timecodes,
+                &mut self.end_buf,
+            );
+            format_duration_field(
+                ev.start(),
+                ev.end(),
+                self.frame_mode,
+                timecodes,
+                &mut self.dur_buf,
+            );
             self.tokenizer.set_text(&self.text_buf);
             let style_opt = doc
                 .script()
@@ -337,16 +359,35 @@ pub fn build_highlighted_layout_job(
     job
 }
 
-/// Formats `AssTime` as `H:MM:SS.cc` or frame number into `out` (0 allocations).
+/// Formats `AssTime` as `H:MM:SS.cc` or frame number into `out` (using default 23.976 fps
+/// fallback timecodes when `frame_mode` is true and no video is loaded).
 pub fn format_time_field(
     t: AssTime,
     frame_mode: bool,
     timecodes: Option<&Timecodes>,
     out: &mut String,
 ) {
+    format_time_field_typed(t, frame_mode, TimeType::Exact, timecodes, out);
+}
+
+/// Formats `AssTime` as `H:MM:SS.cc` or frame number with explicit `TimeType`.
+pub fn format_time_field_typed(
+    t: AssTime,
+    frame_mode: bool,
+    time_type: TimeType,
+    timecodes: Option<&Timecodes>,
+    out: &mut String,
+) {
     out.clear();
-    if frame_mode && let Some(tc) = timecodes {
-        let f = tc.time_cs_to_frame(t.as_cs(), TimeType::Exact);
+    if frame_mode {
+        let fallback;
+        let tc = if let Some(tc) = timecodes {
+            tc
+        } else {
+            fallback = default_fallback_timecodes();
+            &fallback
+        };
+        let f = tc.time_cs_to_frame(t.as_cs(), time_type);
         let _ = write!(out, "{f}");
         return;
     }
@@ -358,6 +399,165 @@ pub fn format_time_field(
     let mins = total_mins % 60;
     let hours = total_mins / 60;
     let _ = write!(out, "{hours}:{mins:02}:{secs:02}.{centis:02}");
+}
+
+/// Formats duration between `start` and `end` as `H:MM:SS.cc` in Time mode or frame count in Frame
+/// mode into `out`.
+pub fn format_duration_field(
+    start: AssTime,
+    end: AssTime,
+    frame_mode: bool,
+    timecodes: Option<&Timecodes>,
+    out: &mut String,
+) {
+    out.clear();
+    if frame_mode {
+        let fallback;
+        let tc = if let Some(tc) = timecodes {
+            tc
+        } else {
+            fallback = default_fallback_timecodes();
+            &fallback
+        };
+        let sf = tc.time_cs_to_frame(start.as_cs(), TimeType::Start);
+        let ef = tc.time_cs_to_frame(end.as_cs(), TimeType::End);
+        let _ = write!(out, "{}", ef.saturating_sub(sf));
+        return;
+    }
+    let dur = AssTime::from_cs(end.as_cs().saturating_sub(start.as_cs()));
+    format_time_field_typed(dur, false, TimeType::Exact, None, out);
+}
+
+/// Refreshes Start, End, and Duration text buffers from `start` / `end`.
+fn sync_time_buffers(
+    state: &mut EditBoxState,
+    start: AssTime,
+    end: AssTime,
+    timecodes: Option<&Timecodes>,
+) {
+    format_time_field_typed(
+        start,
+        state.frame_mode,
+        TimeType::Start,
+        timecodes,
+        &mut state.start_buf,
+    );
+    format_time_field_typed(
+        end,
+        state.frame_mode,
+        TimeType::End,
+        timecodes,
+        &mut state.end_buf,
+    );
+    format_duration_field(start, end, state.frame_mode, timecodes, &mut state.dur_buf);
+}
+
+/// Parses and applies an edited Start, End, or Duration field, committing via `doc.commit`
+/// (`CommitType::TIMES`) when valid and reverting the buffer on invalid input.
+pub fn commit_time_field(
+    doc: &mut DocumentController,
+    state: &mut EditBoxState,
+    line_idx: usize,
+    ev_snapshot: &AssEvent,
+    field: TimeFieldKind,
+    timecodes: Option<&Timecodes>,
+) -> bool {
+    let mut after = ev_snapshot.clone();
+    let desc = match field {
+        TimeFieldKind::Start => {
+            let Ok(new_start) = parse_time_or_frame(
+                &state.start_buf,
+                state.frame_mode,
+                TimeType::Start,
+                timecodes,
+            ) else {
+                sync_time_buffers(state, ev_snapshot.start(), ev_snapshot.end(), timecodes);
+                return false;
+            };
+            if new_start == ev_snapshot.start() {
+                sync_time_buffers(state, ev_snapshot.start(), ev_snapshot.end(), timecodes);
+                return false;
+            }
+            after.set_start(new_start);
+            if after.end() < new_start {
+                after.set_end(new_start);
+            }
+            "edit start time"
+        }
+        TimeFieldKind::End => {
+            let Ok(new_end) =
+                parse_time_or_frame(&state.end_buf, state.frame_mode, TimeType::End, timecodes)
+            else {
+                sync_time_buffers(state, ev_snapshot.start(), ev_snapshot.end(), timecodes);
+                return false;
+            };
+            if new_end == ev_snapshot.end() {
+                sync_time_buffers(state, ev_snapshot.start(), ev_snapshot.end(), timecodes);
+                return false;
+            }
+            after.set_end(new_end);
+            if after.start() > new_end {
+                after.set_start(new_end);
+            }
+            "edit end time"
+        }
+        TimeFieldKind::Duration => {
+            let parsed_end = if state.frame_mode {
+                state.dur_buf.trim().parse::<u32>().ok().map(|frames| {
+                    let fallback;
+                    let tc = if let Some(tc) = timecodes {
+                        tc
+                    } else {
+                        fallback = default_fallback_timecodes();
+                        &fallback
+                    };
+                    let sf = tc.time_cs_to_frame(ev_snapshot.start().as_cs(), TimeType::Start);
+                    AssTime::from_cs(tc.frame_to_time_cs(sf.saturating_add(frames), TimeType::End))
+                })
+            } else {
+                AssTime::parse_ass(state.dur_buf.trim()).map(|dur| {
+                    AssTime::from_cs(ev_snapshot.start().as_cs().saturating_add(dur.as_cs()))
+                })
+            };
+            let Some(new_end) = parsed_end else {
+                sync_time_buffers(state, ev_snapshot.start(), ev_snapshot.end(), timecodes);
+                return false;
+            };
+            if new_end == ev_snapshot.end() {
+                sync_time_buffers(state, ev_snapshot.start(), ev_snapshot.end(), timecodes);
+                return false;
+            }
+            after.set_end(new_end);
+            "edit duration"
+        }
+    };
+
+    let (new_start, new_end) = (after.start(), after.end());
+    if doc
+        .commit(
+            desc,
+            EditCommand::ModifyEvent {
+                index: line_idx,
+                before: Box::new(ev_snapshot.clone()),
+                after: Box::new(after),
+            },
+            CommitType::TIMES,
+        )
+        .is_ok()
+    {
+        sync_time_buffers(state, new_start, new_end, timecodes);
+        true
+    } else {
+        false
+    }
+}
+
+/// Which of the three edit-box timing fields is being committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeFieldKind {
+    Start,
+    End,
+    Duration,
 }
 
 /// Computes the maximum visible character length of any `\N`-separated line (Aegisub edit-box
@@ -697,8 +897,8 @@ pub fn show_edit_box(
         .saturating_sub(ev_snapshot.start().as_cs());
     let (max_line_len, _cps) = count_visible_chars_and_cps(&state.text_buf, dur_cs);
     let sel = TextSelection::clamped(
-        state.last_cursor_byte,
-        state.last_cursor_byte,
+        state.last_sel_start_byte,
+        state.last_sel_end_byte,
         &state.text_buf,
     );
 
@@ -852,23 +1052,64 @@ pub fn show_edit_box(
             );
             changed = true;
         }
-        ui.add(
-            TextEdit::singleline(&mut state.start_buf)
-                .desired_width(72.0)
-                .id_salt(("edit_start", line_idx)),
-        )
-        .on_hover_text(catalog.get("grid-col-start").unwrap_or("Start"));
-        ui.add(
-            TextEdit::singleline(&mut state.end_buf)
-                .desired_width(72.0)
-                .id_salt(("edit_end", line_idx)),
-        )
-        .on_hover_text(catalog.get("grid-col-end").unwrap_or("End"));
-        ui.add_enabled(
-            false,
-            TextEdit::singleline(&mut state.dur_buf).desired_width(68.0),
-        )
-        .on_hover_text("Duration");
+        let enter_pressed = ui.input(|i| i.key_pressed(Key::Enter));
+        let start_resp = ui
+            .add(
+                TextEdit::singleline(&mut state.start_buf)
+                    .desired_width(72.0)
+                    .id_salt(("edit_start", line_idx)),
+            )
+            .on_hover_text(catalog.get("grid-col-start").unwrap_or("Start"));
+        if (start_resp.lost_focus() || (start_resp.has_focus() && enter_pressed))
+            && commit_time_field(
+                doc,
+                state,
+                line_idx,
+                &ev_snapshot,
+                TimeFieldKind::Start,
+                timecodes,
+            )
+        {
+            changed = true;
+        }
+        let end_resp = ui
+            .add(
+                TextEdit::singleline(&mut state.end_buf)
+                    .desired_width(72.0)
+                    .id_salt(("edit_end", line_idx)),
+            )
+            .on_hover_text(catalog.get("grid-col-end").unwrap_or("End"));
+        if (end_resp.lost_focus() || (end_resp.has_focus() && enter_pressed))
+            && commit_time_field(
+                doc,
+                state,
+                line_idx,
+                &ev_snapshot,
+                TimeFieldKind::End,
+                timecodes,
+            )
+        {
+            changed = true;
+        }
+        let dur_resp = ui
+            .add(
+                TextEdit::singleline(&mut state.dur_buf)
+                    .desired_width(68.0)
+                    .id_salt(("edit_dur", line_idx)),
+            )
+            .on_hover_text("Duration");
+        if (dur_resp.lost_focus() || (dur_resp.has_focus() && enter_pressed))
+            && commit_time_field(
+                doc,
+                state,
+                line_idx,
+                &ev_snapshot,
+                TimeFieldKind::Duration,
+                timecodes,
+            )
+        {
+            changed = true;
+        }
 
         // Plain margin number boxes (no "L:", "R:", "V:" prefixes).
         let mut margins_changed = false;
@@ -904,14 +1145,25 @@ pub fn show_edit_box(
 
     // ── Row 3 (Aegisub): B I U S fn | 4 coloured "AB" buttons | green commit ✓ | Time/Frame | Show Original
     ui.horizontal(|ui| {
+        let apply_tag_result = |state: &mut EditBoxState,
+                                doc: &mut DocumentController,
+                                desc: &str,
+                                res: edit_box_ops::TextEditResult| {
+            state.text_buf = res.text;
+            state.last_cursor_byte = res.selection.start;
+            state.last_sel_start_byte = res.selection.start;
+            state.last_sel_end_byte = res.selection.end;
+            state.tokenizer.set_text(&state.text_buf);
+            let _ = doc.amend_text(line_idx, desc, &state.text_buf);
+        };
         if ui
             .small_button(RichText::new("B").strong())
             .on_hover_text("Bold (\\b1)")
             .clicked()
         {
-            let res = toggle_bold(&state.text_buf, sel, ev_snapshot.style(), &[]);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "bold", &state.text_buf);
+            let styles: Vec<_> = doc.script().styles().cloned().collect();
+            let res = toggle_bold(&state.text_buf, sel, ev_snapshot.style(), &styles);
+            apply_tag_result(state, doc, "bold", res);
             changed = true;
         }
         if ui
@@ -919,9 +1171,9 @@ pub fn show_edit_box(
             .on_hover_text("Italic (\\i1)")
             .clicked()
         {
-            let res = toggle_italic(&state.text_buf, sel, ev_snapshot.style(), &[]);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "italic", &state.text_buf);
+            let styles: Vec<_> = doc.script().styles().cloned().collect();
+            let res = toggle_italic(&state.text_buf, sel, ev_snapshot.style(), &styles);
+            apply_tag_result(state, doc, "italic", res);
             changed = true;
         }
         if ui
@@ -929,9 +1181,9 @@ pub fn show_edit_box(
             .on_hover_text("Underline (\\u1)")
             .clicked()
         {
-            let res = toggle_underline(&state.text_buf, sel, ev_snapshot.style(), &[]);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "underline", &state.text_buf);
+            let styles: Vec<_> = doc.script().styles().cloned().collect();
+            let res = toggle_underline(&state.text_buf, sel, ev_snapshot.style(), &styles);
+            apply_tag_result(state, doc, "underline", res);
             changed = true;
         }
         if ui
@@ -939,9 +1191,9 @@ pub fn show_edit_box(
             .on_hover_text("Strikeout (\\s1)")
             .clicked()
         {
-            let res = toggle_strikeout(&state.text_buf, sel, ev_snapshot.style(), &[]);
-            state.text_buf = res.text;
-            let _ = doc.amend_text(line_idx, "strikeout", &state.text_buf);
+            let styles: Vec<_> = doc.script().styles().cloned().collect();
+            let res = toggle_strikeout(&state.text_buf, sel, ev_snapshot.style(), &styles);
+            apply_tag_result(state, doc, "strikeout", res);
             changed = true;
         }
         if ui
@@ -949,19 +1201,18 @@ pub fn show_edit_box(
             .on_hover_text("Insert font override (\\fn)")
             .clicked()
         {
-            let pos = state.last_cursor_byte.min(state.text_buf.len());
-            state.text_buf.insert_str(pos, r"{\fnArial}");
-            let _ = doc.amend_text(line_idx, "font", &state.text_buf);
+            let res = set_font_name(&state.text_buf, sel, "Arial");
+            apply_tag_result(state, doc, "font", res);
             changed = true;
         }
 
-        let ab_tags = [
-            (0usize, r"{\1c&HFFFFFF&}", "Primary colour (\\1c)"),
-            (1usize, r"{\2c&H3CD2FF&}", "Secondary colour (\\2c)"),
-            (2usize, r"{\3c&H201814&}", "Outline colour (\\3c)"),
-            (3usize, r"{\4c&H000000&}", "Shadow colour (\\4c)"),
+        let ab_channels: [(usize, u8, &str); 4] = [
+            (0, 1, "Primary colour (\\1c)"),
+            (1, 2, "Secondary colour (\\2c)"),
+            (2, 3, "Outline colour (\\3c)"),
+            (3, 4, "Shadow colour (\\4c)"),
         ];
-        for (idx, tag, tip) in ab_tags {
+        for (idx, chan, tip) in ab_channels {
             if paint_ab_colour_button(
                 ui,
                 state.colour_swatches[idx],
@@ -970,10 +1221,11 @@ pub fn show_edit_box(
                 palette,
                 tip,
             ) {
-                let pos = state.last_cursor_byte.min(state.text_buf.len());
-                state.text_buf.insert_str(pos, tag);
-                let _ = doc.amend_text(line_idx, "colour", &state.text_buf);
-                changed = true;
+                let sw = state.colour_swatches[idx];
+                if let Ok(res) = set_color(&state.text_buf, sel, chan, sw.r(), sw.g(), sw.b()) {
+                    apply_tag_result(state, doc, "colour", res);
+                    changed = true;
+                }
             }
         }
 
@@ -987,17 +1239,26 @@ pub fn show_edit_box(
         ui.radio_value(&mut state.frame_mode, false, "Time");
         ui.radio_value(&mut state.frame_mode, true, "Frame");
         if state.frame_mode != prev_frame_mode {
-            format_time_field(
+            format_time_field_typed(
                 ev_snapshot.start(),
                 state.frame_mode,
+                TimeType::Start,
                 timecodes,
                 &mut state.start_buf,
             );
-            format_time_field(
+            format_time_field_typed(
+                ev_snapshot.end(),
+                state.frame_mode,
+                TimeType::End,
+                timecodes,
+                &mut state.end_buf,
+            );
+            format_duration_field(
+                ev_snapshot.start(),
                 ev_snapshot.end(),
                 state.frame_mode,
                 timecodes,
-                &mut state.end_buf,
+                &mut state.dur_buf,
             );
         }
 
@@ -1092,12 +1353,18 @@ pub fn show_edit_box(
     }
 
     if let Some(range) = output.cursor_range {
-        let char_idx = range.primary.index;
-        state.last_cursor_byte = state
-            .text_buf
-            .char_indices()
-            .nth(char_idx.into())
-            .map_or(state.text_buf.len(), |(b, _)| b);
+        let to_byte = |char_idx: usize| -> usize {
+            state
+                .text_buf
+                .char_indices()
+                .nth(char_idx)
+                .map_or(state.text_buf.len(), |(b, _)| b)
+        };
+        let p_byte = to_byte(range.primary.index.into());
+        let s_byte = to_byte(range.secondary.index.into());
+        state.last_cursor_byte = p_byte;
+        state.last_sel_start_byte = p_byte.min(s_byte);
+        state.last_sel_end_byte = p_byte.max(s_byte);
     }
 
     // Ctrl+Shift+Space inserts `\h` without interfering with IME composition.
@@ -1330,5 +1597,143 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Sign,,0,0,0,,Test
             state.colour_swatches[3],
             Color32::from_rgb(0x00, 0x00, 0x00)
         );
+    }
+
+    #[test]
+    fn manual_time_duration_frame_mode_and_invalid_revert() {
+        let mut script = ScriptFile::new_default();
+        script.ensure_events_section_mut().insert_event(
+            0,
+            AssEvent::dialogue(AssTime::from_cs(100), AssTime::from_cs(300), "Line 0"),
+        );
+        let mut doc = DocumentController::new(script);
+        let mut state = EditBoxState::default();
+        state.sync_active_line(&doc, None);
+        let ev0 = doc
+            .script()
+            .events_section()
+            .and_then(|s| s.get_event(0))
+            .expect("ev0")
+            .clone();
+
+        // 1. Typed Start time updates event and is undoable.
+        "0:00:01.50".clone_into(&mut state.start_buf);
+        assert!(commit_time_field(
+            &mut doc,
+            &mut state,
+            0,
+            &ev0,
+            TimeFieldKind::Start,
+            None
+        ));
+        let ev1 = doc
+            .script()
+            .events_section()
+            .and_then(|s| s.get_event(0))
+            .expect("ev1")
+            .clone();
+        assert_eq!(ev1.start().as_cs(), 150);
+        assert_eq!(ev1.end().as_cs(), 300);
+
+        // 2. Typed Duration recomputes End.
+        "0:00:02.50".clone_into(&mut state.dur_buf);
+        assert!(commit_time_field(
+            &mut doc,
+            &mut state,
+            0,
+            &ev1,
+            TimeFieldKind::Duration,
+            None
+        ));
+        let ev2 = doc
+            .script()
+            .events_section()
+            .and_then(|s| s.get_event(0))
+            .expect("ev2")
+            .clone();
+        assert_eq!(ev2.start().as_cs(), 150);
+        assert_eq!(ev2.end().as_cs(), 400);
+
+        // Undo restores previous end.
+        let _ = doc.undo().expect("undo");
+        let ev_undo = doc
+            .script()
+            .events_section()
+            .and_then(|s| s.get_event(0))
+            .expect("ev_undo")
+            .clone();
+        assert_eq!(ev_undo.end().as_cs(), 300);
+
+        // 3. Invalid input reverts without mutating document.
+        "not-a-time".clone_into(&mut state.start_buf);
+        assert!(!commit_time_field(
+            &mut doc,
+            &mut state,
+            0,
+            &ev_undo,
+            TimeFieldKind::Start,
+            None
+        ));
+        assert_eq!(state.start_buf, "0:00:01.50");
+    }
+
+    #[test]
+    fn manual_frame_mode_with_and_without_video() {
+        let mut script = ScriptFile::new_default();
+        script.ensure_events_section_mut().insert_event(
+            0,
+            AssEvent::dialogue(AssTime::from_cs(150), AssTime::from_cs(300), "Line 0"),
+        );
+        let mut doc = DocumentController::new(script);
+        let mut state = EditBoxState::default();
+        state.sync_active_line(&doc, None);
+        let ev_undo = doc
+            .script()
+            .events_section()
+            .and_then(|s| s.get_event(0))
+            .expect("ev_undo")
+            .clone();
+
+        // 4. Frame mode with video timecodes (24000/1001).
+        let tc = Timecodes::from_cfr(24_000, 1_001).expect("cfr");
+        state.frame_mode = true;
+        "48".clone_into(&mut state.start_buf);
+        assert!(commit_time_field(
+            &mut doc,
+            &mut state,
+            0,
+            &ev_undo,
+            TimeFieldKind::Start,
+            Some(&tc)
+        ));
+        let ev_f = doc
+            .script()
+            .events_section()
+            .and_then(|s| s.get_event(0))
+            .expect("ev_f")
+            .clone();
+        assert_eq!(
+            ev_f.start().as_cs(),
+            tc.frame_to_time_cs(48, TimeType::Start)
+        );
+
+        // 5. Frame mode without video uses default fallback fps.
+        "96".clone_into(&mut state.end_buf);
+        assert!(commit_time_field(
+            &mut doc,
+            &mut state,
+            0,
+            &ev_f,
+            TimeFieldKind::End,
+            None
+        ));
+        let ev_fb = doc
+            .script()
+            .events_section()
+            .and_then(|s| s.get_event(0))
+            .expect("ev_fb")
+            .clone();
+        let fb = default_fallback_timecodes();
+        assert_eq!(ev_fb.end().as_cs(), fb.frame_to_time_cs(96, TimeType::End));
     }
 }
