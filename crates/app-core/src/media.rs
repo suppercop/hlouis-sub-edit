@@ -30,6 +30,8 @@ pub struct VideoMeta {
     pub frame_count: u32,
     pub timecodes: Timecodes,
     pub keyframes: Vec<u32>,
+    /// Sample aspect ratio `(num, den)` of the stream (`(1, 1)` when unspecified).
+    pub sar: (u32, u32),
 }
 
 /// Event produced by a background media provider; always surfaced to the user (never silent).

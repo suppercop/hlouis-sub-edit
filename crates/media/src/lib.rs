@@ -61,9 +61,22 @@ pub struct VideoInfo {
     pub duration_ms: f64,
     pub keyframes: Vec<usize>,
     pub frame_pts_ms: Vec<i64>,
+    /// Sample (pixel) aspect ratio of the stream; `0` means unknown (treated as `1:1`).
+    pub sar_num: u32,
+    pub sar_den: u32,
 }
 
 impl VideoInfo {
+    /// Sample aspect ratio `(num, den)`, `(1, 1)` when the stream does not specify one.
+    #[must_use]
+    pub const fn sar(&self) -> (u32, u32) {
+        if self.sar_num == 0 || self.sar_den == 0 {
+            (1, 1)
+        } else {
+            (self.sar_num, self.sar_den)
+        }
+    }
+
     /// Finds the next keyframe strictly after `current`.
     #[must_use]
     pub fn next_keyframe(&self, current: usize) -> Option<usize> {
@@ -483,6 +496,8 @@ mod ffi {
             duration_ms,
             keyframes,
             frame_pts_ms,
+            sar_num: u32::try_from(props.SARNum).unwrap_or(0),
+            sar_den: u32::try_from(props.SARDen).unwrap_or(0),
         })
     }
 }
@@ -617,6 +632,8 @@ mod tests {
             duration_ms: 8341.0,
             keyframes: vec![0, 48, 96, 150],
             frame_pts_ms: vec![0; 200],
+            sar_num: 0,
+            sar_den: 0,
         };
 
         assert!(info.is_keyframe(48));

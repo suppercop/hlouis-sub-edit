@@ -209,6 +209,7 @@ impl EditorApp {
             meta.width,
             meta.height,
         );
+        self.shell.set_video_sar(meta.sar.0, meta.sar.1);
         if refined && let Some(pb) = self.shell.playback.as_mut() {
             pb.seek_frame(keep);
         }

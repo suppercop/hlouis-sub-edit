@@ -86,6 +86,12 @@ impl Default for DetachedVideoState {
     }
 }
 
+/// Width of the video panel taken by the visual-tool toolbar and spacing (logical points); the
+/// canvas is `panel_w - VIDEO_PANEL_CHROME_W` wide.
+pub const VIDEO_PANEL_CHROME_W: f32 = 28.0;
+/// Height of the video panel taken by the seek bar and transport rows below the canvas.
+pub const VIDEO_PANEL_CHROME_H: f32 = 44.0;
+
 /// Proportional splitter state (`0.0..=1.0`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayoutState {
@@ -96,6 +102,11 @@ pub struct LayoutState {
     pub video_width_ratio: f32,
     /// Fraction of top-right height allocated to the audio panel vs edit box below it.
     pub audio_height_ratio: f32,
+    /// Display aspect ratio (width / height) of the loaded video. When `Some`, the video panel
+    /// takes the width that makes its canvas match this aspect at the current top height (as
+    /// Aegisub sizes its video window), so Fit mode shows no letterbox bars when the layout
+    /// allows it. Cleared when the user drags the video/right splitter.
+    pub video_aspect: Option<f32>,
     pub detached_video: DetachedVideoState,
     pub mins: MinPanelSizes,
 }
@@ -107,6 +118,7 @@ impl Default for LayoutState {
             top_height_ratio: 0.62,
             video_width_ratio: 0.52,
             audio_height_ratio: 0.52,
+            video_aspect: None,
             detached_video: DetachedVideoState::default(),
             mins: MinPanelSizes::default(),
         }
@@ -194,8 +206,13 @@ impl LayoutState {
         if show_video {
             let right_min_w = if show_audio { self.mins.audio_w } else { 200.0 };
             let max_vid_w = (w - sp - right_min_w).max(self.mins.video_w.min(w * 0.7));
-            let vid_w =
-                (w * self.video_width_ratio).clamp(self.mins.video_w.min(max_vid_w), max_vid_w);
+            let wanted_w = match self.video_aspect {
+                Some(aspect) if aspect.is_finite() && aspect > 0.0 => {
+                    VIDEO_PANEL_CHROME_W + (top_h - VIDEO_PANEL_CHROME_H).max(1.0) * aspect
+                }
+                _ => w * self.video_width_ratio,
+            };
+            let vid_w = wanted_w.clamp(self.mins.video_w.min(max_vid_w), max_vid_w);
             let video = Rect {
                 x: 0.0,
                 y: 0.0,

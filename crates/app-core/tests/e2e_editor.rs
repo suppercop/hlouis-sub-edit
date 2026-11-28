@@ -270,7 +270,8 @@ fn e2e_selecting_line_seeks_to_first_visible_frame_23_976() {
     );
     let mut app = EditorApp::new(script);
     let tc = keyframes::Timecodes::from_cfr(24_000, 1_001).expect("cfr");
-    app.shell.attach_video(tc.clone(), 5_000, vec![0], 1920, 1080);
+    app.shell
+        .attach_video(tc.clone(), 5_000, vec![0], 1920, 1080);
     app.shell.doc.set_selection(Some(1), &[1]);
     app.shell.grid.model.click(1);
 
@@ -287,7 +288,10 @@ fn e2e_selecting_line_seeks_to_first_visible_frame_23_976() {
     let app = harness.state();
     let pb = app.shell.playback.as_ref().expect("playback");
     let frame = pb.current_frame();
-    assert_eq!(frame, 1_389, "line at 57.90 must seek to frame 1389, not 1388");
+    assert_eq!(
+        frame, 1_389,
+        "line at 57.90 must seek to frame 1389, not 1388"
+    );
     assert!(
         tc.frame_to_time_ms(frame, keyframes::TimeType::Exact) >= 57_900,
         "the sought frame must be displayed at or after the line start"

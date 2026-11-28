@@ -61,6 +61,9 @@ pub struct AppShell {
     pub doc: DocumentController,
     pub settings: AppSettings,
     pub layout_state: LayoutState,
+    /// `true` once the user dragged the video splitter: the video panel then stops sizing itself
+    /// to the video aspect (until the next video is attached).
+    pub video_split_manual: bool,
     pub theme: ThemeController,
     pub catalog: Catalog,
     pub commands: CommandRegistry,
@@ -548,6 +551,7 @@ impl AppShell {
             doc,
             settings: AppSettings::default(),
             layout_state: LayoutState::default(),
+            video_split_manual: false,
             theme: ThemeController::new(ThemeSpec::Dark, FontConfig::default()),
             catalog: Catalog::for_locale(Locale::En),
             commands: CommandRegistry::new_default(),
@@ -605,6 +609,12 @@ impl AppShell {
             PlaybackConfig::default(),
         ));
         self.video = VideoPanelState::new(width, height);
+        self.video_split_manual = false;
+    }
+
+    /// Sets the stream's sample aspect ratio (anamorphic video is displayed at `DAR = w/h * SAR`).
+    pub fn set_video_sar(&mut self, num: u32, den: u32) {
+        self.video.set_sar(num, den);
     }
 
     /// Detaches the active video source and clears playback state.
@@ -1193,6 +1203,14 @@ impl AppShell {
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(2)))
             .show(ui, |ui| {
                 let avail = ui.available_rect_before_wrap();
+                // The video panel sizes itself to the video's display aspect (like Aegisub) while
+                // in Fit mode, unless the user took manual control of the splitter.
+                self.layout_state.video_aspect = (self.playback.is_some()
+                    && !self.video_split_manual
+                    && self.video.zoom_mode == ui_video::ZoomMode::Fit
+                    && self.video.display_aspect.is_finite()
+                    && self.video.display_aspect > 0.0)
+                    .then_some(self.video.display_aspect);
                 let comp = self
                     .layout_state
                     .compute_logical(avail.width().max(320.0), avail.height().max(240.0));
@@ -1375,6 +1393,11 @@ impl AppShell {
                         ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
                     }
                     if tv_resp.dragged() {
+                        if !self.video_split_manual {
+                            // Start from the width the panel currently has (aspect-derived).
+                            self.layout_state.video_width_ratio = tv.x / avail.width().max(1.0);
+                            self.video_split_manual = true;
+                        }
                         let dx = tv_resp.drag_delta().x / avail.width().max(1.0);
                         self.layout_state.video_width_ratio =
                             (self.layout_state.video_width_ratio + dx).clamp(0.25, 0.75);
@@ -1746,5 +1769,94 @@ mod tests {
         let (spec, loc) = state_check.get();
         assert_eq!(spec, ThemeSpec::Dark);
         assert_eq!(loc, Locale::En);
+    }
+
+    struct TinyVideo(Vec<u8>);
+    impl VideoFrameSupplier for TinyVideo {
+        fn total_frames(&self) -> u32 {
+            1_000
+        }
+        fn is_keyframe(&self, frame: u32) -> bool {
+            frame == 0
+        }
+        fn frame_revision(&self, _frame: u32) -> u64 {
+            1
+        }
+        fn frame_rgba(&self, _frame: u32) -> Option<ui_video::RgbaFrameRef<'_>> {
+            Some(ui_video::RgbaFrameRef {
+                width: 16,
+                height: 9,
+                rgba: &self.0,
+            })
+        }
+    }
+
+    /// Fit mode must show the picture at the stream's display aspect (SAR applied, never
+    /// stretched or cropped) and the panel must size itself to it so no letterbox bars remain.
+    #[test]
+    fn video_panel_fits_display_aspect_without_bars_for_square_and_anamorphic() {
+        // (storage w, h, SAR num, SAR den, expected display aspect)
+        let cases: [(u32, u32, u32, u32, f32); 3] = [
+            (1920, 1080, 1, 1, 16.0 / 9.0),
+            (720, 480, 32, 27, 720.0 * 32.0 / (480.0 * 27.0)),
+            (720, 480, 8, 9, 4.0 / 3.0),
+        ];
+        for (w, h, sn, sd, dar) in cases {
+            for (size, ppp) in [
+                (Vec2::new(1280.0, 800.0), 1.0),
+                (Vec2::new(1920.0, 1000.0), 1.0),
+                (Vec2::new(1280.0, 800.0), 1.5),
+            ] {
+                let mut shell = AppShell::new(ScriptFile::new_default());
+                if let Ok(tc) = Timecodes::from_cfr(24_000, 1_001) {
+                    shell.attach_video(tc, 1_000, vec![0], w, h);
+                }
+                shell.set_video_sar(sn, sd);
+                let vid = TinyVideo(vec![90u8; 16 * 9 * 4]);
+                let out = std::rc::Rc::new(std::cell::Cell::new((Rect::NOTHING, Rect::NOTHING)));
+                let out_c = out.clone();
+                let mut harness = Harness::builder()
+                    .with_size(size)
+                    .with_pixels_per_point(ppp)
+                    .with_accessibility_check(false)
+                    .build_ui(move |ui| {
+                        shell.show(ui, Some(&vid), None, &ZeroClock);
+                        out_c.set((shell.video.last_canvas_rect, shell.video.last_video_rect));
+                    });
+                harness.run();
+                harness.run();
+                let (canvas, video) = out.get();
+                let label = format!("{w}x{h} SAR {sn}:{sd} win {size:?} ppp {ppp}");
+                assert!(canvas.width() > 100.0, "{label}: canvas missing");
+                let aspect = video.width() / video.height();
+                assert!(
+                    (aspect / dar - 1.0).abs() < 0.01,
+                    "{label}: picture aspect {aspect} != display aspect {dar} (stretched)"
+                );
+                assert!(
+                    video.min.x >= canvas.min.x - 0.5
+                        && video.max.x <= canvas.max.x + 0.5
+                        && video.min.y >= canvas.min.y - 0.5
+                        && video.max.y <= canvas.max.y + 0.5,
+                    "{label}: picture cropped: {video:?} outside {canvas:?}"
+                );
+                let bar_x = canvas.width() - video.width();
+                let bar_y = canvas.height() - video.height();
+                assert!(
+                    bar_x.min(bar_y) < 1.0,
+                    "{label}: Fit must fill one dimension ({bar_x} x {bar_y})"
+                );
+                assert!(
+                    bar_x.max(bar_y) < 2.0,
+                    "{label}: letterbox bars {bar_x} x {bar_y} px (canvas {canvas:?}, video {video:?})"
+                );
+                let centre_dx = (video.center().x - canvas.center().x).abs();
+                let centre_dy = (video.center().y - canvas.center().y).abs();
+                assert!(
+                    centre_dx < 0.5 && centre_dy < 0.5,
+                    "{label}: bars not symmetric"
+                );
+            }
+        }
     }
 }

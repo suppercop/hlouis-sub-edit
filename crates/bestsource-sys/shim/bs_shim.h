@@ -56,6 +56,8 @@ typedef struct bs_video_props {
     int bits;
     int sub_sampling_w;
     int sub_sampling_h;
+    int sar_num;        /* sample aspect ratio, 0/0 when unknown */
+    int sar_den;
 } bs_video_props;
 
 typedef struct bs_audio_props {
@@ -134,6 +136,8 @@ typedef struct bs_quick_props {
     int time_base_den;
     int64_t first_pts; /* time base units */
     int64_t duration;  /* time base units, 0 when unknown */
+    int sar_num;       /* sample aspect ratio, 0/0 when unknown */
+    int sar_den;
 } bs_quick_props;
 
 int bs_quick_open(const char *path_utf8, int track, int threads, bs_quick **out, char *err, size_t err_len);

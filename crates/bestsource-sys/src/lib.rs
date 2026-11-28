@@ -59,6 +59,8 @@ pub struct bs_video_props {
     pub bits: c_int,
     pub sub_sampling_w: c_int,
     pub sub_sampling_h: c_int,
+    pub sar_num: c_int,
+    pub sar_den: c_int,
 }
 
 #[repr(C)]
@@ -236,6 +238,8 @@ pub struct bs_quick_props {
     pub time_base_den: c_int,
     pub first_pts: i64,
     pub duration: i64,
+    pub sar_num: c_int,
+    pub sar_den: c_int,
 }
 
 #[cfg(test)]
