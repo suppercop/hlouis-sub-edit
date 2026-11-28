@@ -2,26 +2,26 @@
 //! [`visual_tools`], [`playback`], [`theme::Palette`], and [`i18n_catalog`].
 //!
 //! Mirrors Aegisub 3.2.2 / 3.5.1 `src/video_display.cpp` & `src/video_box.cpp`:
-//! - Displays RGBA frames from a [`VideoFrameSupplier`] trait (zero native/FFI deps; video frames
-//!   are ALWAYS rendered in true colour, exempt from Eye Comfort warming).
-//! - Zoom / AR / pan via [`video_geometry::VideoDisplayState`].
-//! - All 7 visual tools painted as crisp 16×16 vector icons on the left (`Cross`, `Drag`,
-//!   `RotateZ`, `RotateXY`, `Scale`, `RectClip`, `VectorClip`) plus vector-clip sub-toolbar.
-//! - Full-width seek bar, compact vector playback buttons, frame/time box, offset box
-//!   (`+0ms; -0ms`), and Zoom combo below the seek bar.
-//! - Bench target: overlay frame with a 500-point vector clip `< 0.3 ms` CPU.
+//! - Left column: 8 coloured 16×16 visual tool icons (Standard, Drag, Rotate Z, Rotate X/Y,
+//!   Scale, Rect Clip, Vector Clip, plus `?` Help at the bottom) with pressed frame on selection.
+//! - True-colour video frame filling the panel cleanly without oversized black margins.
+//! - Dense seek bar with black keyframe tick marks and a crisp small slider thumb.
+//! - Classic Aegisub playback row: Play, Play line (`[▶]`), Pause/Stop, `AUTO` scroll toggle,
+//!   time/frame box (`0:05:13.897 - 7526`), offset box (`+3607ms; -23ms`), and Zoom combo
+//!   (`37.5%`, `50%`, `75%`, `100%`, `150%`, `200%`).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use egui::{
-    Color32, ColorImage, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Ui,
-    Vec2,
+    Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, Vec2,
 };
 use i18n_catalog::Catalog;
 use playback::{Clock, PlaybackController};
 use std::f32::consts::TAU;
+use std::fmt::Write as _;
 use theme::Palette;
 use ui_theme::{rgba, snap_px};
 use video_geometry::VideoDisplayState;
@@ -54,6 +54,10 @@ pub trait VideoFrameSupplier {
     fn total_frames(&self) -> u32;
     /// Returns `true` if `frame` is a keyframe.
     fn is_keyframe(&self, frame: u32) -> bool;
+    /// Optional sorted slice of keyframe indices so seek bar ticks render without stride misses.
+    fn keyframes(&self) -> Option<&[u32]> {
+        None
+    }
     /// Revision token for `frame` (bump when subtitle overlay changes to trigger re-upload).
     fn frame_revision(&self, frame: u32) -> u64;
     /// Borrows the RGBA8 pixels for `frame`.
@@ -65,10 +69,21 @@ pub trait VideoFrameSupplier {
 pub enum VideoPanelAction {
     PlayToggle,
     PlayLine,
+    Stop,
     StepFrame(i32),
     SeekFrame(u32),
     SeekKeyframe(bool),
     VisualOverlayEdited,
+    ShowVisualHelp,
+}
+
+/// How the video is scaled inside the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomMode {
+    /// Scale proportionally to fill the panel.
+    Fit,
+    /// Use `VideoPanelState::zoom_tenths` directly.
+    Fixed,
 }
 
 /// Persistent UI state for the video panel + visual tool overlay.
@@ -79,9 +94,18 @@ pub struct VideoPanelState {
     pub vclip_path: VectorClipPath,
     pub rect_clip: [f64; 4],
     pub drag_pos: [f64; 2],
+    pub rotate_z_deg: f64,
+    pub rotate_xy_deg: [f64; 2],
+    pub scale_pct: [f64; 2],
     pub dragging_vertex: Option<usize>,
     pub show_overscan: bool,
-    pub zoom_percent: u16,
+    pub auto_scroll_video: bool,
+    pub show_visual_help: bool,
+    /// When `true`, scales video proportionally to fill the panel canvas; when `false`, uses
+    /// [`Self::zoom_tenths`] directly.
+    pub zoom_mode: ZoomMode,
+    /// Zoom percentage × 10 (e.g. `375` = `37.5%`, `500` = `50%`, `1000` = `100%`).
+    pub zoom_tenths: u16,
     pub active_line_start_ms: i64,
     pub active_line_end_ms: i64,
     // Cached GPU texture + revision key (0 re-upload when unchanged).
@@ -90,6 +114,9 @@ pub struct VideoPanelState {
     texture_uploads: u64,
     // Reusable scratch buffer for drawing 500+ vector clip segments without allocating.
     poly_scratch: Vec<Pos2>,
+    frame_time_buf: String,
+    offset_buf: String,
+    last_readout_key: Option<(i64, u32, i64, i64)>,
 }
 
 impl Default for VideoPanelState {
@@ -114,15 +141,24 @@ impl VideoPanelState {
             vclip_path: VectorClipPath::default(),
             rect_clip: [160.0, 120.0, 1760.0, 960.0],
             drag_pos: [960.0, 540.0],
+            rotate_z_deg: 0.0,
+            rotate_xy_deg: [0.0, 0.0],
+            scale_pct: [100.0, 100.0],
             dragging_vertex: None,
             show_overscan: false,
-            zoom_percent: 50,
+            auto_scroll_video: true,
+            show_visual_help: false,
+            zoom_mode: ZoomMode::Fit,
+            zoom_tenths: 375,
             active_line_start_ms: 0,
             active_line_end_ms: 2_000,
             texture: None,
             uploaded_key: None,
             texture_uploads: 0,
             poly_scratch: Vec::with_capacity(1024),
+            frame_time_buf: String::with_capacity(32),
+            offset_buf: String::with_capacity(32),
+            last_readout_key: None,
         }
     }
 
@@ -159,7 +195,7 @@ impl VideoPanelState {
     }
 }
 
-/// Paints a crisp 16×16 vector icon for one of the 7 Aegisub visual typesetting tools.
+/// Paints a coloured 16×16 vector icon for one of the 7 Aegisub visual tools with pressed frame.
 #[allow(clippy::too_many_lines)]
 fn visual_tool_icon_button(
     ui: &mut Ui,
@@ -171,25 +207,20 @@ fn visual_tool_icon_button(
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
     let p = ui.painter();
     let bg = if selected {
-        rgba(pal.selection_bg)
+        Color32::from_rgb(198, 224, 250)
     } else if resp.hovered() {
         rgba(pal.hover)
     } else {
         rgba(pal.toolbar_bg)
-    };
-    let fg = if selected {
-        rgba(pal.selection_text)
-    } else {
-        rgba(pal.text_primary)
     };
     p.rect_filled(rect, 2.0, bg);
     p.rect_stroke(
         rect,
         2.0,
         Stroke::new(
-            1.0,
+            if selected { 1.4 } else { 1.0 },
             if selected {
-                rgba(pal.focus_ring)
+                Color32::from_rgb(42, 120, 214)
             } else {
                 rgba(pal.border)
             },
@@ -197,10 +228,14 @@ fn visual_tool_icon_button(
         egui::StrokeKind::Inside,
     );
     let c = rect.center();
-    let st = Stroke::new(1.3, fg);
+    let blue = Color32::from_rgb(38, 114, 210);
+    let red = Color32::from_rgb(212, 58, 58);
+    let green = Color32::from_rgb(38, 162, 82);
+    let orange = Color32::from_rgb(218, 128, 24);
+    let purple = Color32::from_rgb(148, 66, 198);
+
     match tool {
         ActiveVisualTool::Cross => {
-            // Standard pointer arrow.
             p.add(egui::Shape::convex_polygon(
                 vec![
                     Pos2::new(c.x - 4.0, c.y - 6.0),
@@ -208,20 +243,19 @@ fn visual_tool_icon_button(
                     Pos2::new(c.x - 1.0, c.y + 2.5),
                     Pos2::new(c.x + 3.5, c.y + 3.0),
                 ],
-                fg,
-                Stroke::NONE,
+                blue,
+                Stroke::new(0.8, Color32::from_rgb(20, 56, 120)),
             ));
         }
         ActiveVisualTool::Drag => {
-            // 4-way drag arrows.
+            let st = Stroke::new(1.5, blue);
             p.line_segment([Pos2::new(c.x - 6.0, c.y), Pos2::new(c.x + 6.0, c.y)], st);
             p.line_segment([Pos2::new(c.x, c.y - 6.0), Pos2::new(c.x, c.y + 6.0)], st);
             for (dx, dy) in [(-6.0, 0.0), (6.0, 0.0), (0.0, -6.0), (0.0, 6.0)] {
-                p.circle_filled(Pos2::new(c.x + dx, c.y + dy), 1.6, fg);
+                p.circle_filled(Pos2::new(c.x + dx, c.y + dy), 1.8, red);
             }
         }
         ActiveVisualTool::RotateZ => {
-            // Circular rotation arc + arrowhead.
             let r = 5.5;
             let pts: Vec<Pos2> = (0..=12)
                 .map(|i| {
@@ -229,72 +263,123 @@ fn visual_tool_icon_button(
                     Pos2::new(c.x + a.cos() * r, c.y + a.sin() * r)
                 })
                 .collect();
-            p.add(egui::Shape::line(pts, st));
-            p.circle_filled(c, 1.5, fg);
+            p.add(egui::Shape::line(pts, Stroke::new(1.6, green)));
+            p.circle_filled(c, 1.8, red);
         }
         ActiveVisualTool::RotateXY => {
-            // 3D orbit ellipse + tilted axis.
             let pts: Vec<Pos2> = (0..=16)
                 .map(|i| {
                     let a = (i as f32 / 16.0) * TAU;
                     Pos2::new(c.x + a.cos() * 6.0, c.y + a.sin() * 3.0)
                 })
                 .collect();
-            p.add(egui::Shape::closed_line(pts, st));
+            p.add(egui::Shape::closed_line(pts, Stroke::new(1.4, orange)));
             p.line_segment(
                 [
                     Pos2::new(c.x - 2.0, c.y - 6.0),
                     Pos2::new(c.x + 2.0, c.y + 6.0),
                 ],
-                st,
+                Stroke::new(1.4, blue),
             );
         }
         ActiveVisualTool::Scale => {
-            // Box + diagonal resize arrow.
             let b = Rect::from_min_max(
                 Pos2::new(c.x - 5.5, c.y - 5.5),
                 Pos2::new(c.x + 1.5, c.y + 1.5),
             );
-            p.rect_stroke(b, 0.0, st, egui::StrokeKind::Inside);
+            p.rect_stroke(b, 0.0, Stroke::new(1.4, blue), egui::StrokeKind::Inside);
             p.line_segment(
                 [
                     Pos2::new(c.x + 1.0, c.y + 1.0),
                     Pos2::new(c.x + 6.0, c.y + 6.0),
                 ],
-                st,
+                Stroke::new(1.6, green),
             );
             p.rect_filled(
-                Rect::from_center_size(Pos2::new(c.x + 5.5, c.y + 5.5), Vec2::splat(3.0)),
+                Rect::from_center_size(Pos2::new(c.x + 5.5, c.y + 5.5), Vec2::splat(3.2)),
                 0.0,
-                fg,
+                red,
             );
         }
         ActiveVisualTool::RectClip => {
-            // Rectangle with 4 corner handles.
             let b = Rect::from_center_size(c, Vec2::new(11.0, 9.0));
-            p.rect_stroke(b, 0.0, st, egui::StrokeKind::Inside);
+            p.rect_stroke(b, 0.0, Stroke::new(1.4, purple), egui::StrokeKind::Inside);
             for corner in [
                 b.left_top(),
                 b.right_top(),
                 b.left_bottom(),
                 b.right_bottom(),
             ] {
-                p.rect_filled(Rect::from_center_size(corner, Vec2::splat(3.0)), 0.0, fg);
+                p.rect_filled(Rect::from_center_size(corner, Vec2::splat(3.0)), 0.0, red);
             }
         }
         ActiveVisualTool::VectorClip => {
-            // Polygon path with vertex nodes.
             let v0 = Pos2::new(c.x - 5.5, c.y + 4.5);
             let v1 = Pos2::new(c.x - 2.0, c.y - 5.0);
             let v2 = Pos2::new(c.x + 5.5, c.y - 1.5);
             let v3 = Pos2::new(c.x + 2.5, c.y + 5.0);
-            p.add(egui::Shape::closed_line(vec![v0, v1, v2, v3], st));
+            p.add(egui::Shape::closed_line(
+                vec![v0, v1, v2, v3],
+                Stroke::new(1.4, orange),
+            ));
             for v in [v0, v1, v2, v3] {
-                p.rect_filled(Rect::from_center_size(v, Vec2::splat(3.0)), 0.0, fg);
+                p.rect_filled(Rect::from_center_size(v, Vec2::splat(3.0)), 0.0, blue);
             }
         }
     }
     resp.on_hover_text(tooltip).clicked()
+}
+
+/// Paints the 8th visual-tool button (`?` help) at the bottom of the left column.
+fn visual_help_button(ui: &mut Ui, active: bool, pal: &Palette) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+    let p = ui.painter();
+    let bg = if active {
+        Color32::from_rgb(198, 224, 250)
+    } else if resp.hovered() {
+        rgba(pal.hover)
+    } else {
+        rgba(pal.toolbar_bg)
+    };
+    p.rect_filled(rect, 2.0, bg);
+    p.rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0, rgba(pal.border)),
+        egui::StrokeKind::Inside,
+    );
+    p.circle_filled(rect.center(), 6.5, Color32::from_rgb(42, 120, 214));
+    let c = rect.center();
+    let qst = Stroke::new(1.5, Color32::WHITE);
+    p.line_segment(
+        [
+            Pos2::new(c.x - 2.0, c.y - 2.2),
+            Pos2::new(c.x - 1.2, c.y - 3.6),
+        ],
+        qst,
+    );
+    p.line_segment(
+        [
+            Pos2::new(c.x - 1.2, c.y - 3.6),
+            Pos2::new(c.x + 1.4, c.y - 3.6),
+        ],
+        qst,
+    );
+    p.line_segment(
+        [
+            Pos2::new(c.x + 1.4, c.y - 3.6),
+            Pos2::new(c.x + 2.0, c.y - 1.8),
+        ],
+        qst,
+    );
+    p.line_segment(
+        [Pos2::new(c.x + 2.0, c.y - 1.8), Pos2::new(c.x, c.y + 0.5)],
+        qst,
+    );
+    p.line_segment([Pos2::new(c.x, c.y + 0.5), Pos2::new(c.x, c.y + 1.8)], qst);
+    p.circle_filled(Pos2::new(c.x, c.y + 3.8), 1.0, Color32::WHITE);
+    resp.on_hover_text("Toggle visual typesetting tool help")
+        .clicked()
 }
 
 /// Paints the active visual tool overlay onto `painter` inside `video_rect` (0 allocations in
@@ -400,20 +485,36 @@ pub fn paint_visual_overlay(
     }
 }
 
-fn format_video_time_ms(ms: i64) -> String {
-    let clamped = ms.max(0);
-    let millis = clamped % 1_000;
-    let total_s = clamped / 1_000;
-    let s = total_s % 60;
-    let total_m = total_s / 60;
-    let m = total_m % 60;
-    let h = total_m / 60;
-    format!("{h}:{m:02}:{s:02}.{millis:03}")
+fn zoom_label_static(tenths: u16) -> Option<&'static str> {
+    match tenths {
+        250 => Some("25%"),
+        375 => Some("37.5%"),
+        500 => Some("50%"),
+        750 => Some("75%"),
+        1000 => Some("100%"),
+        1500 => Some("150%"),
+        2000 => Some("200%"),
+        _ => None,
+    }
 }
 
-/// Renders the complete Aegisub 3.2.2 video panel (7 vector visual tool icons on the left,
-/// true-colour video canvas, vector-clip sub-toolbar, full-width seek bar, playback buttons,
-/// frame/time readout box, offset box, and zoom combo).
+fn format_zoom_tenths(tenths: u16) -> std::borrow::Cow<'static, str> {
+    if let Some(s) = zoom_label_static(tenths) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    if tenths.is_multiple_of(10) {
+        std::borrow::Cow::Owned(format!("{}%", tenths / 10))
+    } else {
+        std::borrow::Cow::Owned(format!("{}.{}%", tenths / 10, tenths % 10))
+    }
+}
+
+/// Renders the complete Aegisub 3.5.1 video panel:
+/// - 8 coloured visual tool icons on the left (7 tools + `?` help) with pressed frame
+/// - Full-fill true-colour video canvas (minimal letterboxing)
+/// - Dense seek bar with black keyframe tick marks and crisp small slider thumb
+/// - Classic Aegisub playback row: Play, Play line (`[▶]`), Pause/Stop, `AUTO`, time-frame box,
+///   offset box, and Zoom combo.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn show_video_panel(
     ui: &mut Ui,
@@ -422,7 +523,7 @@ pub fn show_video_panel(
     pb: &mut PlaybackController,
     clock: &dyn Clock,
     palette: &Palette,
-    catalog: &Catalog,
+    _catalog: &Catalog,
 ) -> Option<VideoPanelAction> {
     let mut action: Option<VideoPanelAction> = None;
     let ppp = ui.ctx().pixels_per_point();
@@ -434,12 +535,12 @@ pub fn show_video_panel(
     } else {
         0.0
     };
-    let bottom_bars_h = 46.0 + extra_vclip_h;
+    let bottom_bars_h = 44.0 + extra_vclip_h;
     let canvas_h = (ui.available_height() - bottom_bars_h).max(72.0);
     let canvas_w = (ui.available_width() - 28.0).max(120.0);
 
     ui.horizontal(|ui| {
-        // Left vertical visual tool toolbar (7 crisp 16×16 vector-painted Aegisub icons).
+        // Left vertical visual tool toolbar: 8 entries (7 tools + `?` help at the bottom).
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for (tool, tip) in [
@@ -458,21 +559,30 @@ pub fn show_video_panel(
                     state.active_tool = tool;
                 }
             }
+            if visual_help_button(ui, state.show_visual_help, palette) {
+                state.show_visual_help = !state.show_visual_help;
+                action = Some(VideoPanelAction::ShowVisualHelp);
+            }
         });
 
-        // Main true-colour video canvas.
+        // Main true-colour video canvas filling the panel cleanly at aspect ratio.
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::click_and_drag());
-        state.display.viewport_w = f64::from(rect.width().max(1.0));
-        state.display.viewport_h = f64::from(rect.height().max(1.0));
-        let layout = state.display.layout();
-        let video_rect = Rect::from_min_size(
-            Pos2::new(
-                rect.left() + layout.video_rect.x as f32,
-                rect.top() + layout.video_rect.y as f32,
-            ),
-            Vec2::new(layout.video_rect.w as f32, layout.video_rect.h as f32),
-        );
+        let vw = state.display.video_w.max(1.0) as f32;
+        let vh = state.display.video_h.max(1.0) as f32;
+        let video_aspect = vw / vh;
+        let box_aspect = rect.width() / rect.height().max(1.0);
+        let (draw_w, draw_h) = if state.zoom_mode == ZoomMode::Fit {
+            if box_aspect > video_aspect {
+                (rect.height() * video_aspect, rect.height())
+            } else {
+                (rect.width(), rect.width() / video_aspect)
+            }
+        } else {
+            let scale = (f32::from(state.zoom_tenths) / 1000.0).max(0.05);
+            (vw * scale, vh * scale)
+        };
+        let video_rect = Rect::from_center_size(rect.center(), Vec2::new(draw_w, draw_h));
 
         // Upload RGBA frame texture ONLY when `(frame, revision)` changes.
         let rev = supplier.frame_revision(frame);
@@ -497,9 +607,8 @@ pub fn show_video_panel(
         }
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, Color32::BLACK);
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(18, 20, 26));
         if let Some(ref tex) = state.texture {
-            // True-colour video frame (Color32::WHITE tint = never warmed by Eye Comfort).
             painter.image(
                 tex.id(),
                 video_rect,
@@ -508,10 +617,6 @@ pub fn show_video_panel(
             );
         }
 
-        let vw = state.display.video_w as f32;
-        let vh = state.display.video_h as f32;
-
-        // Visual tool mouse interaction (Drag / VectorClip).
         if let Some(pos) = resp.interact_pointer_pos() {
             let vpos = VideoPanelState::screen_to_video(video_rect, vw, vh, pos);
             if state.active_tool == ActiveVisualTool::VectorClip {
@@ -559,6 +664,68 @@ pub fn show_video_panel(
             } else if state.active_tool == ActiveVisualTool::Drag && resp.dragged() {
                 state.drag_pos = [vpos.x, vpos.y];
                 action = Some(VideoPanelAction::VisualOverlayEdited);
+            } else if state.active_tool == ActiveVisualTool::RotateZ && resp.dragged() {
+                let dx = vpos.x - state.drag_pos[0];
+                let dy = vpos.y - state.drag_pos[1];
+                state.rotate_z_deg = -dy.atan2(dx).to_degrees();
+                action = Some(VideoPanelAction::VisualOverlayEdited);
+            } else if state.active_tool == ActiveVisualTool::RotateXY && resp.dragged() {
+                let dx = vpos.x - state.drag_pos[0];
+                let dy = vpos.y - state.drag_pos[1];
+                state.rotate_xy_deg = [
+                    (dy * 0.25).clamp(-89.0, 89.0),
+                    (dx * 0.25).clamp(-89.0, 89.0),
+                ];
+                action = Some(VideoPanelAction::VisualOverlayEdited);
+            } else if state.active_tool == ActiveVisualTool::Scale && resp.dragged() {
+                let sx = ((vpos.x - state.drag_pos[0]).abs() / 100.0 * 100.0).clamp(10.0, 500.0);
+                let sy = ((vpos.y - state.drag_pos[1]).abs() / 100.0 * 100.0).clamp(10.0, 500.0);
+                state.scale_pct = [sx, sy];
+                action = Some(VideoPanelAction::VisualOverlayEdited);
+            } else if state.active_tool == ActiveVisualTool::RectClip {
+                if resp.drag_started() {
+                    let corners = [
+                        (state.rect_clip[0], state.rect_clip[1]),
+                        (state.rect_clip[2], state.rect_clip[1]),
+                        (state.rect_clip[0], state.rect_clip[3]),
+                        (state.rect_clip[2], state.rect_clip[3]),
+                    ];
+                    let best = corners
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            let da = (a.0 - vpos.x).hypot(a.1 - vpos.y);
+                            let db = (b.0 - vpos.x).hypot(b.1 - vpos.y);
+                            da.total_cmp(&db)
+                        })
+                        .map(|(idx, _)| idx);
+                    state.dragging_vertex = best;
+                }
+                if resp.dragged() {
+                    match state.dragging_vertex {
+                        Some(0) => {
+                            state.rect_clip[0] = vpos.x;
+                            state.rect_clip[1] = vpos.y;
+                        }
+                        Some(1) => {
+                            state.rect_clip[2] = vpos.x;
+                            state.rect_clip[1] = vpos.y;
+                        }
+                        Some(2) => {
+                            state.rect_clip[0] = vpos.x;
+                            state.rect_clip[3] = vpos.y;
+                        }
+                        Some(3) => {
+                            state.rect_clip[2] = vpos.x;
+                            state.rect_clip[3] = vpos.y;
+                        }
+                        _ => {}
+                    }
+                    action = Some(VideoPanelAction::VisualOverlayEdited);
+                }
+                if resp.drag_stopped() {
+                    state.dragging_vertex = None;
+                }
             }
         }
 
@@ -585,97 +752,195 @@ pub fn show_video_panel(
         });
     }
 
-    // Row 1 below video: full-width seek bar.
-    ui.horizontal(|ui| {
-        let mut seek_f = frame;
-        let slider_w = (ui.available_width() - 8.0).max(80.0);
-        ui.spacing_mut().slider_width = slider_w;
-        if ui
-            .add(egui::Slider::new(&mut seek_f, 0..=total.saturating_sub(1)).show_value(false))
-            .changed()
-        {
-            pb.scrub_to_frame(seek_f);
-            action = Some(VideoPanelAction::SeekFrame(seek_f));
-        }
-    });
+    // Row 1 below video: dense seek bar with black keyframe tick marks + small slider thumb.
+    let seek_w = (ui.available_width() - 4.0).max(80.0);
+    let (seek_rect, seek_resp) =
+        ui.allocate_exact_size(Vec2::new(seek_w, 16.0), Sense::click_and_drag());
+    let sp = ui.painter_at(seek_rect);
+    let track_rect = Rect::from_min_max(
+        Pos2::new(seek_rect.left() + 2.0, seek_rect.center().y - 3.0),
+        Pos2::new(seek_rect.right() - 2.0, seek_rect.center().y + 3.0),
+    );
+    sp.rect_filled(track_rect, 1.0, rgba(palette.panel_bg));
+    sp.rect_stroke(
+        track_rect,
+        1.0,
+        Stroke::new(1.0, rgba(palette.border)),
+        egui::StrokeKind::Inside,
+    );
 
-    // Row 2 below seek bar: playback buttons | frame/time box | offset box (+0ms; -0ms) | Zoom combo.
+    // Draw black keyframe tick marks across the seek track without stride-missing real keyframes.
+    let max_f = total.saturating_sub(1).max(1);
+    if let Some(kfs) = supplier.keyframes() {
+        let step = (kfs.len() / 320).max(1);
+        for &kf_f in kfs.iter().step_by(step) {
+            if kf_f < total {
+                let frac = (kf_f as f32) / (max_f as f32);
+                let tx = snap_px(track_rect.left() + frac * track_rect.width(), ppp);
+                sp.line_segment(
+                    [
+                        Pos2::new(tx, track_rect.top() - 2.0),
+                        Pos2::new(tx, track_rect.bottom() + 2.0),
+                    ],
+                    Stroke::new(1.0 / ppp.max(0.5), Color32::from_rgb(20, 22, 26)),
+                );
+            }
+        }
+    } else {
+        let kf_stride = (total / 120).max(1);
+        let mut kf_f = 0u32;
+        while kf_f < total {
+            if supplier.is_keyframe(kf_f) {
+                let frac = (kf_f as f32) / (max_f as f32);
+                let tx = snap_px(track_rect.left() + frac * track_rect.width(), ppp);
+                sp.line_segment(
+                    [
+                        Pos2::new(tx, track_rect.top() - 2.0),
+                        Pos2::new(tx, track_rect.bottom() + 2.0),
+                    ],
+                    Stroke::new(1.0 / ppp.max(0.5), Color32::from_rgb(20, 22, 26)),
+                );
+            }
+            kf_f = kf_f.saturating_add(kf_stride);
+        }
+    }
+
+    // Draw small slider thumb.
+    let cur_frac = (frame as f32 / max_f as f32).clamp(0.0, 1.0);
+    let thumb_x = track_rect.left() + cur_frac * track_rect.width();
+    let thumb_r = Rect::from_center_size(
+        Pos2::new(thumb_x, seek_rect.center().y),
+        Vec2::new(7.0, 13.0),
+    );
+    sp.rect_filled(thumb_r, 1.5, Color32::from_rgb(56, 136, 226));
+    sp.rect_stroke(
+        thumb_r,
+        1.5,
+        Stroke::new(1.0, Color32::from_rgb(24, 72, 148)),
+        egui::StrokeKind::Inside,
+    );
+    if (seek_resp.clicked() || seek_resp.dragged())
+        && let Some(pos) = seek_resp.interact_pointer_pos()
+    {
+        let frac = ((pos.x - track_rect.left()) / track_rect.width().max(1.0)).clamp(0.0, 1.0);
+        #[allow(clippy::cast_sign_loss)]
+        let target = (frac * (max_f as f32)).round() as u32;
+        pb.scrub_to_frame(target);
+        action = Some(VideoPanelAction::SeekFrame(target));
+    }
+
+    // Row 2 below seek bar (Aegisub exact order):
+    // Play | Play line ([▶]) | Pause/Stop | AUTO toggle | time-frame box | offset box | zoom combo.
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let green = Color32::from_rgb(38, 168, 84);
+        let red = Color32::from_rgb(214, 58, 58);
+        let blue = Color32::from_rgb(42, 120, 214);
+
         if ui
-            .small_button(if pb.is_playing() { "⏸" } else { "▶" })
-            .on_hover_text("Play / Pause video")
+            .small_button(RichText::new("▶").color(green))
+            .on_hover_text("Play video")
             .clicked()
         {
             pb.toggle_play(clock);
             action = Some(VideoPanelAction::PlayToggle);
         }
         if ui
-            .small_button("▶|")
+            .small_button(RichText::new("[▶]").color(green))
             .on_hover_text("Play current line")
             .clicked()
         {
             action = Some(VideoPanelAction::PlayLine);
         }
         if ui
-            .small_button("◀")
-            .on_hover_text("Previous frame")
+            .small_button(RichText::new(if pb.is_playing() { "II" } else { "■" }).color(red))
+            .on_hover_text("Pause / Stop video")
             .clicked()
         {
-            pb.step_frame(-1);
-            action = Some(VideoPanelAction::StepFrame(-1));
-        }
-        if ui.small_button("▶").on_hover_text("Next frame").clicked() {
-            pb.step_frame(1);
-            action = Some(VideoPanelAction::StepFrame(1));
+            if pb.is_playing() {
+                pb.toggle_play(clock);
+            }
+            action = Some(VideoPanelAction::Stop);
         }
         if ui
-            .small_button("|◀")
-            .on_hover_text("Previous keyframe")
+            .selectable_label(
+                state.auto_scroll_video,
+                RichText::new("AUTO").small().color(blue),
+            )
+            .on_hover_text("Auto-seek video to active line")
             .clicked()
         {
-            let _ = pb.seek_keyframe(false);
-            action = Some(VideoPanelAction::SeekKeyframe(false));
-        }
-        if ui
-            .small_button("▶|")
-            .on_hover_text("Next keyframe")
-            .clicked()
-        {
-            let _ = pb.seek_keyframe(true);
-            action = Some(VideoPanelAction::SeekKeyframe(true));
+            state.auto_scroll_video = !state.auto_scroll_video;
         }
 
         let cur_ms = pb.current_time_ms();
-        let kf_tag = if supplier.is_keyframe(frame) {
-            catalog.get("panel-video-keyframe").unwrap_or("KF")
-        } else {
-            ""
-        };
-        let mut frame_time_txt = format!("{} - {frame} {kf_tag}", format_video_time_ms(cur_ms));
+        let rkey = (
+            cur_ms,
+            frame,
+            state.active_line_start_ms,
+            state.active_line_end_ms,
+        );
+        if state.last_readout_key != Some(rkey) {
+            state.frame_time_buf.clear();
+            let clamped = cur_ms.max(0);
+            let millis = clamped % 1_000;
+            let total_secs = clamped / 1_000;
+            let secs = total_secs % 60;
+            let total_mins = total_secs / 60;
+            let mins = total_mins % 60;
+            let hrs = total_mins / 60;
+            let _ = write!(
+                state.frame_time_buf,
+                "{hrs}:{mins:02}:{secs:02}.{millis:03} - {frame}"
+            );
+
+            let from_start = cur_ms - state.active_line_start_ms;
+            let to_end = cur_ms - state.active_line_end_ms;
+            state.offset_buf.clear();
+            let _ = write!(state.offset_buf, "{from_start:+}ms; {to_end:+}ms");
+            state.last_readout_key = Some(rkey);
+        }
         ui.add_enabled(
             false,
-            egui::TextEdit::singleline(&mut frame_time_txt)
-                .font(egui::FontId::monospace(11.0))
-                .desired_width(126.0),
+            egui::TextEdit::singleline(&mut state.frame_time_buf)
+                .font(FontId::proportional(11.0))
+                .desired_width(114.0),
         );
 
-        let from_start = cur_ms - state.active_line_start_ms;
-        let to_end = cur_ms - state.active_line_end_ms;
-        let mut offset_txt = format!("{from_start:+}ms; {to_end:+}ms");
         ui.add_enabled(
             false,
-            egui::TextEdit::singleline(&mut offset_txt)
-                .font(egui::FontId::monospace(11.0))
-                .desired_width(104.0),
+            egui::TextEdit::singleline(&mut state.offset_buf)
+                .font(FontId::proportional(11.0))
+                .desired_width(98.0),
         )
         .on_hover_text("Offset from active line start / end");
 
+        let zoom_text = if state.zoom_mode == ZoomMode::Fit {
+            std::borrow::Cow::Borrowed("Fit")
+        } else {
+            format_zoom_tenths(state.zoom_tenths)
+        };
         egui::ComboBox::from_id_salt("video_zoom_combo")
-            .width(54.0)
-            .selected_text(RichText::new(format!("{}%", state.zoom_percent)).small())
+            .width(56.0)
+            .selected_text(RichText::new(zoom_text).small())
             .show_ui(ui, |ui| {
-                for pct in [25u16, 50, 75, 100, 150, 200] {
-                    ui.selectable_value(&mut state.zoom_percent, pct, format!("{pct}%"));
+                if ui
+                    .selectable_label(state.zoom_mode == ZoomMode::Fit, "Fit")
+                    .clicked()
+                {
+                    state.zoom_mode = ZoomMode::Fit;
+                }
+                for z in [250u16, 375, 500, 750, 1000, 1500, 2000] {
+                    if ui
+                        .selectable_label(
+                            state.zoom_mode == ZoomMode::Fixed && state.zoom_tenths == z,
+                            format_zoom_tenths(z),
+                        )
+                        .clicked()
+                    {
+                        state.zoom_tenths = z;
+                        state.zoom_mode = ZoomMode::Fixed;
+                    }
                 }
             });
     });
@@ -736,7 +1001,7 @@ mod tests {
         let sup = DummySupplier::new();
         let tc = Timecodes::from_cfr(24_000, 1_001).expect("cfr");
         let mut pb = PlaybackController::new(tc, 240, vec![0, 24, 48], PlaybackConfig::default());
-        let pal = theme::palette(ThemeSpec::Dark);
+        let pal = theme::palette(ThemeSpec::Light);
         let cat = Catalog::for_locale(Locale::En);
         let fonts = ui_theme::build_font_definitions(&ui_theme::FontConfig::default());
         let mut inited = false;

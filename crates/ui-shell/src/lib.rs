@@ -76,14 +76,23 @@ pub struct AppShell {
     pub metrics: PerfMetrics,
     pub command_palette_open: bool,
     pub command_palette_query: String,
+    pub script_name: String,
     pub status_message: String,
     pub dropped_files: Vec<PathBuf>,
     pub last_autosave_ns: u64,
     pub autosave_interval_ns: u64,
     pub system_is_dark: bool,
     pub last_pane_rects: LastPaneRects,
+    /// Command IDs the shell does not handle itself (open video/audio, save, ...), drained by the
+    /// application layer every frame.
+    pub pending_commands: Vec<String>,
+    /// Last action emitted by the video panel this frame (cleared by the host after handling).
+    pub last_video_action: Option<ui_video::VideoPanelAction>,
+    /// Last action emitted by the audio panel this frame (cleared by the host after handling).
+    pub last_audio_action: Option<ui_audio::AudioPanelAction>,
     fonts_installed: bool,
     last_theme_rev: u64,
+    status_line_cache: (Option<usize>, usize, String),
 }
 
 #[derive(Clone, Copy)]
@@ -91,16 +100,31 @@ enum ToolbarIcon {
     New,
     Open,
     Save,
+    SaveAs,
+    OpenMkv,
+    OpenVideo,
+    OpenAudio,
     Undo,
     Redo,
+    Cut,
+    Copy,
+    Paste,
+    FindReplace,
     Styles,
+    StyleEditor,
     Properties,
+    Fonts,
     Resample,
     ShiftTimes,
     Tpp,
-    FindReplace,
+    SelectLines,
+    ContStart,
+    ContEnd,
+    SnapScene,
+    JumpTo,
     Karaoke,
     Doctor,
+    Hotkeys,
     Preferences,
 }
 
@@ -122,96 +146,261 @@ fn toolbar_icon_button(ui: &mut Ui, icon: ToolbarIcon, pal: &Palette, tooltip: &
             egui::StrokeKind::Inside,
         );
     }
+    let blue = egui::Color32::from_rgb(42, 120, 214);
+    let green = egui::Color32::from_rgb(38, 168, 84);
+    let red = egui::Color32::from_rgb(214, 62, 62);
+    let amber = egui::Color32::from_rgb(218, 148, 24);
+    let purple = egui::Color32::from_rgb(154, 72, 206);
+    let teal = egui::Color32::from_rgb(24, 152, 168);
     let fg = rgba(pal.text_primary);
-    let accent = rgba(pal.focus_ring);
     let st = Stroke::new(1.3, fg);
     let c = rect.center();
+
     match icon {
         ToolbarIcon::New => {
             let b = Rect::from_center_size(c, Vec2::new(10.0, 12.0));
-            p.rect_stroke(b, 1.0, st, egui::StrokeKind::Inside);
-            p.line_segment([Pos2::new(c.x, c.y - 3.0), Pos2::new(c.x, c.y + 3.0)], st);
-            p.line_segment([Pos2::new(c.x - 3.0, c.y), Pos2::new(c.x + 3.0, c.y)], st);
+            p.rect_filled(b, 1.0, egui::Color32::from_rgb(248, 250, 255));
+            p.rect_stroke(b, 1.0, Stroke::new(1.1, blue), egui::StrokeKind::Inside);
+            p.line_segment(
+                [Pos2::new(c.x, c.y - 3.0), Pos2::new(c.x, c.y + 3.0)],
+                Stroke::new(1.5, green),
+            );
+            p.line_segment(
+                [Pos2::new(c.x - 3.0, c.y), Pos2::new(c.x + 3.0, c.y)],
+                Stroke::new(1.5, green),
+            );
         }
         ToolbarIcon::Open => {
             let b = Rect::from_center_size(Pos2::new(c.x, c.y + 1.0), Vec2::new(12.0, 8.0));
-            p.rect_stroke(b, 1.0, st, egui::StrokeKind::Inside);
-            p.line_segment(
-                [
-                    Pos2::new(b.left(), b.top() - 2.0),
-                    Pos2::new(b.left() + 5.0, b.top() - 2.0),
-                ],
-                st,
-            );
+            p.rect_filled(b, 1.0, egui::Color32::from_rgb(245, 206, 98));
+            p.rect_stroke(b, 1.0, Stroke::new(1.1, amber), egui::StrokeKind::Inside);
         }
-        ToolbarIcon::Save => {
+        ToolbarIcon::Save | ToolbarIcon::SaveAs => {
             let b = Rect::from_center_size(c, Vec2::new(11.0, 11.0));
-            p.rect_stroke(b, 1.0, st, egui::StrokeKind::Inside);
+            p.rect_filled(b, 1.0, blue);
             p.rect_filled(
                 Rect::from_center_size(Pos2::new(c.x, c.y - 3.0), Vec2::new(6.0, 3.0)),
                 0.0,
-                fg,
+                egui::Color32::WHITE,
+            );
+            if matches!(icon, ToolbarIcon::SaveAs) {
+                p.circle_filled(Pos2::new(c.x + 4.5, c.y + 4.5), 2.5, amber);
+            }
+        }
+        ToolbarIcon::OpenMkv => {
+            let b = Rect::from_center_size(c, Vec2::new(12.0, 9.0));
+            p.rect_filled(b, 1.0, purple);
+            let mst = Stroke::new(1.3, egui::Color32::WHITE);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.5, c.y + 2.8),
+                    Pos2::new(c.x - 3.5, c.y - 2.8),
+                ],
+                mst,
+            );
+            p.line_segment(
+                [Pos2::new(c.x - 3.5, c.y - 2.8), Pos2::new(c.x, c.y + 0.8)],
+                mst,
+            );
+            p.line_segment(
+                [Pos2::new(c.x, c.y + 0.8), Pos2::new(c.x + 3.5, c.y - 2.8)],
+                mst,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x + 3.5, c.y - 2.8),
+                    Pos2::new(c.x + 3.5, c.y + 2.8),
+                ],
+                mst,
             );
         }
+        ToolbarIcon::OpenVideo => {
+            let b = Rect::from_center_size(c, Vec2::new(12.0, 9.0));
+            p.rect_stroke(b, 1.0, Stroke::new(1.3, blue), egui::StrokeKind::Inside);
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(c.x - 2.0, c.y - 3.0),
+                    Pos2::new(c.x + 3.5, c.y),
+                    Pos2::new(c.x - 2.0, c.y + 3.0),
+                ],
+                green,
+                Stroke::NONE,
+            ));
+        }
+        ToolbarIcon::OpenAudio => {
+            for (dx, h) in [(-4.0, 4.0), (-1.5, 9.0), (1.5, 6.0), (4.0, 8.0)] {
+                p.line_segment(
+                    [
+                        Pos2::new(c.x + dx, c.y + h * 0.5),
+                        Pos2::new(c.x + dx, c.y - h * 0.5),
+                    ],
+                    Stroke::new(1.8, teal),
+                );
+            }
+        }
         ToolbarIcon::Undo => {
-            p.line_segment([Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 4.0, c.y)], st);
+            let s = Stroke::new(1.6, blue);
+            p.line_segment([Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 4.0, c.y)], s);
             p.line_segment(
                 [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x - 1.5, c.y - 3.5)],
-                st,
+                s,
             );
             p.line_segment(
                 [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x - 1.5, c.y + 3.5)],
-                st,
+                s,
             );
         }
         ToolbarIcon::Redo => {
-            p.line_segment([Pos2::new(c.x - 4.0, c.y), Pos2::new(c.x + 5.0, c.y)], st);
+            let s = Stroke::new(1.6, blue);
+            p.line_segment([Pos2::new(c.x - 4.0, c.y), Pos2::new(c.x + 5.0, c.y)], s);
             p.line_segment(
                 [Pos2::new(c.x + 5.0, c.y), Pos2::new(c.x + 1.5, c.y - 3.5)],
-                st,
+                s,
             );
             p.line_segment(
                 [Pos2::new(c.x + 5.0, c.y), Pos2::new(c.x + 1.5, c.y + 3.5)],
-                st,
+                s,
+            );
+        }
+        ToolbarIcon::Cut => {
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 4.5, c.y - 4.5),
+                    Pos2::new(c.x + 4.5, c.y + 4.5),
+                ],
+                Stroke::new(1.4, red),
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x + 4.5, c.y - 4.5),
+                    Pos2::new(c.x - 4.5, c.y + 4.5),
+                ],
+                Stroke::new(1.4, red),
+            );
+        }
+        ToolbarIcon::Copy => {
+            p.rect_stroke(
+                Rect::from_center_size(Pos2::new(c.x - 1.5, c.y - 1.5), Vec2::new(7.0, 9.0)),
+                0.5,
+                Stroke::new(1.2, blue),
+                egui::StrokeKind::Inside,
+            );
+            p.rect_stroke(
+                Rect::from_center_size(Pos2::new(c.x + 2.0, c.y + 1.5), Vec2::new(7.0, 9.0)),
+                0.5,
+                Stroke::new(1.2, teal),
+                egui::StrokeKind::Inside,
+            );
+        }
+        ToolbarIcon::Paste => {
+            p.rect_stroke(
+                Rect::from_center_size(c, Vec2::new(9.0, 11.0)),
+                1.0,
+                Stroke::new(1.3, amber),
+                egui::StrokeKind::Inside,
+            );
+            p.rect_filled(
+                Rect::from_center_size(Pos2::new(c.x, c.y - 4.5), Vec2::new(5.0, 2.5)),
+                0.5,
+                blue,
+            );
+        }
+        ToolbarIcon::FindReplace => {
+            p.circle_stroke(Pos2::new(c.x - 1.5, c.y - 1.5), 4.0, Stroke::new(1.5, teal));
+            p.line_segment(
+                [
+                    Pos2::new(c.x + 1.5, c.y + 1.5),
+                    Pos2::new(c.x + 5.5, c.y + 5.5),
+                ],
+                Stroke::new(2.0, blue),
             );
         }
         ToolbarIcon::Styles => {
             p.line_segment(
                 [Pos2::new(c.x - 4.0, c.y + 5.0), Pos2::new(c.x, c.y - 5.0)],
-                Stroke::new(1.5, accent),
+                Stroke::new(1.8, purple),
             );
             p.line_segment(
                 [Pos2::new(c.x, c.y - 5.0), Pos2::new(c.x + 4.0, c.y + 5.0)],
-                Stroke::new(1.5, accent),
+                Stroke::new(1.8, purple),
             );
             p.line_segment(
                 [
                     Pos2::new(c.x - 2.5, c.y + 1.5),
                     Pos2::new(c.x + 2.5, c.y + 1.5),
                 ],
-                st,
+                Stroke::new(1.4, blue),
             );
         }
+        ToolbarIcon::StyleEditor => {
+            let ast = Stroke::new(1.5, purple);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 4.5, c.y + 4.0),
+                    Pos2::new(c.x - 1.5, c.y - 4.5),
+                ],
+                ast,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 1.5, c.y - 4.5),
+                    Pos2::new(c.x + 1.5, c.y + 4.0),
+                ],
+                ast,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.3, c.y + 1.0),
+                    Pos2::new(c.x + 0.3, c.y + 1.0),
+                ],
+                ast,
+            );
+            p.circle_stroke(Pos2::new(c.x + 3.5, c.y + 1.8), 2.0, Stroke::new(1.3, blue));
+        }
         ToolbarIcon::Properties => {
-            for dy in [-4.0, 0.0, 4.0] {
+            for (dy, col) in [(-4.0, blue), (0.0, teal), (4.0, amber)] {
                 p.line_segment(
                     [
                         Pos2::new(c.x - 5.0, c.y + dy),
                         Pos2::new(c.x + 5.0, c.y + dy),
                     ],
-                    st,
+                    Stroke::new(1.6, col),
                 );
             }
         }
+        ToolbarIcon::Fonts => {
+            let fst = Stroke::new(1.7, red);
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.0, c.y - 4.5),
+                    Pos2::new(c.x - 3.0, c.y + 4.5),
+                ],
+                fst,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.0, c.y - 4.5),
+                    Pos2::new(c.x + 3.5, c.y - 4.5),
+                ],
+                fst,
+            );
+            p.line_segment(
+                [
+                    Pos2::new(c.x - 3.0, c.y - 0.5),
+                    Pos2::new(c.x + 2.0, c.y - 0.5),
+                ],
+                fst,
+            );
+        }
         ToolbarIcon::Resample => {
             let b = Rect::from_center_size(c, Vec2::new(11.0, 9.0));
-            p.rect_stroke(b, 0.5, st, egui::StrokeKind::Inside);
-            p.line_segment([b.left_bottom(), b.right_top()], st);
+            p.rect_stroke(b, 0.5, Stroke::new(1.3, teal), egui::StrokeKind::Inside);
+            p.line_segment([b.left_bottom(), b.right_top()], Stroke::new(1.4, green));
         }
         ToolbarIcon::ShiftTimes => {
-            p.circle_stroke(c, 5.5, st);
-            p.line_segment([c, Pos2::new(c.x, c.y - 3.5)], st);
-            p.line_segment([c, Pos2::new(c.x + 3.0, c.y)], st);
+            p.circle_stroke(c, 5.5, Stroke::new(1.5, amber));
+            p.line_segment([c, Pos2::new(c.x, c.y - 3.5)], Stroke::new(1.4, blue));
+            p.line_segment([c, Pos2::new(c.x + 3.0, c.y)], Stroke::new(1.4, red));
         }
         ToolbarIcon::Tpp => {
             p.line_segment(
@@ -228,55 +417,115 @@ fn toolbar_icon_button(ui: &mut Ui, icon: ToolbarIcon, pal: &Palette, tooltip: &
                 ],
                 st,
             );
-            p.circle_filled(Pos2::new(c.x - 2.0, c.y - 3.0), 2.0, accent);
-            p.circle_filled(Pos2::new(c.x + 2.0, c.y + 3.0), 2.0, accent);
+            p.circle_filled(Pos2::new(c.x - 2.0, c.y - 3.0), 2.2, green);
+            p.circle_filled(Pos2::new(c.x + 2.0, c.y + 3.0), 2.2, blue);
         }
-        ToolbarIcon::FindReplace => {
-            p.circle_stroke(Pos2::new(c.x - 1.5, c.y - 1.5), 4.0, st);
+        ToolbarIcon::SelectLines => {
+            for dy in [-3.5, 0.0, 3.5] {
+                p.line_segment(
+                    [
+                        Pos2::new(c.x - 5.0, c.y + dy),
+                        Pos2::new(c.x + 5.0, c.y + dy),
+                    ],
+                    Stroke::new(1.5, blue),
+                );
+            }
+        }
+        ToolbarIcon::ContStart => {
             p.line_segment(
                 [
-                    Pos2::new(c.x + 1.5, c.y + 1.5),
-                    Pos2::new(c.x + 5.5, c.y + 5.5),
+                    Pos2::new(c.x - 4.0, c.y - 4.0),
+                    Pos2::new(c.x - 4.0, c.y + 4.0),
                 ],
-                Stroke::new(1.8, fg),
+                Stroke::new(1.8, red),
+            );
+            p.line_segment(
+                [Pos2::new(c.x - 2.0, c.y), Pos2::new(c.x + 5.0, c.y)],
+                Stroke::new(1.5, blue),
+            );
+        }
+        ToolbarIcon::ContEnd => {
+            p.line_segment(
+                [
+                    Pos2::new(c.x + 4.0, c.y - 4.0),
+                    Pos2::new(c.x + 4.0, c.y + 4.0),
+                ],
+                Stroke::new(1.8, red),
+            );
+            p.line_segment(
+                [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 2.0, c.y)],
+                Stroke::new(1.5, blue),
+            );
+        }
+        ToolbarIcon::SnapScene => {
+            p.line_segment(
+                [Pos2::new(c.x, c.y - 5.5), Pos2::new(c.x, c.y + 5.5)],
+                Stroke::new(1.8, purple),
+            );
+            p.circle_filled(c, 2.2, amber);
+        }
+        ToolbarIcon::JumpTo => {
+            p.line_segment(
+                [Pos2::new(c.x - 5.0, c.y), Pos2::new(c.x + 4.0, c.y)],
+                Stroke::new(1.6, green),
+            );
+            p.line_segment(
+                [Pos2::new(c.x + 4.0, c.y), Pos2::new(c.x + 1.0, c.y - 3.5)],
+                Stroke::new(1.6, green),
+            );
+            p.line_segment(
+                [Pos2::new(c.x + 4.0, c.y), Pos2::new(c.x + 1.0, c.y + 3.5)],
+                Stroke::new(1.6, green),
             );
         }
         ToolbarIcon::Karaoke => {
-            p.circle_filled(Pos2::new(c.x - 2.5, c.y + 3.5), 2.3, accent);
+            p.circle_filled(Pos2::new(c.x - 2.5, c.y + 3.5), 2.4, purple);
             p.line_segment(
                 [
                     Pos2::new(c.x - 0.5, c.y + 3.0),
                     Pos2::new(c.x - 0.5, c.y - 5.0),
                 ],
-                Stroke::new(1.5, accent),
+                Stroke::new(1.6, purple),
             );
             p.line_segment(
                 [
                     Pos2::new(c.x - 0.5, c.y - 5.0),
                     Pos2::new(c.x + 4.5, c.y - 3.0),
                 ],
-                Stroke::new(1.5, accent),
+                Stroke::new(1.6, purple),
             );
         }
         ToolbarIcon::Doctor => {
             p.rect_stroke(
                 Rect::from_center_size(c, Vec2::new(11.0, 11.0)),
                 2.0,
-                st,
+                Stroke::new(1.2, green),
                 egui::StrokeKind::Inside,
             );
             p.line_segment(
                 [Pos2::new(c.x, c.y - 3.5), Pos2::new(c.x, c.y + 3.5)],
-                Stroke::new(1.8, egui::Color32::from_rgb(46, 170, 92)),
+                Stroke::new(2.0, green),
             );
             p.line_segment(
                 [Pos2::new(c.x - 3.5, c.y), Pos2::new(c.x + 3.5, c.y)],
-                Stroke::new(1.8, egui::Color32::from_rgb(46, 170, 92)),
+                Stroke::new(2.0, green),
+            );
+        }
+        ToolbarIcon::Hotkeys => {
+            p.rect_stroke(
+                Rect::from_center_size(c, Vec2::new(12.0, 8.0)),
+                1.5,
+                Stroke::new(1.3, blue),
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment(
+                [Pos2::new(c.x - 3.5, c.y), Pos2::new(c.x + 3.5, c.y)],
+                Stroke::new(1.2, amber),
             );
         }
         ToolbarIcon::Preferences => {
-            p.circle_stroke(c, 4.5, st);
-            p.circle_filled(c, 1.8, fg);
+            p.circle_stroke(c, 4.5, Stroke::new(1.6, blue));
+            p.circle_filled(c, 2.0, amber);
         }
     }
     resp.on_hover_text(tooltip).clicked()
@@ -314,14 +563,29 @@ impl AppShell {
             metrics: PerfMetrics::default(),
             command_palette_open: false,
             command_palette_query: String::new(),
-            status_message: "Ready".to_owned(),
+            script_name: "Untitled.ass".to_owned(),
+            status_message: String::new(),
             dropped_files: Vec::new(),
             last_autosave_ns: 0,
             autosave_interval_ns: 60_000_000_000,
             system_is_dark: true,
             last_pane_rects: LastPaneRects::default(),
+            pending_commands: Vec::new(),
+            last_video_action: None,
+            last_audio_action: None,
             fonts_installed: false,
             last_theme_rev: 0,
+            status_line_cache: (None, usize::MAX, String::with_capacity(32)),
+        }
+    }
+
+    /// Returns the window title (`"<script name> - hlouis-sub-edit"`, prefixed with `"*"` when modified).
+    #[must_use]
+    pub fn window_title(&self) -> String {
+        if self.doc.is_dirty() {
+            format!("*{} - hlouis-sub-edit", self.script_name)
+        } else {
+            format!("{} - hlouis-sub-edit", self.script_name)
         }
     }
 
@@ -454,6 +718,7 @@ impl AppShell {
             }
             _ => {
                 self.status_message = format!("Command: {cmd_id}");
+                self.pending_commands.push(cmd_id.to_owned());
             }
         }
     }
@@ -622,9 +887,16 @@ impl AppShell {
                         ui.close();
                     }
                     ui.separator();
-                    for pct in [50u16, 100, 150, 200] {
-                        if ui.button(format!("Zoom {pct}%")).clicked() {
-                            self.video.zoom_percent = pct;
+                    for (tenths, label) in [
+                        (375u16, "37.5%"),
+                        (500, "50%"),
+                        (1000, "100%"),
+                        (1500, "150%"),
+                        (2000, "200%"),
+                    ] {
+                        if ui.button(format!("Zoom {label}")).clicked() {
+                            self.video.zoom_tenths = tenths;
+                            self.video.zoom_mode = ui_video::ZoomMode::Fixed;
                             ui.close();
                         }
                     }
@@ -751,18 +1023,37 @@ impl AppShell {
             });
         });
 
-        // 1b. Classic Aegisub 3.2.2 single-row 16×16 vector icon toolbar + compact quick toggles.
+        // 1b. Aegisub 3.5.1 default toolbar (29 coloured 16×16 icons, grouped by separators;
+        //     NO theme or EN/VI toggles in the toolbar — those live in View menu & Preferences).
         Panel::top("hlouis_toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if toolbar_icon_button(ui, ToolbarIcon::New, &pal, "New subtitles") {
+                ui.spacing_mut().item_spacing.x = 1.5;
+                if toolbar_icon_button(ui, ToolbarIcon::New, &pal, "New subtitles (Ctrl+N)") {
                     self.execute_command("subtitle/new");
                 }
-                if toolbar_icon_button(ui, ToolbarIcon::Open, &pal, "Open subtitles from MKV") {
+                if toolbar_icon_button(ui, ToolbarIcon::Open, &pal, "Open subtitles (Ctrl+O)") {
+                    self.execute_command("subtitle/open");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Save, &pal, "Save subtitles (Ctrl+S)") {
+                    self.execute_command("subtitle/save");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::SaveAs, &pal, "Save subtitles as...") {
+                    self.execute_command("subtitle/save/as");
+                }
+                ui.separator();
+                if toolbar_icon_button(
+                    ui,
+                    ToolbarIcon::OpenMkv,
+                    &pal,
+                    "Open subtitles from video (MKV)",
+                ) {
                     self.execute_command("subtitle/open/video");
                 }
-                if toolbar_icon_button(ui, ToolbarIcon::Save, &pal, "Save subtitles") {
-                    self.execute_command("subtitle/save");
+                if toolbar_icon_button(ui, ToolbarIcon::OpenVideo, &pal, "Open video") {
+                    self.execute_command("video/open");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::OpenAudio, &pal, "Open audio") {
+                    self.execute_command("audio/open");
                 }
                 ui.separator();
                 if toolbar_icon_button(ui, ToolbarIcon::Undo, &pal, "Undo (Ctrl+Z)") {
@@ -772,24 +1063,71 @@ impl AppShell {
                     self.execute_command("edit/redo");
                 }
                 ui.separator();
+                if toolbar_icon_button(ui, ToolbarIcon::Cut, &pal, "Cut lines") {
+                    self.execute_command("edit/line/cut");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Copy, &pal, "Copy lines") {
+                    self.execute_command("edit/line/copy");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Paste, &pal, "Paste lines") {
+                    self.execute_command("edit/line/paste");
+                }
+                if toolbar_icon_button(
+                    ui,
+                    ToolbarIcon::FindReplace,
+                    &pal,
+                    "Find and Replace (Ctrl+H)",
+                ) {
+                    self.execute_command("edit/find_replace");
+                }
+                ui.separator();
                 if toolbar_icon_button(ui, ToolbarIcon::Styles, &pal, "Styles Manager") {
                     self.execute_command("tool/styles_manager");
                 }
+                if toolbar_icon_button(ui, ToolbarIcon::StyleEditor, &pal, "Edit active style") {
+                    self.execute_command("tool/style_editor");
+                }
                 if toolbar_icon_button(ui, ToolbarIcon::Properties, &pal, "Script Properties") {
                     self.execute_command("subtitle/properties");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::Fonts, &pal, "Fonts Collector") {
+                    self.execute_command("tool/fonts_collector");
                 }
                 if toolbar_icon_button(ui, ToolbarIcon::Resample, &pal, "Resample Resolution") {
                     self.execute_command("tool/resample");
                 }
                 ui.separator();
-                if toolbar_icon_button(ui, ToolbarIcon::ShiftTimes, &pal, "Shift Times") {
+                if toolbar_icon_button(ui, ToolbarIcon::ShiftTimes, &pal, "Shift Times (Ctrl+I)") {
                     self.execute_command("time/shift");
                 }
                 if toolbar_icon_button(ui, ToolbarIcon::Tpp, &pal, "Timing Post-Processor") {
                     self.execute_command("tool/timing_processor");
                 }
-                if toolbar_icon_button(ui, ToolbarIcon::FindReplace, &pal, "Find and Replace") {
-                    self.execute_command("edit/find_replace");
+                if toolbar_icon_button(ui, ToolbarIcon::SelectLines, &pal, "Select Lines") {
+                    self.execute_command("tool/line/select");
+                }
+                if toolbar_icon_button(
+                    ui,
+                    ToolbarIcon::ContStart,
+                    &pal,
+                    "Make Times Continuous (Start)",
+                ) {
+                    self.execute_command("time/continuous/start");
+                }
+                if toolbar_icon_button(
+                    ui,
+                    ToolbarIcon::ContEnd,
+                    &pal,
+                    "Make Times Continuous (End)",
+                ) {
+                    self.execute_command("time/continuous/end");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::SnapScene, &pal, "Snap to Scene") {
+                    self.execute_command("time/snap/scene");
+                }
+                if toolbar_icon_button(ui, ToolbarIcon::JumpTo, &pal, "Jump to frame/time (Ctrl+G)")
+                {
+                    self.execute_command("video/jump");
                 }
                 ui.separator();
                 if toolbar_icon_button(ui, ToolbarIcon::Karaoke, &pal, "Apply Karaoke Template") {
@@ -798,86 +1136,56 @@ impl AppShell {
                 if toolbar_icon_button(ui, ToolbarIcon::Doctor, &pal, "Template Doctor") {
                     self.execute_command("automation/template_doctor");
                 }
+                ui.separator();
+                if toolbar_icon_button(ui, ToolbarIcon::Hotkeys, &pal, "Hotkeys Editor") {
+                    self.execute_command("app/hotkeys");
+                }
                 if toolbar_icon_button(ui, ToolbarIcon::Preferences, &pal, "Preferences") {
                     self.execute_command("app/options");
                 }
+            });
+        });
 
-                // Right-aligned compact quick theme & language switchers.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .selectable_label(self.catalog.locale() == Locale::Vi, "VI")
-                        .clicked()
-                    {
-                        self.set_locale(Locale::Vi);
+        // 2. Compact Aegisub-style status bar (empty left area + right info; no "Ready" label).
+        Panel::bottom("hlouis_statusbar")
+            .exact_size(19.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if !self.status_message.is_empty() {
+                        ui.small(&self.status_message);
                     }
-                    if ui
-                        .selectable_label(self.catalog.locale() == Locale::En, "EN")
-                        .clicked()
-                    {
-                        self.set_locale(Locale::En);
-                    }
-                    ui.separator();
-                    let cur_spec = self.theme.spec();
-                    let is_ec = matches!(cur_spec, ThemeSpec::EyeComfort { .. });
-                    if is_ec {
-                        let mut strength = self.settings.appearance.eye_comfort_strength;
-                        ui.spacing_mut().slider_width = 64.0;
-                        if ui
-                            .add(egui::Slider::new(&mut strength, 0..=100).suffix("%"))
-                            .changed()
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let total = self.grid.model.row_count();
+                        let active_opt = self.doc.active_line();
+                        if self.status_line_cache.0 != active_opt
+                            || self.status_line_cache.1 != total
                         {
-                            self.settings.appearance.eye_comfort_strength = strength;
-                            self.set_theme(ThemeSpec::EyeComfort {
-                                base: BaseTheme::Dark,
-                                strength,
-                            });
+                            self.status_line_cache.0 = active_opt;
+                            self.status_line_cache.1 = total;
+                            self.status_line_cache.2.clear();
+                            let active = active_opt.map_or(0, |i| i + 1);
+                            let _ = std::fmt::Write::write_fmt(
+                                &mut self.status_line_cache.2,
+                                format_args!("Line {active} / {total}"),
+                            );
                         }
-                    }
-                    if ui.selectable_label(is_ec, "Eye").clicked() {
-                        self.set_theme(ThemeSpec::EyeComfort {
-                            base: BaseTheme::Dark,
-                            strength: self.settings.appearance.eye_comfort_strength,
-                        });
-                    }
-                    if ui
-                        .selectable_label(matches!(cur_spec, ThemeSpec::Dark), "Dark")
-                        .clicked()
-                    {
-                        self.set_theme(ThemeSpec::Dark);
-                    }
-                    if ui
-                        .selectable_label(matches!(cur_spec, ThemeSpec::Light), "Light")
-                        .clicked()
-                    {
-                        self.set_theme(ThemeSpec::Light);
-                    }
+                        ui.small(self.status_line_cache.2.as_str());
+                        if self.doc.is_dirty() {
+                            ui.separator();
+                            ui.small(self.catalog.get("status-unsaved").unwrap_or("Modified"));
+                        }
+                        if self.settings.appearance.show_performance_overlay {
+                            ui.separator();
+                            ui.monospace(format!(
+                                "p50={}us p95={}us worst={}us",
+                                self.metrics.frame_time.p50(),
+                                self.metrics.frame_time.p95(),
+                                self.metrics.frame_time.worst()
+                            ));
+                        }
+                    });
                 });
             });
-        });
-
-        // 2. Bottom status bar.
-        Panel::bottom("hlouis_statusbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status_message);
-                ui.separator();
-                let total = self.grid.model.row_count();
-                let active = self.doc.active_line().map_or(0, |i| i + 1);
-                ui.label(format!("Line {active} / {total}"));
-                if self.doc.is_dirty() {
-                    ui.separator();
-                    ui.label(self.catalog.get("status-unsaved").unwrap_or("Modified"));
-                }
-                if self.settings.appearance.show_performance_overlay {
-                    ui.separator();
-                    ui.monospace(format!(
-                        "p50={}us p95={}us worst={}us",
-                        self.metrics.frame_time.p50(),
-                        self.metrics.frame_time.p95(),
-                        self.metrics.frame_time.worst()
-                    ));
-                }
-            });
-        });
 
         // 3. Central Aegisub 3.2.2 workspace layout (computed directly in logical points — zero
         //    double-DPI division at 200% scaling!).
@@ -906,7 +1214,7 @@ impl AppShell {
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(vr));
                     child.set_clip_rect(vr);
                     if let (Some(vs), Some(pb)) = (video_supplier, self.playback.as_mut()) {
-                        let _ = show_video_panel(
+                        self.last_video_action = show_video_panel(
                             &mut child,
                             &mut self.video,
                             vs,
@@ -938,7 +1246,7 @@ impl AppShell {
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ar));
                     child.set_clip_rect(ar);
                     if let Some(ap) = audio_provider {
-                        let _ = show_audio_panel(
+                        self.last_audio_action = show_audio_panel(
                             &mut child,
                             &mut self.audio,
                             ap,
@@ -1167,6 +1475,7 @@ impl AppShell {
             match mkv_action {
                 MkvImportAction::ImportSelected { track_numbers, .. } => {
                     self.status_message = format!("Imported {} MKV track(s)", track_numbers.len());
+                    self.pending_commands.push("mkv/import".to_owned());
                     self.dialogs.open = None;
                 }
                 MkvImportAction::Close => {
@@ -1424,14 +1733,18 @@ mod tests {
             });
         harness.run();
 
-        // Click "Light" and "VI" buttons in the toolbar.
-        harness.get_by_label("Light").click();
+        // Verify Light/VI are NOT in the toolbar (they live in View menu & Preferences).
+        assert!(harness.query_by_label("Light").is_none());
+        assert!(harness.query_by_label("VI").is_none());
+
+        // Open View menu and verify menu is interactive.
+        harness.get_by_label("View").click();
         harness.run();
-        harness.get_by_label("VI").click();
-        harness.run();
+        assert!(harness.query_by_label("Theme").is_some());
+        assert!(harness.query_by_label("Language").is_some());
 
         let (spec, loc) = state_check.get();
-        assert_eq!(spec, ThemeSpec::Light);
-        assert_eq!(loc, Locale::Vi);
+        assert_eq!(spec, ThemeSpec::Dark);
+        assert_eq!(loc, Locale::En);
     }
 }

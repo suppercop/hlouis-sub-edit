@@ -254,6 +254,80 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
+name = "app-core"
+version = "0.1.0"
+dependencies = [
+ "aegisub-config",
+ "ass-core",
+ "ass-tools",
+ "audio-peaks",
+ "audio-view",
+ "autosave",
+ "commands",
+ "dialogs-model",
+ "document",
+ "edit-ops",
+ "eframe",
+ "egui",
+ "egui_kittest",
+ "golden-tools",
+ "hlouis-tools",
+ "hound",
+ "i18n-catalog",
+ "kara-templater",
+ "karaoke-timing",
+ "karaskel",
+ "keyframes",
+ "layout",
+ "mkv-import",
+ "mkv-subs",
+ "perf-metrics",
+ "playback",
+ "png 0.17.16",
+ "settings",
+ "tempfile",
+ "template-doctor",
+ "theme",
+ "thiserror 2.0.21",
+ "timing-controller",
+ "ui-audio",
+ "ui-dialogs",
+ "ui-editbox",
+ "ui-grid",
+ "ui-mkv-import",
+ "ui-preferences",
+ "ui-shell",
+ "ui-theme",
+ "ui-video",
+]
+
+[[package]]
+name = "app-native"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "app-core",
+ "ass-core",
+ "audio-cache",
+ "audio-out",
+ "audio-peaks",
+ "egui",
+ "egui_kittest",
+ "fonts",
+ "fonts-dwrite",
+ "keyframes",
+ "media",
+ "playback",
+ "render",
+ "rfd",
+ "spectrum",
+ "tempfile",
+ "theme",
+ "ui-audio",
+ "ui-video",
+]
+
+[[package]]
 name = "app-services"
 version = "0.1.0"
 dependencies = [
@@ -2245,6 +2319,8 @@ name = "hlouis-sub-edit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "app-core",
+ "app-native",
  "ass-core",
  "criterion",
  "dark-light",
@@ -2254,7 +2330,9 @@ dependencies = [
  "egui_extras",
  "fluent",
  "i18n",
+ "layout",
  "media",
+ "playback",
  "render",
  "rfd",
  "settings",
@@ -2270,6 +2348,12 @@ dependencies = [
  "ass-tools",
  "criterion",
 ]
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "i18n"
@@ -5143,7 +5227,6 @@ dependencies = [
  "commands",
  "criterion",
  "document",
- "eframe",
  "egui",
  "egui_kittest",
  "hlouis-tools",
@@ -5154,7 +5237,6 @@ dependencies = [
  "mkv-subs",
  "perf-metrics",
  "playback",
- "png 0.17.16",
  "settings",
  "template-doctor",
  "theme",

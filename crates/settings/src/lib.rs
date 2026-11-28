@@ -104,10 +104,13 @@ pub struct InterfacePrefs {
     pub show_video: bool,
     pub show_audio: bool,
     pub hide_overrides_mode: u8,
+    pub show_col_layer: bool,
     pub show_col_actor: bool,
     pub show_col_effect: bool,
     pub show_col_margins: bool,
     pub show_col_cps: bool,
+    pub grid_header_color: Option<[u8; 4]>,
+    pub grid_line_num_color: Option<[u8; 4]>,
 }
 
 impl Default for InterfacePrefs {
@@ -117,10 +120,13 @@ impl Default for InterfacePrefs {
             show_video: true,
             show_audio: true,
             hide_overrides_mode: 1,
+            show_col_layer: false,
             show_col_actor: false,
             show_col_effect: false,
             show_col_margins: false,
             show_col_cps: true,
+            grid_header_color: Some([165, 207, 231, 255]),
+            grid_line_num_color: Some([196, 236, 201, 255]),
         }
     }
 }
@@ -447,9 +453,15 @@ impl AppSettings {
         self.appearance.grid_font_size = imported.grid.font_size;
         self.interface.hide_overrides_mode =
             u8::try_from(imported.grid.hide_overrides_mode.clamp(0, 2)).unwrap_or(1);
+        self.interface.show_col_layer = imported.grid.columns.layer;
         self.interface.show_col_actor = imported.grid.columns.actor;
         self.interface.show_col_effect = imported.grid.columns.effect;
+        self.interface.show_col_margins = imported.grid.columns.margin_l
+            || imported.grid.columns.margin_r
+            || imported.grid.columns.margin_v;
         self.interface.show_col_cps = imported.grid.columns.cps;
+        let hc = imported.colors.header;
+        self.interface.grid_header_color = Some([hc.r, hc.g, hc.b, hc.a]);
         self.audio.spectrum = imported.audio.spectrum;
         self.audio.lead_in_ms = imported.audio.lead_in_ms;
         self.audio.lead_out_ms = imported.audio.lead_out_ms;

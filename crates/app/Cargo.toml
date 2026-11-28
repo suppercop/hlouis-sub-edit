@@ -6,7 +6,11 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+app-core = { path = "../app-core" }
+app-native = { path = "../app-native" }
 ass-core = { path = "../ass-core" }
+layout = { path = "../layout" }
+playback = { path = "../playback" }
 dark-light.workspace = true
 eframe.workspace = true
 egui.workspace = true
@@ -30,6 +34,11 @@ bench = false
 [[bin]]
 name = "hlouis-sub-edit"
 path = "src/main.rs"
+bench = false
+
+[[bin]]
+name = "hlouis-spike"
+path = "src/spike.rs"
 bench = false
 
 [[bench]]
