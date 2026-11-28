@@ -614,7 +614,7 @@ impl EditorApp {
                     && !playing
                     && let Some(pb) = self.shell.playback.as_mut()
                 {
-                    pb.seek_time_ms(s);
+                    pb.seek_line_start(s);
                 }
             }
         }

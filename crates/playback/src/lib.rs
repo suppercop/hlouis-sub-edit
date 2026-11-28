@@ -578,4 +578,23 @@ mod tests {
         assert_eq!(d_scrub.current_frame, 109);
         assert!(d_scrub.present_frame);
     }
+
+    #[test]
+    fn seek_line_start_lands_on_first_frame_at_or_after_start_23_976() {
+        let tc = Timecodes::from_cfr(24_000, 1_001).expect("cfr");
+        let mut pb = PlaybackController::new(tc.clone(), 5_000, vec![0], PlaybackConfig::default());
+        // 57.90 s is inside frame 1388 (57.891 s); the line first shows on frame 1389.
+        pb.seek_line_start(57_900);
+        assert_eq!(pb.current_frame(), 1_389);
+        assert!(pb.current_time_ms() >= 57_900);
+        // The old behaviour (exact frame containing the time) is one frame early.
+        pb.seek_time_ms(57_900);
+        assert_eq!(pb.current_frame(), 1_388);
+        // A start exactly on a frame boundary keeps that frame; line start 0 is frame 0.
+        let boundary = tc.frame_to_time_ms(1_389, TimeType::Exact);
+        pb.seek_line_start(boundary);
+        assert_eq!(pb.current_frame(), 1_389);
+        pb.seek_line_start(0);
+        assert_eq!(pb.current_frame(), 0);
+    }
 }
