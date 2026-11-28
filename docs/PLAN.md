@@ -34,9 +34,10 @@ Aegisub 3.5.1 "Open Subtitles from Video" silently returns an empty script for M
 
 ## UI direction (owner preference)
 The owner prefers the **classic Aegisub 3.2.2 look and layout** over the 3.4/3.5 UI, and has tuned their own Aegisub 3.5.1 to look like 3.2.2. Use that as the reference: same panel arrangement (video top-left, audio top-right, edit box under audio, grid at the bottom), compact toolbar, classic grid/edit-box density and colours as the Light theme default. New features (pan/zoom, new audio marker, dark theme) are added without changing that layout. The owner's Aegisub config and hotkeys (%APPDATA%\Aegisub\config.json, hotkey.json) are the reference for default layout options and hotkeys; import them where they map.
+- **Spell check, attachments, encoding choice:** Spell check (Hunspell-compatible, bundled vi + en dictionaries, Vietnamese tone-mark style: traditional hòa/thủy by default, modern or both selectable), attachments manager ([Fonts]/[Graphics] attach/extract/delete, undoable), choose-encoding prompt when charset detection is unsure (owner decision 2026-11-28).
 
 ## Out of scope
-SSA, TTXT, MicroDVD, plain text, EBU STL, Encore, Transtation; open-with-charset; recent files; Export As filters; attachments manager; VSFilter; spell check, thesaurus, translation assistant; Kanji timer; MoonScript, automation manager, macro menu, Lua export filters, `aegisub.*` macro API, DependencyControl; font copy/zip; other UI languages; line folding; perspective tool; Linux/macOS.
+SSA, TTXT, MicroDVD, plain text, EBU STL, Encore, Transtation; recent files; Export As filters; VSFilter; thesaurus, translation assistant; Kanji timer; MoonScript, automation manager, macro menu, Lua export filters, `aegisub.*` macro API, DependencyControl; font copy/zip; other UI languages; line folding; perspective tool; Linux/macOS.
 
 ## Phases
 0. Spike & foundation (2–3 w) — see `docs/phase-0.md`
