@@ -104,6 +104,8 @@ pub struct AppShell {
     pub last_audio_action: Option<ui_audio::AudioPanelAction>,
     fonts_installed: bool,
     last_theme_rev: u64,
+    cached_active_timing: Option<(u64, usize, i64, i64)>,
+    active_timing_lookups: u64,
     status_line_cache: (Option<usize>, usize, String),
 }
 
@@ -588,8 +590,16 @@ impl AppShell {
             last_audio_action: None,
             fonts_installed: false,
             last_theme_rev: 0,
+            cached_active_timing: None,
+            active_timing_lookups: 0,
             status_line_cache: (None, usize::MAX, String::with_capacity(32)),
         }
+    }
+
+    /// Number of times active-line start/end timings were queried from the script.
+    #[must_use]
+    pub const fn active_timing_lookups(&self) -> u64 {
+        self.active_timing_lookups
     }
 
     /// Returns the window title (`"<script name> - hlouis-sub-edit"`, prefixed with `"*"` when modified).
@@ -792,16 +802,35 @@ impl AppShell {
             ctx.request_repaint();
         }
 
-        // Sync active line start/end to video panel offset display.
-        if let Some(active) = self.doc.active_line()
-            && let Some(ev) = self
-                .doc
-                .script()
-                .events_section()
-                .and_then(|s| s.get_event(active))
-        {
-            self.video.active_line_start_ms = i64::from(ev.start().as_cs()) * 10;
-            self.video.active_line_end_ms = i64::from(ev.end().as_cs()) * 10;
+        // Sync active line start/end to video panel offset display (cached by non-text revision
+        // and active line so idle frames and same-line text amends avoid scanning the script).
+        if let Some(active) = self.doc.active_line() {
+            let non_text_rev = self.doc.non_text_revision();
+            match self.cached_active_timing {
+                Some((rev, idx, start_ms, end_ms)) if rev == non_text_rev && idx == active => {
+                    self.video.active_line_start_ms = start_ms;
+                    self.video.active_line_end_ms = end_ms;
+                }
+                _ => {
+                    self.active_timing_lookups = self.active_timing_lookups.saturating_add(1);
+                    if let Some(ev) = self
+                        .doc
+                        .script()
+                        .events_section()
+                        .and_then(|s| s.get_event(active))
+                    {
+                        let start_ms = i64::from(ev.start().as_cs()) * 10;
+                        let end_ms = i64::from(ev.end().as_cs()) * 10;
+                        self.video.active_line_start_ms = start_ms;
+                        self.video.active_line_end_ms = end_ms;
+                        self.cached_active_timing = Some((non_text_rev, active, start_ms, end_ms));
+                    } else {
+                        self.cached_active_timing = None;
+                    }
+                }
+            }
+        } else {
+            self.cached_active_timing = None;
         }
 
         let pal = self.theme.palette().clone();
@@ -1864,5 +1893,67 @@ mod tests {
                 assert!(off_x < 0.5 && off_y < 0.5, "{label}: bars not symmetric");
             }
         }
+    }
+
+    #[test]
+    fn shell_active_timing_cache_skips_idle_and_text_amend_and_refreshes_on_change() {
+        let mut script = ScriptFile::new_default();
+        let sec = script.ensure_events_section_mut();
+        sec.insert_event(
+            0,
+            AssEvent::dialogue(AssTime::from_cs(100), AssTime::from_cs(300), "Line 0"),
+        );
+        sec.insert_event(
+            1,
+            AssEvent::dialogue(AssTime::from_cs(400), AssTime::from_cs(600), "Line 1"),
+        );
+        let mut shell = AppShell::new(script);
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+            ..Default::default()
+        };
+
+        let run_frame = |shell: &mut AppShell, input: egui::RawInput| {
+            let mut out = ctx.run_ui(input, |ui| shell.show(ui, None, None, &ZeroClock));
+            out.textures_delta.clear();
+        };
+
+        // First frame queries event 0 once.
+        run_frame(&mut shell, raw.clone());
+        assert_eq!(shell.active_timing_lookups(), 1);
+        assert_eq!(shell.video.active_line_start_ms, 1_000);
+
+        // Idle frames and same-line text amends do not re-query event 0.
+        for _ in 0..3 {
+            run_frame(&mut shell, raw.clone());
+        }
+        shell
+            .doc
+            .amend_text(0, "typing", "Line 0 edited")
+            .expect("amend text");
+        run_frame(&mut shell, raw.clone());
+        assert_eq!(shell.active_timing_lookups(), 1);
+
+        // Timing change refreshes cache.
+        shell
+            .doc
+            .amend_time(0, false, "timing", AssTime::from_cs(150))
+            .expect("amend time");
+        run_frame(&mut shell, raw.clone());
+        assert_eq!(shell.active_timing_lookups(), 2);
+        assert_eq!(shell.video.active_line_start_ms, 1_500);
+
+        // Undo refreshes cache back to original start time.
+        shell.doc.undo().expect("undo");
+        run_frame(&mut shell, raw.clone());
+        assert_eq!(shell.active_timing_lookups(), 3);
+        assert_eq!(shell.video.active_line_start_ms, 1_000);
+
+        // Switching active line refreshes cache for line 1.
+        shell.doc.set_selection(Some(1), &[1]);
+        run_frame(&mut shell, raw);
+        assert_eq!(shell.active_timing_lookups(), 4);
+        assert_eq!(shell.video.active_line_start_ms, 4_000);
     }
 }

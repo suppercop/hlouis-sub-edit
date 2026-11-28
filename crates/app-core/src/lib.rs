@@ -696,13 +696,9 @@ impl EditorApp {
 
     /// Runs `ass_tools::resample_resolution` and updates the document.
     pub fn apply_resample(&mut self, opts: &ResampleOptions) -> Result<(), AppError> {
-        let mut clone = self.shell.doc.script().clone();
-        let cmd = resample_resolution(&clone, opts).map_err(|e| AppError::Edit(e.to_string()))?;
-        cmd.apply(&mut clone)
-            .map_err(|e| AppError::Document(e.to_string()))?;
-        self.shell.doc = DocumentController::new(clone);
-        self.sync_ui_from_doc();
-        Ok(())
+        let cmd = resample_resolution(self.shell.doc.script(), opts)
+            .map_err(|e| AppError::Edit(e.to_string()))?;
+        self.commit_and_sync("resample resolution", cmd, CommitType::EVERYTHING)
     }
 
     fn commit_and_sync(
@@ -881,53 +877,60 @@ fn parse_srt_ts(raw: &str) -> Option<AssTime> {
 #[must_use]
 pub fn build_demo_script(line_count: usize) -> ScriptFile {
     let header = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\nStyle: Sign,Arial,42,&H00FFE080,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1\nStyle: Romaji,Arial,44,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,8,10,10,10,1\nStyle: Translation,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
-    let mut script = parse_ass(header).value;
-    let sec = script.ensure_events_section_mut();
+    let mut buf = String::with_capacity(header.len() + line_count.saturating_mul(112));
+    buf.push_str(header);
     for i in 0..line_count {
         #[allow(clippy::cast_possible_truncation)]
-        let s = (i as u32) * 5;
-        let mut ev = match i % 20 {
-            0 => {
-                let mut e = AssEvent::dialogue(
-                    AssTime::from_cs(s),
-                    AssTime::from_cs(s + 180),
-                    r"{\an8\pos(960,80)\blur2}Typeset sign / Tiêu đề cảnh",
-                );
-                e.set_style("Sign");
-                e
-            }
-            5 => {
-                let mut e = AssEvent::dialogue(
-                    AssTime::from_cs(s),
-                    AssTime::from_cs(s + 240),
-                    r"{\k40}Yu{\k50}me {\k60}no {\k90}tsuzuki",
-                );
-                e.set_style("Romaji");
-                e.set_effect("karaoke");
-                e
-            }
-            10 => {
-                let mut e = AssEvent::dialogue(
-                    AssTime::from_cs(s),
-                    AssTime::from_cs(s + 100),
-                    "QC note: kiểm tra lại tên riêng nhân vật",
-                );
-                e.set_kind(EventKind::Comment);
-                e.set_style("Translation");
-                e
-            }
-            _ => AssEvent::dialogue(
-                AssTime::from_cs(s),
-                AssTime::from_cs(s + 120),
+        let s = (i as u32).saturating_mul(5);
+        let start = AssTime::from_cs(s);
+        let (prefix, dur_cs, style, effect, text) = match i % 20 {
+            0 => (
+                "Dialogue: 0,",
+                180u32,
+                "Sign",
+                "",
+                r"{\an8\pos(960,80)\blur2}Typeset sign / Tiêu đề cảnh",
+            ),
+            5 => (
+                "Dialogue: 0,",
+                240u32,
+                "Romaji",
+                "karaoke",
+                r"{\k40}Yu{\k50}me {\k60}no {\k90}tsuzuki",
+            ),
+            10 => (
+                "Comment: 0,",
+                100u32,
+                "Translation",
+                "",
+                "QC note: kiểm tra lại tên riêng nhân vật",
+            ),
+            _ => (
+                "Dialogue: 0,",
+                120u32,
+                if i % 10 == 3 {
+                    "Translation"
+                } else {
+                    "Default"
+                },
+                "",
                 r"{\i1}Sample subtitle dialogue line\NPhụ đề tiếng Việt",
             ),
         };
-        if i % 10 == 3 {
-            ev.set_style("Translation");
-        }
-        sec.insert_event(i, ev);
+        let end = AssTime::from_cs(s.saturating_add(dur_cs));
+        buf.push_str(prefix);
+        start.write_ass(&mut buf);
+        buf.push(',');
+        end.write_ass(&mut buf);
+        buf.push(',');
+        buf.push_str(style);
+        buf.push_str(",,0,0,0,");
+        buf.push_str(effect);
+        buf.push(',');
+        buf.push_str(text);
+        buf.push('\n');
     }
-    script
+    parse_ass(&buf).value
 }
 
 /// Populates `HLouis` style counts and Template Doctor diagnostics on `app`.

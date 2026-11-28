@@ -408,16 +408,14 @@ impl grid_model::FontMetrics for RowH {
 #[allow(clippy::too_many_lines)]
 pub fn show_subtitle_grid(
     ui: &mut Ui,
-    script: &ScriptFile,
+    _script: &ScriptFile,
     state: &mut SubtitleGridState,
     video_time_cs: Option<u32>,
     palette: &Palette,
     catalog: &Catalog,
 ) -> Option<GridAction> {
     let mut action: Option<GridAction> = None;
-    let total_rows = script
-        .events_section()
-        .map_or(0, ass_core::EventsSection::event_count);
+    let total_rows = state.model.row_count();
     let ppp = ui.ctx().pixels_per_point();
     let border_stroke = one_px_stroke(palette.border, ppp);
     // Aegisub uses the proportional UI font for times and text alike.
