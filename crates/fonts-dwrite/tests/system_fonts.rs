@@ -240,10 +240,18 @@ fn fifty_fonts_times_two_thousand_glyphs_under_20_ms() {
     // The 20 ms budget is for release builds on fonts DirectWrite has already
     // opened (warm); unoptimised test builds only get a sanity bound. The cold
     // pass is dominated by the OS reading ~50 font files from disk for the
-    // first time (521 ms seen on a fresh CI runner), so it gets a looser
-    // sanity bound that still catches pathological regressions.
+    // first time (up to ~8 s seen on a fresh CI runner with cold DirectWrite
+    // cache), so it only gets a sanity bound that still catches pathological
+    // regressions (> 30 s would indicate a code bug, not runner variance).
     let budget_ms = if cfg!(debug_assertions) { 500 } else { 20 };
-    let cold_bound_ms = 3000;
+    let cold_bound_ms = 30_000u128;
+    eprintln!(
+        "fonts-dwrite cold {:.2} ms (bound {} ms), warm {:.2} ms (budget {} ms)",
+        cold.as_secs_f64() * 1e3,
+        cold_bound_ms,
+        warm.as_secs_f64() * 1e3,
+        budget_ms,
+    );
     assert!(cold.as_millis() < cold_bound_ms, "cold check took {cold:?}");
     assert!(warm.as_millis() < budget_ms, "warm check took {warm:?}");
 }

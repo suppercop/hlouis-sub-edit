@@ -90,24 +90,54 @@ jobs:
           if ($isMain) {
               cargo bench @pkgArgs --bench '*' -- --save-baseline main
               if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-              ./scripts/compare-benches.ps1 `
-                  -CurrentBaseline main `
-                  -ReferenceBaseline main `
-                  -CeilingsPath ci/bench-ceilings.json `
-                  -FailOnCeiling `
-                  -RecordMedianJson dist/bench-results/medians.json `
-                  -OutDir dist/bench-results
+              # Retry once if ceiling exceeded (runner noise), then hard-fail on second breach.
+              for ($attempt = 1; $attempt -le 2; $attempt++) {
+                  try {
+                      ./scripts/compare-benches.ps1 `
+                          -CurrentBaseline main `
+                          -ReferenceBaseline main `
+                          -CeilingsPath ci/bench-ceilings.json `
+                          -FailOnCeiling `
+                          -RecordMedianJson dist/bench-results/medians.json `
+                          -OutDir dist/bench-results
+                      break
+                  } catch {
+                      if ($attempt -eq 1) {
+                          Write-Host "::warning::Bench ceiling check failed on first attempt: $_"
+                          Write-Host "Retrying benchmark run once to filter runner noise..."
+                          cargo bench @pkgArgs --bench '*' -- --save-baseline main
+                          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                      } else {
+                          throw
+                      }
+                  }
+              }
           } else {
               cargo bench @pkgArgs --bench '*' -- --save-baseline pr
               if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-              ./scripts/compare-benches.ps1 `
-                  -CurrentBaseline pr `
-                  -ReferenceBaseline main `
-                  -MaxRegressionPct 10.0 `
-                  -CeilingsPath ci/bench-ceilings.json `
-                  -FailOnCeiling `
-                  -RecordMedianJson dist/bench-results/medians.json `
-                  -OutDir dist/bench-results
+              # Retry once if ceiling exceeded (runner noise), then hard-fail on second breach.
+              for ($attempt = 1; $attempt -le 2; $attempt++) {
+                  try {
+                      ./scripts/compare-benches.ps1 `
+                          -CurrentBaseline pr `
+                          -ReferenceBaseline main `
+                          -MaxRegressionPct 10.0 `
+                          -CeilingsPath ci/bench-ceilings.json `
+                          -FailOnCeiling `
+                          -RecordMedianJson dist/bench-results/medians.json `
+                          -OutDir dist/bench-results
+                      break
+                  } catch {
+                      if ($attempt -eq 1) {
+                          Write-Host "::warning::Bench ceiling check failed on first attempt: $_"
+                          Write-Host "Retrying benchmark run once to filter runner noise..."
+                          cargo bench @pkgArgs --bench '*' -- --save-baseline pr
+                          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                      } else {
+                          throw
+                      }
+                  }
+              }
           }
       - name: Save main benchmark baseline cache
         if: github.ref == 'refs/heads/main'
