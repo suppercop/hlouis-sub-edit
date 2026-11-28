@@ -147,7 +147,9 @@ pub struct DocumentController {
     has_bom: bool,
     last_disk_stamp: Option<DiskStamp>,
     commit_id: u64,
-    non_text_revision: u64,
+    // u32 (wrapping) so it packs into existing padding next to the bool flags and keeps the hot
+    // amend-while-typing fields on the same cache lines.
+    non_text_revision: u32,
     saved_commit_id: u64,
     // Pre-allocated amend buffers for 0-allocation keystroke merging while typing.
     amend_state: Option<ActiveAmend>,
@@ -335,8 +337,9 @@ impl DocumentController {
     /// metadata, undo/redo, or reload change, excluding in-place same-line `amend_text` edits.
     #[inline]
     #[must_use]
+    #[allow(clippy::cast_lossless)]
     pub const fn non_text_revision(&self) -> u64 {
-        self.non_text_revision
+        self.non_text_revision as u64
     }
 
     /// Description of the next undo step (including an active un-flushed amend).
@@ -388,7 +391,7 @@ impl DocumentController {
         self.undo_descs.push(description.into());
         self.redo_descs.clear();
         self.commit_id += 1;
-        self.non_text_revision += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.dirty = self.commit_id != self.saved_commit_id;
         self.autosave_dirty = true;
         self.notify(commit_type, false);
@@ -495,7 +498,7 @@ impl DocumentController {
             }
         }
         self.commit_id += 1;
-        self.non_text_revision += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.dirty = true;
         self.autosave_dirty = true;
         self.notify(CommitType::TIMES, true);
@@ -524,7 +527,7 @@ impl DocumentController {
                 self.undo.execute(&mut self.script, cmd)?;
                 self.undo_descs.push(self.amend_desc.clone());
                 self.redo_descs.clear();
-                self.non_text_revision += 1;
+                self.non_text_revision = self.non_text_revision.wrapping_add(1);
             }
             AmendField::StartTime(index) | AmendField::EndTime(index) => {
                 if active.orig_time == active.cur_time {
@@ -553,7 +556,7 @@ impl DocumentController {
                 self.undo.execute(&mut self.script, cmd)?;
                 self.undo_descs.push(self.amend_desc.clone());
                 self.redo_descs.clear();
-                self.non_text_revision += 1;
+                self.non_text_revision = self.non_text_revision.wrapping_add(1);
             }
         }
         let _ = active.commit_type;
@@ -572,7 +575,7 @@ impl DocumentController {
         let desc = self.undo_descs.pop().unwrap_or_default();
         self.redo_descs.push(desc.clone());
         self.commit_id += 1;
-        self.non_text_revision += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.dirty = self.commit_id != self.saved_commit_id;
         self.autosave_dirty = true;
         self.notify(CommitType::EVERYTHING, false);
@@ -591,7 +594,7 @@ impl DocumentController {
         let desc = self.redo_descs.pop().unwrap_or_default();
         self.undo_descs.push(desc.clone());
         self.commit_id += 1;
-        self.non_text_revision += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.dirty = self.commit_id != self.saved_commit_id;
         self.autosave_dirty = true;
         self.notify(CommitType::EVERYTHING, false);
@@ -656,7 +659,7 @@ impl DocumentController {
         self.redo_descs.clear();
         self.amend_state = None;
         self.commit_id += 1;
-        self.non_text_revision += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.saved_commit_id = self.commit_id;
         self.dirty = false;
         self.autosave_dirty = false;
