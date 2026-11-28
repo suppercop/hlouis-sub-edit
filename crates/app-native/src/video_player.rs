@@ -1,5 +1,5 @@
 //! Background video decoding (instant index-free open with progressive exact seeking,
-//! video-first then audio `BestSource` indexing, fallback with visible notices, and optional
+//! audio-first then video `BestSource` indexing, fallback with visible notices, and optional
 //! idle-time sibling pre-indexing) + libass rendering worker.
 
 use media::{
@@ -250,6 +250,8 @@ struct WorkerState {
     video: Option<HybridVideo>,
     current_video_path: Option<PathBuf>,
     last_exact_report: Instant,
+    /// The audio index outcome (ready / no audio / failed) was already sent to the UI.
+    audio_reported: bool,
     renderer: Option<AssSubRenderer>,
     ass_script: AssContent,
     current_frame: usize,
@@ -484,6 +486,7 @@ fn worker_loop(
         video: None,
         current_video_path: None,
         last_exact_report: Instant::now(),
+        audio_reported: false,
         renderer: None,
         ass_script: AssContent::Memory(initial_ass.to_owned()),
         current_frame: 0,
@@ -646,6 +649,7 @@ fn handle_open_video(
     state.current_video_path = None;
     // Closing the previous file cancels its background index (HybridVideo::drop).
     state.video = None;
+    state.audio_reported = false;
     state.buffer_pool.clear();
     state.buffer_pool.shrink_to_fit();
     state.generation = state.generation.wrapping_add(1);
@@ -677,16 +681,13 @@ fn handle_open_video(
             }
             let notice = video.take_fallback_notice();
             let initial_progress = video.index_progress();
-            let audio_err = match video.poll_audio() {
-                AudioUpgradeStatus::Failed(e) => Some(e.to_string()),
-                _ => None,
-            };
             let info = video.info().clone();
             let file_name = path.file_name().map_or_else(
                 || path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
             state.video = Some(video);
+            state.audio_reported = false;
             state.current_video_path = Some(path.to_path_buf());
             state.current_frame = 0;
             state.preindex_attempted = false;
@@ -694,9 +695,8 @@ fn handle_open_video(
             if let Some(msg) = notice {
                 let _ = evt_tx.send(PlayerEvent::ProviderNotice(msg));
             }
-            if let Some(msg) = audio_err {
-                let _ = evt_tx.send(PlayerEvent::ExactAudioFailed(msg));
-            }
+            // Cached / no-audio / index_audio=false files already know their audio outcome.
+            report_audio_outcome(state, evt_tx, ctx);
             if let Some(p) = initial_progress {
                 state.last_exact_report = Instant::now();
                 let _ = evt_tx.send(PlayerEvent::ExactIndexing {
@@ -722,6 +722,29 @@ fn handle_open_video(
     }
 }
 
+/// Sends `ExactAudioReady` / `ExactAudioFailed` exactly once per opened file (the audio gate of
+/// the decoder opens on it), whatever order audio and video indexing finished in.
+fn report_audio_outcome(
+    state: &mut WorkerState,
+    evt_tx: &mpsc::Sender<PlayerEvent>,
+    ctx: &egui::Context,
+) {
+    if state.audio_reported {
+        return;
+    }
+    let Some(video) = state.video.as_mut() else {
+        return;
+    };
+    let evt = match video.poll_audio() {
+        AudioUpgradeStatus::Ready | AudioUpgradeStatus::NoAudio => PlayerEvent::ExactAudioReady,
+        AudioUpgradeStatus::Failed(err) => PlayerEvent::ExactAudioFailed(err.to_string()),
+        AudioUpgradeStatus::Pending => return,
+    };
+    state.audio_reported = true;
+    let _ = evt_tx.send(evt);
+    ctx.request_repaint();
+}
+
 /// Reports background video/audio index progress and switches to the exact provider when ready.
 fn poll_exact_index(
     state: &mut WorkerState,
@@ -729,6 +752,9 @@ fn poll_exact_index(
     queued_frames: &AtomicUsize,
     ctx: &egui::Context,
 ) {
+    // Audio is indexed first. Its outcome is sent exactly once per opened file, before and
+    // independently of the `is_indexing` early return and the video upgrade handling.
+    report_audio_outcome(state, evt_tx, ctx);
     let Some(video) = state.video.as_mut() else {
         return;
     };
@@ -736,6 +762,9 @@ fn poll_exact_index(
         return;
     }
 
+    let Some(video) = state.video.as_mut() else {
+        return;
+    };
     match video.poll_upgrade() {
         UpgradeStatus::Switched => {
             let info = video.info().clone();
@@ -768,23 +797,12 @@ fn poll_exact_index(
     }
 
     if let Some(video) = state.video.as_mut() {
-        match video.poll_audio() {
-            AudioUpgradeStatus::Ready | AudioUpgradeStatus::NoAudio => {
-                let _ = evt_tx.send(PlayerEvent::ExactAudioReady);
-                ctx.request_repaint();
-                return;
-            }
-            AudioUpgradeStatus::Failed(err) => {
-                let _ = evt_tx.send(PlayerEvent::ExactAudioFailed(err.to_string()));
-                ctx.request_repaint();
-                return;
-            }
-            AudioUpgradeStatus::Pending => {}
-        }
-
         if state.last_exact_report.elapsed() >= EXACT_POLL_INTERVAL {
             state.last_exact_report = Instant::now();
-            if let Some(p) = video.index_progress() {
+            if let Some(p) = video
+                .index_progress()
+                .filter(|p| !(state.audio_reported && p.phase == IndexPhase::Audio))
+            {
                 let _ = evt_tx.send(PlayerEvent::ExactIndexing {
                     phase: p.phase,
                     fraction: p.fraction,

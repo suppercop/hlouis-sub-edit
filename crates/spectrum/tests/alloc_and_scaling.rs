@@ -2,12 +2,17 @@
 
 use spectrum::{ColorLut, SpectrumCache, SpectrumColorScheme, SpectrumQuality};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 use std::time::Instant;
 use theme::ThemeSpec;
 
 struct CountingAlloc;
-static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    // Allocations made by THIS thread only: rayon workers and the test harness keep allocating on
+    // their own threads while we measure, which must not be charged to the scroll loop.
+    static ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
@@ -15,7 +20,7 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = ALLOC_COUNT.try_with(|c| c.set(c.get() + 1));
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -24,7 +29,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
 }
 
 fn allocs() -> usize {
-    ALLOC_COUNT.load(Ordering::Relaxed)
+    ALLOC_COUNT.with(Cell::get)
 }
 
 #[test]

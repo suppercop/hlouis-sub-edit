@@ -522,13 +522,12 @@ fn progressive_exact_seeking_matches_bestsource_and_switches_seamlessly() {
 }
 
 #[test]
-fn hybrid_video_becomes_exact_before_or_while_audio_indexes_and_handles_no_audio() {
+fn hybrid_video_indexes_audio_first_then_video_and_handles_no_audio() {
     let Some(cfr) = cfr_clip() else { return };
     let Some(vfr) = vfr_clip() else { return };
-    let store = IndexStore::new(
-        work_dir().join("video-first-store"),
-        IndexStore::DEFAULT_MAX_BYTES,
-    );
+    let store_dir = work_dir().join("audio-first-store");
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let store = IndexStore::new(store_dir, IndexStore::DEFAULT_MAX_BYTES);
     let cancel = AtomicBool::new(false);
     let mut h = HybridVideo::open(
         cfr,
@@ -538,33 +537,37 @@ fn hybrid_video_becomes_exact_before_or_while_audio_indexes_and_handles_no_audio
     )
     .expect("hybrid open");
 
+    // The first phase shown to the user is the audio index.
+    assert_eq!(
+        h.index_progress().map(|p| p.phase),
+        Some(IndexPhase::Audio),
+        "audio must be indexed first"
+    );
+
+    let mut audio_ready = false;
     let mut video_switched = false;
-    let mut saw_audio_phase = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while std::time::Instant::now() < deadline {
-        if video_switched {
-            if let Some(p) = h.index_progress() {
-                if p.phase == IndexPhase::Audio {
-                    saw_audio_phase = true;
-                }
-            }
+    while std::time::Instant::now() < deadline && !(audio_ready && video_switched) {
+        if !audio_ready {
             match h.poll_audio() {
-                AudioUpgradeStatus::Ready => break,
+                AudioUpgradeStatus::Ready => audio_ready = true,
                 AudioUpgradeStatus::Failed(e) => panic!("audio upgrade failed: {e}"),
                 AudioUpgradeStatus::NoAudio => panic!("expected audio track on cfr clip"),
                 AudioUpgradeStatus::Pending => {}
             }
-        } else {
+        }
+        if !video_switched {
             match h.poll_upgrade() {
                 UpgradeStatus::Switched => {
                     video_switched = true;
                     assert_eq!(h.kind(), ProviderKind::BestSource);
                     assert!(h.is_frame_exact());
-                    if let Some(p) = h.index_progress() {
-                        if p.phase == IndexPhase::Audio {
-                            saw_audio_phase = true;
-                        }
-                    }
+                    // Audio is indexed before video, so it can never still be pending here.
+                    assert!(
+                        !matches!(h.poll_audio(), AudioUpgradeStatus::Pending),
+                        "audio must be ready before the video upgrade"
+                    );
+                    audio_ready = true;
                 }
                 UpgradeStatus::Failed(e) => panic!("video upgrade failed: {e}"),
                 UpgradeStatus::Pending | UpgradeStatus::Done => {}
@@ -572,8 +575,8 @@ fn hybrid_video_becomes_exact_before_or_while_audio_indexes_and_handles_no_audio
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    assert!(audio_ready, "audio index must land");
     assert!(video_switched, "video must switch to exact");
-    let _ = saw_audio_phase;
     let mut aud = h.take_audio().expect("audio provider ready");
     let mut pcm = Vec::new();
     aud.samples_into(0, 1024, &mut pcm)
