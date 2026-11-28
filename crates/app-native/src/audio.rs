@@ -131,7 +131,7 @@ fn decode_thread(
     }
 
     let mut audio = if let Some(gate) = gate {
-        // The video worker builds the exact index video-first, then audio; wait for it.
+        // The index worker builds the exact AUDIO index first (then video); wait for it.
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());

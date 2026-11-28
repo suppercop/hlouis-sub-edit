@@ -282,13 +282,15 @@ enum AudioResult {
 
 /// Instant open + progressive exact seeking + frame-exact switch:
 ///
-/// 1. Frames come immediately from [`QuickVideo`] (or `FFMS2`) while `BestSource` indexes the video
-///    track on a below-normal-priority worker thread.
+/// 1. Frames come immediately from [`QuickVideo`] (or `FFMS2`) while `BestSource` indexes audio and
+///    then the video track on a below-normal-priority worker thread.
 /// 2. Frames already covered by the partial index are decoded frame-accurately right away via the
 ///    shared [`PartialIndex`]; unindexed frames seek approximately.
-/// 3. As soon as video indexing finishes, [`Self::poll_upgrade`] swaps seamlessly to
-///    [`BestSourceProvider`] **before** audio indexing starts.
-/// 4. Audio indexing then runs in phase 2 and lands in the persistent [`IndexStore`].
+/// 3. The background worker indexes the AUDIO track first, so playback audio can start while the
+///    video index is still building; it lands in the persistent [`IndexStore`] and is picked up
+///    by [`Self::poll_audio`].
+/// 4. When video indexing finishes afterwards, [`Self::poll_upgrade`] swaps seamlessly to
+///    [`BestSourceProvider`].
 /// 5. Any `BestSource` / `QuickVideo` error falls back cleanly with a visible message.
 pub struct HybridVideo {
     active: Box<dyn VideoProvider>,
@@ -347,25 +349,22 @@ impl HybridVideo {
             phase_started: Mutex::new(Instant::now()),
         });
         let bg_cancel = Arc::new(AtomicBool::new(false));
+        let mut cached_audio: Option<BestSourceAudio> = None;
 
         if let Some(store) = &opts.store {
             if store.has_index(path) {
-                match BestSourceProvider::open_cached_only(path, &bs_opts) {
-                    Ok(bs) => {
-                        let _ = store.touch(path);
-                        return Self::finish_with_cached_video(
-                            path,
-                            opts,
-                            bs,
-                            &audio_opts,
-                            progress,
-                            bg_cancel,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = store.remove_entries_for(path);
-                    }
+                if let Ok(bs) = BestSourceProvider::open_cached_only(path, &bs_opts) {
+                    let _ = store.touch(path);
+                    return Self::finish_with_cached_video(
+                        path,
+                        opts,
+                        bs,
+                        &audio_opts,
+                        progress,
+                        bg_cancel,
+                    );
                 }
+                cached_audio = salvage_cached_audio(store, path, opts.index_audio, &audio_opts);
             }
         }
 
@@ -384,12 +383,16 @@ impl HybridVideo {
         let (vtx, vrx) = mpsc::channel();
         let (atx, arx) = mpsc::channel();
         let index_audio = opts.index_audio;
+        if index_audio && cached_audio.is_none() {
+            progress.phase.store(PHASE_AUDIO, Ordering::Relaxed);
+        }
         let worker = spawn_index_worker(WorkerArgs {
             path: path.to_path_buf(),
             bs_opts,
             audio_opts,
             index_audio,
             skip_video: false,
+            skip_audio: cached_audio.is_some(),
             priority: opts.priority,
             store: opts.store.clone(),
             partial: Some(partial.clone()),
@@ -402,13 +405,19 @@ impl HybridVideo {
         Ok(Self {
             active,
             video_pending: Some(vrx),
-            audio_pending: Some(arx),
-            audio: None,
-            audio_status: if index_audio {
+            audio_pending: if cached_audio.is_some() {
+                None
+            } else {
+                Some(arx)
+            },
+            audio_status: if cached_audio.is_some() {
+                AudioState::Ready
+            } else if index_audio {
                 AudioState::Pending
             } else {
                 AudioState::NoAudio
             },
+            audio: cached_audio,
             worker: Some(worker),
             cancel: bg_cancel,
             progress,
@@ -453,6 +462,7 @@ impl HybridVideo {
                             audio_opts: audio_opts.clone(),
                             index_audio: true,
                             skip_video: true,
+                            skip_audio: false,
                             priority: opts.priority,
                             store: opts.store.clone(),
                             partial: None,
@@ -564,8 +574,6 @@ impl HybridVideo {
             Err(TryRecvError::Empty) => return UpgradeStatus::Pending,
             Err(TryRecvError::Disconnected) => {
                 self.video_pending = None;
-                self.audio_pending = None;
-                self.audio_status = AudioState::Failed("indexing thread died".to_owned());
                 self.join_worker_if_idle();
                 return UpgradeStatus::Failed(MediaError::BestSource(
                     "indexing thread died".to_owned(),
@@ -580,9 +588,8 @@ impl HybridVideo {
                 UpgradeStatus::Switched
             }
             Ok(Err(e)) => {
+                // Audio was indexed first and is independent: keep whatever it produced.
                 self.video_pending = None;
-                self.audio_pending = None;
-                self.audio_status = AudioState::NoAudio;
                 self.join_worker_if_idle();
                 return UpgradeStatus::Failed(e);
             }
@@ -727,6 +734,25 @@ impl HybridVideo {
     }
 }
 
+/// The video index is missing or stale. A finished audio index (audio is indexed first) is kept
+/// and reused; only a wholly unusable cache is dropped so it gets rebuilt.
+fn salvage_cached_audio(
+    store: &IndexStore,
+    path: &Path,
+    index_audio: bool,
+    audio_opts: &BestSourceOptions,
+) -> Option<BestSourceAudio> {
+    let audio = if index_audio {
+        BestSourceAudio::open_cached_only(path, audio_opts).ok()
+    } else {
+        None
+    };
+    if audio.is_none() {
+        let _ = store.remove_entries_for(path);
+    }
+    audio
+}
+
 fn open_fast_provider(
     path: &Path,
     fast: FastOpen,
@@ -795,6 +821,7 @@ struct WorkerArgs {
     audio_opts: BestSourceOptions,
     index_audio: bool,
     skip_video: bool,
+    skip_audio: bool,
     priority: ThreadPriority,
     store: Option<IndexStore>,
     partial: Option<PartialIndex>,
@@ -804,85 +831,92 @@ struct WorkerArgs {
     atx: mpsc::Sender<AudioResult>,
 }
 
+fn begin_phase(progress: &Shared, phase: u8) {
+    progress.phase.store(phase, Ordering::Relaxed);
+    progress.cur.store(0, Ordering::Relaxed);
+    progress.total.store(0, Ordering::Relaxed);
+    *progress
+        .phase_started
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+}
+
+/// Audio phase (runs FIRST so playback audio can start while the video index is still building).
+fn run_audio_phase(args: &WorkerArgs) {
+    if args.skip_audio {
+        return;
+    }
+    if !args.index_audio || args.bg_cancel.load(Ordering::Relaxed) {
+        let _ = args.atx.send(AudioResult::NoAudio);
+        return;
+    }
+    match track_types(&args.path) {
+        Ok(types) if !types.contains(&bestsource_sys::AVMEDIA_TYPE_AUDIO) => {
+            let _ = args.atx.send(AudioResult::NoAudio);
+        }
+        Ok(_) => {
+            begin_phase(&args.progress, PHASE_AUDIO);
+            let audio_res = BestSourceAudio::open_with_progress(
+                &args.path,
+                &args.audio_opts,
+                &args.bg_cancel,
+                |cur, tot| {
+                    if cur != i64::MAX {
+                        args.progress.cur.store(cur, Ordering::Relaxed);
+                        args.progress.total.store(tot, Ordering::Relaxed);
+                    }
+                },
+            );
+            match audio_res {
+                Ok(aud) => {
+                    if let Some(store) = &args.store {
+                        let _ = store.touch(&args.path);
+                        let _ = store.enforce_limit_preserving(Some(&args.path));
+                    }
+                    let _ = args.atx.send(AudioResult::Ready(aud));
+                }
+                Err(e) => {
+                    let _ = args.atx.send(AudioResult::Failed(e));
+                }
+            }
+        }
+        Err(e) => {
+            let _ = args.atx.send(AudioResult::Failed(e));
+        }
+    }
+}
+
 fn spawn_index_worker(args: WorkerArgs) -> Result<JoinHandle<()>, MediaError> {
     std::thread::Builder::new()
         .name("bestsource-index".to_owned())
         .spawn(move || {
             let _ = set_current_thread_priority(args.priority);
-            if !args.skip_video {
-                let res = BestSourceProvider::open_with_partial_and_progress(
-                    &args.path,
-                    &args.bs_opts,
-                    args.partial.as_ref(),
-                    &args.bg_cancel,
-                    |cur, tot| {
-                        if cur != i64::MAX {
-                            args.progress.cur.store(cur, Ordering::Relaxed);
-                            args.progress.total.store(tot, Ordering::Relaxed);
-                        }
-                    },
-                );
-                let ok = res.is_ok();
-                if ok {
-                    if let Some(store) = &args.store {
-                        let _ = store.touch(&args.path);
-                        let _ = store.enforce_limit_preserving(Some(&args.path));
-                    }
-                }
-                if let Some(vtx) = &args.vtx {
-                    let _ = vtx.send(res);
-                }
-                if !ok {
-                    let _ = args.atx.send(AudioResult::NoAudio);
-                    return;
-                }
-            }
-
-            if !args.index_audio || args.bg_cancel.load(Ordering::Relaxed) {
-                let _ = args.atx.send(AudioResult::NoAudio);
+            // Audio first: a failed audio index never blocks the video index.
+            run_audio_phase(&args);
+            if args.skip_video || args.bg_cancel.load(Ordering::Relaxed) {
                 return;
             }
-
-            match track_types(&args.path) {
-                Ok(types) if !types.contains(&bestsource_sys::AVMEDIA_TYPE_AUDIO) => {
-                    let _ = args.atx.send(AudioResult::NoAudio);
-                }
-                Ok(_) => {
-                    args.progress.phase.store(PHASE_AUDIO, Ordering::Relaxed);
-                    args.progress.cur.store(0, Ordering::Relaxed);
-                    args.progress.total.store(0, Ordering::Relaxed);
-                    *args
-                        .progress
-                        .phase_started
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = Instant::now();
-                    let audio_res = BestSourceAudio::open_with_progress(
-                        &args.path,
-                        &args.audio_opts,
-                        &args.bg_cancel,
-                        |cur, tot| {
-                            if cur != i64::MAX {
-                                args.progress.cur.store(cur, Ordering::Relaxed);
-                                args.progress.total.store(tot, Ordering::Relaxed);
-                            }
-                        },
-                    );
-                    match audio_res {
-                        Ok(aud) => {
-                            if let Some(store) = &args.store {
-                                let _ = store.touch(&args.path);
-                                let _ = store.enforce_limit_preserving(Some(&args.path));
-                            }
-                            let _ = args.atx.send(AudioResult::Ready(aud));
-                        }
-                        Err(e) => {
-                            let _ = args.atx.send(AudioResult::Failed(e));
-                        }
+            begin_phase(&args.progress, PHASE_VIDEO);
+            let res = BestSourceProvider::open_with_partial_and_progress(
+                &args.path,
+                &args.bs_opts,
+                args.partial.as_ref(),
+                &args.bg_cancel,
+                |cur, tot| {
+                    if cur != i64::MAX {
+                        args.progress.cur.store(cur, Ordering::Relaxed);
+                        args.progress.total.store(tot, Ordering::Relaxed);
                     }
+                },
+            );
+            if res.is_ok() {
+                if let Some(store) = &args.store {
+                    let _ = store.touch(&args.path);
+                    let _ = store.enforce_limit_preserving(Some(&args.path));
                 }
-                Err(e) => {
-                    let _ = args.atx.send(AudioResult::Failed(e));
-                }
+            }
+            if let Some(vtx) = &args.vtx {
+                let _ = vtx.send(res);
             }
         })
         .map_err(|e| MediaError::BestSource(e.to_string()))

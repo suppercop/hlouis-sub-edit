@@ -17,7 +17,7 @@ pub enum GateState {
     Failed(String),
 }
 
-/// Hand-off between the video worker (which builds the audio index after the video index) and
+/// Hand-off between the index worker (which builds the audio index before the video index) and
 /// the audio decoder of the same file.
 #[derive(Debug, Default)]
 pub struct AudioGate(Mutex<Option<GateState>>);
@@ -196,7 +196,8 @@ impl VideoProvider for NativeVideo {
                     out.push(MediaEvent::Error(format!("Audio index failed: {msg}")));
                 }
                 PlayerEvent::ExactIndexFailed(msg) => {
-                    self.gate.set(GateState::Failed(msg.clone()));
+                    // Audio is indexed first and independently: a video index failure leaves the
+                    // audio gate alone.
                     out.push(MediaEvent::Error(format!(
                         "Frame-exact index failed ({msg}); seeking stays approximate"
                     )));
