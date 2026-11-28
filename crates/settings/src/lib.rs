@@ -95,6 +95,18 @@ impl Default for AppearancePrefs {
     }
 }
 
+/// Visual marker drawn in the subtitle grid where an override `{...}` block was hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HiddenTagMarker {
+    /// Small low-contrast vector dot (default).
+    #[default]
+    SmallDot,
+    /// Compact low-contrast vector sun (Aegisub style).
+    AegisubSun,
+    /// Do not draw any marker for hidden override blocks.
+    None,
+}
+
 /// Interface & grid preference page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -104,6 +116,8 @@ pub struct InterfacePrefs {
     pub show_video: bool,
     pub show_audio: bool,
     pub hide_overrides_mode: u8,
+    pub hidden_tag_marker: HiddenTagMarker,
+    pub hide_karaoke_only_markers: bool,
     pub show_col_layer: bool,
     pub show_col_actor: bool,
     pub show_col_effect: bool,
@@ -120,6 +134,8 @@ impl Default for InterfacePrefs {
             show_video: true,
             show_audio: true,
             hide_overrides_mode: 1,
+            hidden_tag_marker: HiddenTagMarker::SmallDot,
+            hide_karaoke_only_markers: true,
             show_col_layer: false,
             show_col_actor: false,
             show_col_effect: false,

@@ -20,9 +20,11 @@ use egui::{
 };
 use grid_model::{ColumnVisibility, GridColumn, GridModel, KeyNav, RowFlags, RowTiming};
 use i18n_catalog::Catalog;
+pub use settings::HiddenTagMarker;
+use settings::InterfacePrefs;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use syntax_highlight::{GridDisplayConfig, format_grid_text_into};
+use syntax_highlight::{GridDisplayConfig, TagDisplayMode};
 use theme::Palette;
 use ui_theme::{one_px_stroke, rgba, snap_px};
 
@@ -100,6 +102,9 @@ struct CachedRow {
     actor: String,
     effect: String,
     display_text: String,
+    /// UTF-8 byte offsets in `display_text` where a hidden-tag vector marker should be painted.
+    /// Empty (`Vec::new()`, 0 heap allocation) for plain lines and karaoke-only lines.
+    marker_offsets: Vec<u16>,
 }
 
 /// Persistent UI state + reusable scratch buffers for the virtualised subtitle grid.
@@ -107,6 +112,11 @@ struct CachedRow {
 pub struct SubtitleGridState {
     pub model: GridModel,
     pub display_cfg: GridDisplayConfig,
+    /// Vector shape drawn for hidden `{...}` override blocks in `TagDisplayMode::Simplify`.
+    pub tag_marker: HiddenTagMarker,
+    /// When `true` (default), karaoke-only blocks (`{\k}`, `{\kf}`, `{\ko}`, `{\K}`) are hidden
+    /// without emitting a marker so karaoke lines read as plain syllables.
+    pub hide_karaoke_only_markers: bool,
     pub row_height: f32,
     pub column_order: Vec<GridColumn>,
     pub column_widths: [f32; 12],
@@ -140,11 +150,10 @@ impl Default for SubtitleGridState {
         model.columns.margin_v = false;
         Self {
             model,
-            display_cfg: GridDisplayConfig {
-                simplify_marker: '☀',
-                ..GridDisplayConfig::default()
-            },
-            row_height: 16.0,
+            display_cfg: GridDisplayConfig::default(),
+            tag_marker: HiddenTagMarker::SmallDot,
+            hide_karaoke_only_markers: true,
+            row_height: 14.0,
             column_order: vec![
                 GridColumn::LineNumber,
                 GridColumn::Layer,
@@ -209,7 +218,15 @@ impl SubtitleGridState {
                 end_cs: ev.end().as_cs(),
                 is_comment,
             });
-            format_grid_text_into(ev.text(), &self.display_cfg, &mut tmp);
+            let mut markers = Vec::new();
+            format_grid_row_text(
+                ev.text(),
+                &self.display_cfg,
+                self.tag_marker,
+                self.hide_karaoke_only_markers,
+                &mut tmp,
+                &mut markers,
+            );
             self.cached_rows.push(CachedRow {
                 rev,
                 is_comment,
@@ -224,6 +241,7 @@ impl SubtitleGridState {
                 actor: ev.name().to_owned(),
                 effect: ev.effect().to_owned(),
                 display_text: tmp.clone(),
+                marker_offsets: markers,
             });
         }
         self.model.load_rows(&rows);
@@ -258,7 +276,33 @@ impl SubtitleGridState {
             slot.actor.push_str(ev.name());
             slot.effect.clear();
             slot.effect.push_str(ev.effect());
-            format_grid_text_into(ev.text(), &self.display_cfg, &mut slot.display_text);
+            format_grid_row_text(
+                ev.text(),
+                &self.display_cfg,
+                self.tag_marker,
+                self.hide_karaoke_only_markers,
+                &mut slot.display_text,
+                &mut slot.marker_offsets,
+            );
+        }
+    }
+
+    /// Applies grid override-marker settings from [`InterfacePrefs`], refreshing cached rows only
+    /// if any setting actually changed.
+    pub fn apply_interface_prefs(&mut self, prefs: &InterfacePrefs, script: &ScriptFile) {
+        let mode = match prefs.hide_overrides_mode {
+            0 => TagDisplayMode::Show,
+            2 => TagDisplayMode::Hide,
+            _ => TagDisplayMode::Simplify,
+        };
+        if self.display_cfg.mode != mode
+            || self.tag_marker != prefs.hidden_tag_marker
+            || self.hide_karaoke_only_markers != prefs.hide_karaoke_only_markers
+        {
+            self.display_cfg.mode = mode;
+            self.tag_marker = prefs.hidden_tag_marker;
+            self.hide_karaoke_only_markers = prefs.hide_karaoke_only_markers;
+            self.sync_from_script(script);
         }
     }
 
@@ -335,6 +379,209 @@ impl SubtitleGridState {
             GridColumn::Text => "grid-col-text",
         }
     }
+}
+
+/// Returns `true` when `body` (the text inside `{...}`) contains only karaoke timing tags
+/// (`\k`, `\kf`, `\ko`, `\K`) and nothing else.
+#[must_use]
+pub fn is_karaoke_only_block(body: &str) -> bool {
+    let trimmed = body.trim();
+    let Some(rest) = trimmed.strip_prefix('\\') else {
+        return false;
+    };
+    let mut saw_tag = false;
+    for part in rest.split('\\') {
+        let seg = part.trim();
+        if seg.is_empty() {
+            return false;
+        }
+        let arg = if let Some(a) = seg.strip_prefix("kf") {
+            a
+        } else if let Some(a) = seg.strip_prefix("ko") {
+            a
+        } else if let Some(a) = seg.strip_prefix('k') {
+            a
+        } else if let Some(a) = seg.strip_prefix('K') {
+            a
+        } else {
+            return false;
+        };
+        let digits = arg.strip_prefix(['+', '-']).unwrap_or(arg);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        saw_tag = true;
+    }
+    saw_tag
+}
+
+/// Formats `raw` ASS event text into `out` and records hidden-override marker byte offsets in
+/// `marker_offsets` (both cleared and reused without allocating when empty).
+pub fn format_grid_row_text(
+    raw: &str,
+    cfg: &GridDisplayConfig,
+    marker: HiddenTagMarker,
+    hide_karaoke_only: bool,
+    out: &mut String,
+    marker_offsets: &mut Vec<u16>,
+) {
+    out.clear();
+    marker_offsets.clear();
+    let max_chars = cfg.max_chars.unwrap_or(usize::MAX);
+    if max_chars == 0 {
+        return;
+    }
+
+    if cfg.mode == TagDisplayMode::Show {
+        for (idx, ch) in raw.chars().enumerate() {
+            if idx >= max_chars {
+                out.push_str(cfg.ellipsis);
+                break;
+            }
+            out.push(ch);
+        }
+        return;
+    }
+
+    let emit_markers = cfg.mode == TagDisplayMode::Simplify && marker != HiddenTagMarker::None;
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0usize;
+    let mut emitted_chars = 0usize;
+    let mut truncated = false;
+    let mut pending_marker = false;
+
+    while pos < len {
+        if bytes[pos] == b'{'
+            && let Some(rel_close) = bytes[pos + 1..].iter().position(|&c| c == b'}')
+        {
+            let body = &raw[pos + 1..pos + 1 + rel_close];
+            if emit_markers && !(hide_karaoke_only && is_karaoke_only_block(body)) {
+                pending_marker = true;
+            }
+            pos += rel_close + 2;
+            continue;
+        }
+
+        if pending_marker {
+            if let Ok(off) = u16::try_from(out.len()) {
+                marker_offsets.push(off);
+            }
+            pending_marker = false;
+        }
+
+        let seg_start = pos;
+        let next_brace = bytes[pos + 1..]
+            .iter()
+            .position(|&c| c == b'{')
+            .map_or(len, |r| pos + 1 + r);
+        let seg = &raw[seg_start..next_brace];
+
+        if seg.is_ascii() && emitted_chars + seg.len() <= max_chars {
+            out.push_str(seg);
+            emitted_chars += seg.len();
+            pos = next_brace;
+            continue;
+        }
+
+        for ch in seg.chars() {
+            if emitted_chars >= max_chars {
+                truncated = true;
+                break;
+            }
+            out.push(ch);
+            emitted_chars += 1;
+        }
+        if truncated {
+            break;
+        }
+        pos = next_brace;
+    }
+
+    if pending_marker
+        && !truncated
+        && let Ok(off) = u16::try_from(out.len())
+    {
+        marker_offsets.push(off);
+    }
+    if truncated {
+        out.push_str(cfg.ellipsis);
+    }
+}
+
+/// Paints a small, low-contrast vector hidden-tag marker (never a Unicode symbol glyph).
+fn paint_tag_marker(
+    p: &egui::Painter,
+    center: Pos2,
+    marker: HiddenTagMarker,
+    diameter: f32,
+    color: Color32,
+) {
+    match marker {
+        HiddenTagMarker::SmallDot => {
+            p.circle_filled(center, diameter * 0.40, color);
+        }
+        HiddenTagMarker::AegisubSun => {
+            let core_r = diameter * 0.22;
+            let r0 = diameter * 0.30;
+            let r1 = diameter * 0.52;
+            p.circle_filled(center, core_r, color);
+            let st = Stroke::new(0.85, color);
+            for i in 0..8u8 {
+                let a = f32::from(i) * std::f32::consts::FRAC_PI_4;
+                let (sa, ca) = a.sin_cos();
+                p.line_segment(
+                    [
+                        Pos2::new(center.x + ca * r0, center.y + sa * r0),
+                        Pos2::new(center.x + ca * r1, center.y + sa * r1),
+                    ],
+                    st,
+                );
+            }
+        }
+        HiddenTagMarker::None => {}
+    }
+}
+
+/// Diameter of the hidden-tag marker for a body font of `font_size` points.
+#[inline]
+fn marker_diameter(font_size: f32) -> f32 {
+    (font_size * 0.72 * 0.60).clamp(3.6, 5.6)
+}
+
+/// Horizontal space reserved for one hidden-tag marker in the Text column.
+#[inline]
+fn marker_advance(font_size: f32) -> f32 {
+    marker_diameter(font_size) + 3.0
+}
+
+/// Builds the Text-column layout job: every text segment that follows a hidden-tag marker is
+/// laid out with `marker_adv` leading space so the vector marker fits before it.
+fn marker_text_job(
+    text: &str,
+    offsets: &[u16],
+    marker_adv: f32,
+    font: &FontId,
+    color: Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    let fmt = egui::text::TextFormat::simple(font.clone(), color);
+    let mut prev = 0usize;
+    let mut lead = 0.0_f32;
+    for &off_u16 in offsets {
+        let off = usize::from(off_u16).min(text.len());
+        if off > prev && text.is_char_boundary(prev) && text.is_char_boundary(off) {
+            job.append(&text[prev..off], lead, fmt.clone());
+            lead = 0.0;
+            prev = off;
+        }
+        lead += marker_adv;
+    }
+    if prev < text.len() && text.is_char_boundary(prev) {
+        job.append(&text[prev..], lead, fmt);
+    }
+    job
 }
 
 /// Fast, zero-allocation CPS calculation for a single event (strips `{...}` tags & `\N`).
@@ -419,7 +666,7 @@ pub fn show_subtitle_grid(
     let ppp = ui.ctx().pixels_per_point();
     let border_stroke = one_px_stroke(palette.border, ppp);
     // Aegisub uses the proportional UI font for times and text alike.
-    let font_body = FontId::proportional(11.5);
+    let font_body = FontId::proportional(10.0);
     let use_classic_light = state.classic_light_colors && is_light_palette(palette);
 
     // 1. Keyboard navigation when grid has focus or no text edit owns focus.
@@ -610,9 +857,8 @@ pub fn show_subtitle_grid(
             let is_active = state.model.active_row() == Some(row_idx);
             let is_overlap = state
                 .visible_buf
-                .iter()
-                .find(|f| f.row_index == row_idx)
-                .is_some_and(|f| f.is_overlapping);
+                .binary_search_by_key(&row_idx, |f| f.row_index)
+                .is_ok_and(|idx| state.visible_buf[idx].is_overlapping);
             let is_vis_frame =
                 video_time_cs.is_some_and(|t| !is_comment && row.start_cs <= t && t < row.end_cs);
 
@@ -776,9 +1022,20 @@ pub fn show_subtitle_grid(
                         }
                         GridColumn::Text => &row.display_text,
                     };
-                    let built = ctx.fonts_mut(|f| {
-                        f.layout_no_wrap(cell_txt.to_owned(), font_body.clone(), text_col)
-                    });
+                    let built = if col == GridColumn::Text && !row.marker_offsets.is_empty() {
+                        let job = marker_text_job(
+                            cell_txt,
+                            &row.marker_offsets,
+                            marker_advance(font_body.size),
+                            &font_body,
+                            text_col,
+                        );
+                        ctx.fonts_mut(|f| f.layout_job(job))
+                    } else {
+                        ctx.fonts_mut(|f| {
+                            f.layout_no_wrap(cell_txt.to_owned(), font_body.clone(), text_col)
+                        })
+                    };
                     cache_slot.cols[col_idx] = Some(Arc::clone(&built));
                     built
                 };
@@ -797,6 +1054,42 @@ pub fn show_subtitle_grid(
                             cell_galley,
                             text_col,
                         );
+                    }
+                    GridColumn::Text if !row.marker_offsets.is_empty() => {
+                        let clip_p = row_painter.with_clip_rect(cell_rect);
+                        let origin = Pos2::new(cx + 4.0, cy - gsize.y * 0.5);
+                        // Low-contrast theme text colour at ~45% alpha, never darker than text.
+                        let marker_col = Color32::from_rgba_unmultiplied(
+                            text_col.r(),
+                            text_col.g(),
+                            text_col.b(),
+                            115,
+                        );
+                        let marker_d = marker_diameter(font_body.size);
+                        let marker_adv = marker_advance(font_body.size);
+                        let text_len = row.display_text.len();
+                        for &off_u16 in &row.marker_offsets {
+                            let off = usize::from(off_u16).min(text_len);
+                            let x_rel =
+                                if off >= text_len || !row.display_text.is_char_boundary(off) {
+                                    cell_galley.rect.max.x + marker_adv * 0.5
+                                } else {
+                                    let ci = row.display_text[..off].chars().count();
+                                    cell_galley
+                                        .pos_from_cursor(egui::text::CCursor::new(ci))
+                                        .min
+                                        .x
+                                        - marker_adv * 0.5
+                                };
+                            paint_tag_marker(
+                                &clip_p,
+                                Pos2::new(origin.x + x_rel, cy),
+                                state.tag_marker,
+                                marker_d,
+                                marker_col,
+                            );
+                        }
+                        clip_p.galley(origin, cell_galley, text_col);
                     }
                     GridColumn::Style
                     | GridColumn::Actor
@@ -1076,5 +1369,128 @@ mod tests {
             state.galley_epoch.sync(&ctx) > gen_before,
             "atlas reset not noticed by the galley epoch"
         );
+    }
+
+    #[test]
+    fn karaoke_only_detection_and_consecutive_marker_collapsing() {
+        assert!(is_karaoke_only_block(r"\k40"));
+        assert!(is_karaoke_only_block(r"\kf50\ko20\K10"));
+        assert!(!is_karaoke_only_block(r"\k40\blur2"));
+        assert!(!is_karaoke_only_block(r"\an8\pos(960,80)"));
+        assert!(!is_karaoke_only_block("comment"));
+        assert!(!is_karaoke_only_block(r"\kt40"));
+
+        let cfg = GridDisplayConfig::default();
+        let mut out = String::new();
+        let mut markers = Vec::new();
+
+        // Karaoke-only line with hide_karaoke_only=true -> plain syllables, zero markers.
+        format_grid_row_text(
+            r"{\k40}Ni{\k50}ge{\k60}ta{\k30}ku {\k40}na{\k50}ru",
+            &cfg,
+            HiddenTagMarker::SmallDot,
+            true,
+            &mut out,
+            &mut markers,
+        );
+        assert_eq!(markers, [] as [u16; 0]);
+        assert_eq!(out, "Nigetaku naru");
+
+        // Karaoke-only line with hide_karaoke_only=false -> markers emitted at exact offsets.
+        format_grid_row_text(
+            r"{\k40}Ni{\k50}ge",
+            &cfg,
+            HiddenTagMarker::SmallDot,
+            false,
+            &mut out,
+            &mut markers,
+        );
+        assert_eq!(markers, vec![0, 2]);
+        assert_eq!(out, "Nige");
+
+        // Consecutive hidden blocks collapse to ONE marker.
+        format_grid_row_text(
+            r"{\an8}{\blur2}Typeset",
+            &cfg,
+            HiddenTagMarker::SmallDot,
+            true,
+            &mut out,
+            &mut markers,
+        );
+        assert_eq!(markers, vec![0]);
+        assert_eq!(out, "Typeset");
+
+        // Plain line has zero markers.
+        format_grid_row_text(
+            "Plain Vietnamese: Ầ, ữ, ỗ",
+            &cfg,
+            HiddenTagMarker::SmallDot,
+            true,
+            &mut out,
+            &mut markers,
+        );
+        assert_eq!(markers, [] as [u16; 0]);
+        assert_eq!(out, "Plain Vietnamese: Ầ, ữ, ỗ");
+    }
+
+    #[test]
+    fn grid_tag_markers_render_karaoke_typeset_plain_in_all_themes_at_200_dpi() {
+        let mut script = ScriptFile::new_default();
+        let sec = script.ensure_events_section_mut();
+        sec.insert_event(
+            0,
+            AssEvent::dialogue(
+                AssTime::ZERO,
+                AssTime::from_cs(240),
+                r"{\k40}Ni{\k50}ge{\k60}ta{\k30}ku {\k40}na{\k50}ru",
+            ),
+        );
+        sec.insert_event(
+            1,
+            AssEvent::dialogue(
+                AssTime::from_cs(240),
+                AssTime::from_cs(420),
+                r"{\an8\pos(960,80)\blur2}Typeset sign / Tiêu đề cảnh",
+            ),
+        );
+        sec.insert_event(
+            2,
+            AssEvent::dialogue(
+                AssTime::from_cs(420),
+                AssTime::from_cs(600),
+                r"Plain line with stacked diacritics: Ầ, ữ, ỗ",
+            ),
+        );
+
+        let themes = [
+            ThemeSpec::Light,
+            ThemeSpec::Dark,
+            ThemeSpec::EyeComfort {
+                base: theme::BaseTheme::Dark,
+                strength: 65,
+            },
+        ];
+        let fonts = ui_theme::build_font_definitions(&ui_theme::FontConfig::default());
+        for spec in themes {
+            let mut state = SubtitleGridState::default();
+            state.sync_from_script(&script);
+            let pal = theme::palette(spec);
+            let cat = Catalog::for_locale(Locale::En);
+            let script_c = script.clone();
+            let fonts_c = fonts.clone();
+            let mut inited = false;
+            let mut harness = Harness::builder()
+                .with_size(Vec2::new(720.0, 220.0))
+                .with_pixels_per_point(2.0)
+                .with_accessibility_check(false)
+                .build_ui(move |ui| {
+                    if !inited {
+                        ui.ctx().set_fonts(fonts_c.clone());
+                        inited = true;
+                    }
+                    let _ = show_subtitle_grid(ui, &script_c, &mut state, None, &pal, &cat);
+                });
+            harness.run();
+        }
     }
 }

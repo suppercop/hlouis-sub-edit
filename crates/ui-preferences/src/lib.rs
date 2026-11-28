@@ -9,7 +9,7 @@ use aegisub_config::import_config_json;
 use commands::CommandRegistry;
 use egui::{ScrollArea, Ui};
 use i18n_catalog::Catalog;
-use settings::{AppSettings, ThemeMode};
+use settings::{AppSettings, HiddenTagMarker, ThemeMode};
 use std::fs;
 use std::path::{Path, PathBuf};
 use theme::{BaseTheme, ThemeSpec};
@@ -255,7 +255,10 @@ pub fn show_preferences_dialog(
                         let spec = match settings.appearance.theme_mode {
                             ThemeMode::Light => ThemeSpec::Light,
                             ThemeMode::Dark | ThemeMode::System => ThemeSpec::Dark,
-                            ThemeMode::EyeComfortLight => ThemeSpec::EyeComfort { base: BaseTheme::Light, strength: settings.appearance.eye_comfort_strength },
+                            ThemeMode::EyeComfortLight => ThemeSpec::EyeComfort {
+                                base: BaseTheme::Light,
+                                strength: settings.appearance.eye_comfort_strength,
+                            },
                             ThemeMode::EyeComfortDark => ThemeSpec::EyeComfort {
                                 base: BaseTheme::Dark,
                                 strength: settings.appearance.eye_comfort_strength,
@@ -266,6 +269,39 @@ pub fn show_preferences_dialog(
                     ui.checkbox(
                         &mut settings.appearance.show_performance_overlay,
                         "Show performance overlay in status bar",
+                    );
+                    ui.separator();
+                    ui.strong("Grid");
+                    ui.horizontal(|ui| {
+                        ui.label("Hidden tag marker:");
+                        let current_label = match settings.interface.hidden_tag_marker {
+                            HiddenTagMarker::SmallDot => "Small dot",
+                            HiddenTagMarker::AegisubSun => "Aegisub sun",
+                            HiddenTagMarker::None => "None",
+                        };
+                        egui::ComboBox::from_id_salt("prefs_hidden_tag_marker")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut settings.interface.hidden_tag_marker,
+                                    HiddenTagMarker::SmallDot,
+                                    "Small dot",
+                                );
+                                ui.selectable_value(
+                                    &mut settings.interface.hidden_tag_marker,
+                                    HiddenTagMarker::AegisubSun,
+                                    "Aegisub sun",
+                                );
+                                ui.selectable_value(
+                                    &mut settings.interface.hidden_tag_marker,
+                                    HiddenTagMarker::None,
+                                    "None",
+                                );
+                            });
+                    });
+                    ui.checkbox(
+                        &mut settings.interface.hide_karaoke_only_markers,
+                        r"Hide markers for karaoke-only blocks ({\k \kf \ko \K} with nothing else)",
                     );
                 }
                 PrefsPage::Hotkeys => {

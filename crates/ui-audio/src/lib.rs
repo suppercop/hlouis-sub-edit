@@ -22,8 +22,8 @@ use audio_view::{
     build_frame_layout,
 };
 use egui::{
-    Align2, Color32, ColorImage, FontId, Galley, Pos2, Rect, Sense, Stroke, TextureHandle,
-    TextureOptions, Ui, Vec2,
+    Color32, ColorImage, FontId, Galley, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions,
+    Ui, Vec2,
 };
 use i18n_catalog::Catalog;
 use karaoke_timing::KaraokeTimingController;
@@ -154,9 +154,9 @@ impl AudioPanelState {
             auto_next: true,
             auto_scroll: true,
             // Matches the viewport default of 10 ms/px through `ms_per_px = 12 / h_zoom`.
-            h_zoom: 1.2,
-            v_zoom: 1.0,
-            volume: 1.0,
+            h_zoom: 3.2,
+            v_zoom: 2.1,
+            volume: 1.2,
             link_zoom_volume: true,
             play_cursor_ms: None,
             video_marker_ms: None,
@@ -262,15 +262,16 @@ fn role_color(role: ColorRole, pal: &Palette) -> Color32 {
     }
 }
 
-/// Custom aligned vertical slider with dark/subtle track and Aegisub blue thumb.
+/// Custom aligned vertical slider matching Aegisub: thin light track + short wide blue bar thumb.
 fn vertical_blue_slider(
     ui: &mut Ui,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     height: f32,
+    pal: &Palette,
     tooltip: &str,
 ) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(14.0, height), Sense::click_and_drag());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(16.0, height), Sense::click_and_drag());
     let mut changed = false;
     let min_v = *range.start();
     let max_v = *range.end();
@@ -282,16 +283,39 @@ fn vertical_blue_slider(
         changed = true;
     }
     let frac = ((*value - min_v) / (max_v - min_v).max(f32::EPSILON)).clamp(0.0, 1.0);
+    let is_light =
+        u16::from(pal.grid_bg.r) + u16::from(pal.grid_bg.g) + u16::from(pal.grid_bg.b) > 384;
     let p = ui.painter();
-    let track = Rect::from_center_size(rect.center(), Vec2::new(4.0, (height - 4.0).max(8.0)));
-    p.rect_filled(track, 2.0, Color32::from_rgb(56, 62, 74));
-    let thumb_y = rect.bottom() - 4.0 - frac * (height - 8.0).max(1.0);
-    let thumb = Rect::from_center_size(Pos2::new(rect.center().x, thumb_y), Vec2::new(12.0, 6.0));
-    p.rect_filled(thumb, 1.5, Color32::from_rgb(56, 136, 226));
+    let track = Rect::from_center_size(rect.center(), Vec2::new(3.5, (height - 4.0).max(8.0)));
+    let track_bg = if is_light {
+        Color32::from_rgb(232, 234, 238)
+    } else {
+        rgba(pal.grid_bg)
+    };
+    p.rect_filled(track, 1.0, track_bg);
+    p.rect_stroke(
+        track,
+        1.0,
+        Stroke::new(0.8, rgba(pal.border)),
+        egui::StrokeKind::Inside,
+    );
+    let thumb_y = rect.bottom() - 5.0 - frac * (height - 10.0).max(1.0);
+    let thumb = Rect::from_center_size(Pos2::new(rect.center().x, thumb_y), Vec2::new(14.0, 7.0));
+    let thumb_fill = if is_light {
+        Color32::from_rgb(0, 120, 215)
+    } else {
+        Color32::from_rgb(76, 146, 224)
+    };
+    let thumb_bd = if is_light {
+        Color32::from_rgb(0, 90, 168)
+    } else {
+        Color32::from_rgb(48, 104, 174)
+    };
+    p.rect_filled(thumb, 0.5, thumb_fill);
     p.rect_stroke(
         thumb,
-        1.5,
-        Stroke::new(0.8, Color32::from_rgb(24, 72, 148)),
+        0.5,
+        Stroke::new(0.8, thumb_bd),
         egui::StrokeKind::Inside,
     );
     let _ = resp.on_hover_text(tooltip);
@@ -704,7 +728,7 @@ pub fn show_audio_panel(
     let ruler_h = 16.0;
     let scrollbar_h = 11.0;
     let toolbar_h = 24.0;
-    let slider_strip_w = 50.0;
+    let slider_strip_w = 56.0;
     let total_canvas_h = (ui.available_height() - toolbar_h).max(76.0);
     let wave_h = (total_canvas_h - ruler_h - scrollbar_h).max(48.0);
     let canvas_w = (ui.available_width() - slider_strip_w - 6.0).max(100.0);
@@ -995,8 +1019,8 @@ pub fn show_audio_panel(
             }
         });
 
-        // Right-hand strip: 3 aligned vertical sliders (H-zoom, V-zoom, Volume) with blue thumbs
-        // + pink/red Link toggle below them.
+        // Right-hand strip: 3 aligned vertical sliders (H-zoom, V-zoom, Volume) with blue bar
+        // thumbs + pink Link icon toggle below them (matching Aegisub).
         ui.vertical(|ui| {
             let slider_h = (total_canvas_h - 20.0).max(44.0);
             ui.horizontal(|ui| {
@@ -1006,45 +1030,83 @@ pub fn show_audio_panel(
                     &mut state.h_zoom,
                     0.25..=8.0,
                     slider_h,
+                    palette,
                     "Horizontal zoom",
                 ) {
                     state.viewport.ms_per_px = (12.0 / f64::from(state.h_zoom)).clamp(0.5, 200.0);
                 }
                 let prev_v = state.v_zoom;
-                vertical_blue_slider(ui, &mut state.v_zoom, 0.25..=4.0, slider_h, "Vertical zoom");
+                vertical_blue_slider(
+                    ui,
+                    &mut state.v_zoom,
+                    0.25..=4.0,
+                    slider_h,
+                    palette,
+                    "Vertical zoom",
+                );
                 if state.link_zoom_volume && (state.v_zoom - prev_v).abs() > f32::EPSILON {
                     state.volume = (state.v_zoom / 2.0).clamp(0.0, 2.0);
                 }
-                vertical_blue_slider(ui, &mut state.volume, 0.0..=2.0, slider_h, "Volume");
+                vertical_blue_slider(
+                    ui,
+                    &mut state.volume,
+                    0.0..=2.0,
+                    slider_h,
+                    palette,
+                    "Volume",
+                );
             });
 
-            // Pink/red Link toggle button below the 3 sliders.
-            let (lr, lresp) = ui.allocate_exact_size(Vec2::new(46.0, 16.0), Sense::click());
+            // Pink Link toggle button with vector U-bracket icon (no text), aligned under sliders.
+            let (lr, lresp) = ui.allocate_exact_size(Vec2::new(52.0, 16.0), Sense::click());
             let lp = ui.painter();
+            let is_light = u16::from(palette.grid_bg.r)
+                + u16::from(palette.grid_bg.g)
+                + u16::from(palette.grid_bg.b)
+                > 384;
             let lbg = if state.link_zoom_volume {
-                Color32::from_rgb(220, 86, 128)
+                if is_light {
+                    Color32::from_rgb(245, 134, 134)
+                } else {
+                    Color32::from_rgb(176, 86, 98)
+                }
+            } else if is_light {
+                Color32::from_rgb(240, 214, 218)
             } else {
-                Color32::from_rgb(245, 212, 224)
+                rgba(palette.toolbar_bg)
             };
-            let lfg = if state.link_zoom_volume {
-                Color32::WHITE
+            let lbd = if is_light {
+                Color32::from_rgb(172, 72, 82)
             } else {
-                Color32::from_rgb(165, 42, 82)
+                rgba(palette.border)
             };
-            lp.rect_filled(lr, 2.0, lbg);
-            lp.rect_stroke(
-                lr,
-                2.0,
-                Stroke::new(1.0, Color32::from_rgb(185, 56, 98)),
-                egui::StrokeKind::Inside,
-            );
-            lp.text(
-                lr.center(),
-                Align2::CENTER_CENTER,
-                "Link",
-                FontId::proportional(10.0),
-                lfg,
-            );
+            lp.rect_filled(lr, 1.5, lbg);
+            lp.rect_stroke(lr, 1.5, Stroke::new(1.0, lbd), egui::StrokeKind::Inside);
+
+            // Vector U-bracket link icon (cyan core with crisp dark outline, like Aegisub).
+            let lc = lr.center();
+            let outline = Stroke::new(3.0, Color32::from_rgb(28, 42, 60));
+            let core = Stroke::new(1.6, Color32::from_rgb(36, 178, 228));
+            let u_segs = [
+                [
+                    Pos2::new(lc.x - 6.0, lc.y - 3.0),
+                    Pos2::new(lc.x - 6.0, lc.y + 3.0),
+                ],
+                [
+                    Pos2::new(lc.x - 6.0, lc.y + 3.0),
+                    Pos2::new(lc.x + 6.0, lc.y + 3.0),
+                ],
+                [
+                    Pos2::new(lc.x + 6.0, lc.y + 3.0),
+                    Pos2::new(lc.x + 6.0, lc.y - 3.0),
+                ],
+            ];
+            for seg in u_segs {
+                lp.line_segment(seg, outline);
+            }
+            for seg in u_segs {
+                lp.line_segment(seg, core);
+            }
             if lresp
                 .on_hover_text("Link vertical zoom and volume")
                 .clicked()

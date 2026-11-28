@@ -349,6 +349,87 @@ fn run_snapshots(out_dir: &Path) -> ExitCode {
             }
             saved += 1;
         }
+
+        // Unsaved-change snapshot at 200% DPI (checks `*<script> - hlouis-sub-edit` title state).
+        {
+            let mut app = build_demo_editor(200);
+            app.shell.set_theme(spec);
+            let _ = app.shell.doc.amend_text(
+                0,
+                "edit",
+                r"{\an8\pos(960,80)\blur2}Unsaved edit / Tiêu đề chưa lưu (Ầ, ữ, ỗ)",
+            );
+            let path = out_dir.join(format!("view_unsaved_200dpi_{t_name}.png"));
+            let size = Vec2::new(1440.0, 900.0);
+            let rendered = {
+                let mut harness = Harness::builder()
+                    .with_size(size)
+                    .with_pixels_per_point(2.0)
+                    .with_accessibility_check(false)
+                    .build_ui(|ui| {
+                        app.show(ui, &clock);
+                    });
+                harness.run();
+                harness.render()
+            };
+            let write_res = match rendered {
+                Ok(img) => img.save(&path).map_err(|e| e.to_string()),
+                Err(_) => render_fallback_png(&path, 2880, 1800, &app),
+            };
+            if let Err(e) = write_res {
+                eprintln!("failed to save {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            saved += 1;
+        }
+
+        // Grid tag-marker snapshot at 200% DPI: karaoke, typeset (1 block), consecutive, plain.
+        {
+            let marker_ass = "\
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+Style: Romaji,Arial,44,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,8,10,10,10,1
+Style: Sign,Arial,42,&H00FFE080,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.40,Romaji,,0,0,0,karaoke,{\\k40}Ni{\\k50}ge{\\k60}ta{\\k30}ku {\\k40}na{\\k50}ru
+Dialogue: 0,0:00:02.40,0:00:04.20,Sign,,0,0,0,,{\\an8\\pos(960,80)\\blur2}Typeset sign / Tiêu đề cảnh
+Dialogue: 0,0:00:04.20,0:00:06.00,Sign,,0,0,0,,{\\an8}{\\blur2}Consecutive hidden blocks collapse to one
+Dialogue: 0,0:00:06.00,0:00:08.00,Default,,0,0,0,,Plain line with stacked diacritics: Ầ, ữ, ỗ
+";
+            let mut app = EditorApp::new(ass_core::parse_ass(marker_ass).value);
+            app.shell.set_theme(spec);
+            app.shell.layout_state.mode = ViewMode::SubsOnly;
+            let path = out_dir.join(format!("grid_tag_markers_200dpi_{t_name}.png"));
+            let size = Vec2::new(1100.0, 420.0);
+            let rendered = {
+                let mut harness = Harness::builder()
+                    .with_size(size)
+                    .with_pixels_per_point(2.0)
+                    .with_accessibility_check(false)
+                    .build_ui(|ui| {
+                        app.show(ui, &clock);
+                    });
+                harness.run();
+                harness.render()
+            };
+            let write_res = match rendered {
+                Ok(img) => img.save(&path).map_err(|e| e.to_string()),
+                Err(_) => render_fallback_png(&path, 2200, 840, &app),
+            };
+            if let Err(e) = write_res {
+                eprintln!("failed to save {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            saved += 1;
+        }
     }
     println!(
         "hlouis-ui-demo: saved {saved} PNG snapshots to {}",

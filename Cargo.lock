@@ -5182,6 +5182,7 @@ dependencies = [
  "egui_kittest",
  "grid-model",
  "i18n-catalog",
+ "settings",
  "syntax-highlight",
  "theme",
  "ui-theme",

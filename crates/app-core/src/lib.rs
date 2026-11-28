@@ -905,6 +905,13 @@ pub fn build_demo_script(line_count: usize) -> ScriptFile {
                 "",
                 "QC note: kiểm tra lại tên riêng nhân vật",
             ),
+            15 => (
+                "Dialogue: 0,",
+                120u32,
+                "Default",
+                "",
+                r"{\i1}Italic dialogue line\NPhụ đề tiếng Việt",
+            ),
             _ => (
                 "Dialogue: 0,",
                 120u32,
@@ -914,7 +921,7 @@ pub fn build_demo_script(line_count: usize) -> ScriptFile {
                     "Default"
                 },
                 "",
-                r"{\i1}Sample subtitle dialogue line\NPhụ đề tiếng Việt",
+                r"Sample subtitle dialogue line\NPhụ đề tiếng Việt (Ầ, ữ, ỗ)",
             ),
         };
         let end = AssTime::from_cs(s.saturating_add(dur_cs));

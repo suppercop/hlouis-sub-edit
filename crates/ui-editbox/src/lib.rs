@@ -236,6 +236,20 @@ impl EditBoxState {
             let dur = AssTime::from_cs(ev.end().as_cs().saturating_sub(ev.start().as_cs()));
             format_time_field(dur, false, None, &mut self.dur_buf);
             self.tokenizer.set_text(&self.text_buf);
+            let style_opt = doc
+                .script()
+                .styles()
+                .find(|st| st.name().eq_ignore_ascii_case(ev.style()))
+                .or_else(|| doc.script().styles().next());
+            if let Some(st) = style_opt {
+                self.colour_swatches = [
+                    parse_ass_colour_rgb(st.primary_colour()).unwrap_or(Color32::WHITE),
+                    parse_ass_colour_rgb(st.secondary_colour())
+                        .unwrap_or(Color32::from_rgb(255, 0, 0)),
+                    parse_ass_colour_rgb(st.outline_colour()).unwrap_or(Color32::BLACK),
+                    parse_ass_colour_rgb(st.back_colour()).unwrap_or(Color32::BLACK),
+                ];
+            }
             self.cached_event = Some(ev);
             self.cached_event_key = Some((non_text_rev, idx));
             self.event_cache_refreshes = self.event_cache_refreshes.saturating_add(1);
@@ -397,7 +411,26 @@ pub fn count_visible_chars_and_cps(text: &str, dur_cs: u32) -> (usize, u32) {
     (max_line_chars, cps)
 }
 
-/// Paints a classic Aegisub `"AB"` colour-picker button (primary, secondary, outline, shadow).
+/// Parses an ASS `&HAABBGGRR` or `&HBBGGRR` colour string into an opaque [`Color32`].
+#[must_use]
+pub fn parse_ass_colour_rgb(raw: &str) -> Option<Color32> {
+    let trimmed = raw.trim().trim_end_matches('&');
+    let hex = trimmed
+        .strip_prefix("&H")
+        .or_else(|| trimmed.strip_prefix("&h"))
+        .unwrap_or(trimmed);
+    let val = u32::from_str_radix(hex, 16).ok()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let r = (val & 0xFF) as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let g = ((val >> 8) & 0xFF) as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let b = ((val >> 16) & 0xFF) as u8;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+/// Paints a classic Aegisub `"AB"` colour-picker button: bold `"AB"` in the active style's actual
+/// colour (primary, secondary, outline, shadow) on a normal white button.
 fn paint_ab_colour_button(
     ui: &mut Ui,
     fg_color: Color32,
@@ -407,10 +440,18 @@ fn paint_ab_colour_button(
     tooltip: &str,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(22.0, 18.0), Sense::click());
+    let is_light =
+        u16::from(pal.grid_bg.r) + u16::from(pal.grid_bg.g) + u16::from(pal.grid_bg.b) > 384;
     let bg = if resp.hovered() {
-        rgba(pal.hover)
+        if is_light {
+            Color32::from_rgb(238, 244, 252)
+        } else {
+            Color32::from_rgb(224, 228, 236)
+        }
+    } else if is_light {
+        Color32::WHITE
     } else {
-        rgba(pal.toolbar_bg)
+        Color32::from_rgb(238, 238, 240)
     };
     let galley = match cached {
         Some(entry) if entry.generation == generation && entry.color == fg_color => {
@@ -436,6 +477,13 @@ fn paint_ab_colour_button(
         Stroke::new(1.0, rgba(pal.border)),
         egui::StrokeKind::Inside,
     );
+    let lum = (u32::from(fg_color.r()) * 299
+        + u32::from(fg_color.g()) * 587
+        + u32::from(fg_color.b()) * 114)
+        / 1000;
+    if lum > 200 {
+        p.rect_filled(rect.shrink(2.0), 1.5, Color32::from_rgb(76, 82, 92));
+    }
     let gsize = galley.size();
     p.galley(
         Pos2::new(
@@ -678,9 +726,10 @@ pub fn show_edit_box(
             changed = true;
         }
 
+        let style_w = (ui.available_width() * 0.28).clamp(90.0, 190.0);
         let prev_style = state.style_buf.clone();
         egui::ComboBox::from_id_salt(("edit_style_combo", line_idx))
-            .width(86.0)
+            .width(style_w)
             .selected_text(&state.style_buf)
             .show_ui(ui, |ui| {
                 let mut any_style = false;
@@ -718,12 +767,19 @@ pub fn show_edit_box(
             state.edit_style_requested = true;
         }
 
+        // Stretch Actor (~190 px cap) and Effect (remaining width) so max line length sits flush
+        // at the far right edge with no empty trailing gap.
+        let len_box_w = 28.0;
+        let rem_for_combos = (ui.available_width() - len_box_w - 50.0).max(80.0);
+        let actor_w = (rem_for_combos * 0.48).clamp(40.0, 190.0);
+        let effect_w = (rem_for_combos - actor_w).max(40.0);
+
         if editable_combo(
             ui,
             ("edit_actor", line_idx),
             &mut state.actor_buf,
             catalog.get("grid-col-actor").unwrap_or("Actor"),
-            64.0,
+            actor_w,
             doc.script(),
             autocomplete_actors,
         ) {
@@ -746,7 +802,7 @@ pub fn show_edit_box(
             ("edit_effect", line_idx),
             &mut state.effect_buf,
             catalog.get("grid-col-effect").unwrap_or("Effect"),
-            64.0,
+            effect_w,
             doc.script(),
             autocomplete_effects,
         ) {
@@ -1228,5 +1284,43 @@ mod tests {
         state.sync_active_line(&doc, None);
         assert_eq!(state.event_cache_refreshes(), 4);
         assert_eq!(state.event_lookups(), 3);
+    }
+
+    #[test]
+    fn parse_ass_colour_and_sync_active_style_swatches() {
+        assert_eq!(
+            parse_ass_colour_rgb("&H00FFE080"),
+            Some(Color32::from_rgb(0x80, 0xE0, 0xFF))
+        );
+        assert_eq!(
+            parse_ass_colour_rgb("&H000000FF&"),
+            Some(Color32::from_rgb(0xFF, 0x00, 0x00))
+        );
+        let raw = "[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Sign,Arial,42,&H00FFE080,&H000000FF,&H00102030,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Sign,,0,0,0,,Test
+";
+        let doc = DocumentController::new(ass_core::parse_ass(raw).value);
+        let mut state = EditBoxState::default();
+        state.sync_active_line(&doc, None);
+        assert_eq!(
+            state.colour_swatches[0],
+            Color32::from_rgb(0x80, 0xE0, 0xFF)
+        );
+        assert_eq!(
+            state.colour_swatches[1],
+            Color32::from_rgb(0xFF, 0x00, 0x00)
+        );
+        assert_eq!(
+            state.colour_swatches[2],
+            Color32::from_rgb(0x30, 0x20, 0x10)
+        );
+        assert_eq!(
+            state.colour_swatches[3],
+            Color32::from_rgb(0x00, 0x00, 0x00)
+        );
     }
 }

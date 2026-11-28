@@ -12,6 +12,7 @@ ass-core = { path = "../ass-core" }
 egui = { workspace = true, features = ["default_fonts"] }
 grid-model = { path = "../grid-model" }
 i18n-catalog = { path = "../i18n-catalog" }
+settings = { path = "../settings" }
 syntax-highlight = { path = "../syntax-highlight" }
 theme = { path = "../theme" }
 ui-theme = { path = "../ui-theme" }
