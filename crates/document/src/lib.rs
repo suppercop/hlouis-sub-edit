@@ -147,6 +147,9 @@ pub struct DocumentController {
     has_bom: bool,
     last_disk_stamp: Option<DiskStamp>,
     commit_id: u64,
+    // u32 (wrapping) so it packs into existing padding next to the bool flags and keeps the hot
+    // amend-while-typing fields on the same cache lines.
+    non_text_revision: u32,
     saved_commit_id: u64,
     // Pre-allocated amend buffers for 0-allocation keystroke merging while typing.
     amend_state: Option<ActiveAmend>,
@@ -185,6 +188,7 @@ impl DocumentController {
             has_bom: true,
             last_disk_stamp: None,
             commit_id: 0,
+            non_text_revision: 0,
             saved_commit_id: 0,
             amend_state: None,
             amend_desc: String::with_capacity(64),
@@ -320,6 +324,24 @@ impl DocumentController {
         self.commit_id
     }
 
+    /// Monotonically increasing revision counter incremented on every content change (`commit`,
+    /// `amend_text`, `amend_time`, `undo`, `redo`, `reload_from_disk`); selection changes do not
+    /// increment it.
+    #[inline]
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.commit_id
+    }
+
+    /// Monotonically increasing revision counter incremented on every structural, timing,
+    /// metadata, undo/redo, or reload change, excluding in-place same-line `amend_text` edits.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_lossless)]
+    pub const fn non_text_revision(&self) -> u64 {
+        self.non_text_revision as u64
+    }
+
     /// Description of the next undo step (including an active un-flushed amend).
     #[must_use]
     pub fn undo_description(&self) -> Option<&str> {
@@ -369,6 +391,7 @@ impl DocumentController {
         self.undo_descs.push(description.into());
         self.redo_descs.clear();
         self.commit_id += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.dirty = self.commit_id != self.saved_commit_id;
         self.autosave_dirty = true;
         self.notify(commit_type, false);
@@ -475,6 +498,7 @@ impl DocumentController {
             }
         }
         self.commit_id += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.dirty = true;
         self.autosave_dirty = true;
         self.notify(CommitType::TIMES, true);
@@ -503,6 +527,7 @@ impl DocumentController {
                 self.undo.execute(&mut self.script, cmd)?;
                 self.undo_descs.push(self.amend_desc.clone());
                 self.redo_descs.clear();
+                self.non_text_revision = self.non_text_revision.wrapping_add(1);
             }
             AmendField::StartTime(index) | AmendField::EndTime(index) => {
                 if active.orig_time == active.cur_time {
@@ -531,6 +556,7 @@ impl DocumentController {
                 self.undo.execute(&mut self.script, cmd)?;
                 self.undo_descs.push(self.amend_desc.clone());
                 self.redo_descs.clear();
+                self.non_text_revision = self.non_text_revision.wrapping_add(1);
             }
         }
         let _ = active.commit_type;
@@ -549,6 +575,7 @@ impl DocumentController {
         let desc = self.undo_descs.pop().unwrap_or_default();
         self.redo_descs.push(desc.clone());
         self.commit_id += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.dirty = self.commit_id != self.saved_commit_id;
         self.autosave_dirty = true;
         self.notify(CommitType::EVERYTHING, false);
@@ -567,6 +594,7 @@ impl DocumentController {
         let desc = self.redo_descs.pop().unwrap_or_default();
         self.undo_descs.push(desc.clone());
         self.commit_id += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.dirty = self.commit_id != self.saved_commit_id;
         self.autosave_dirty = true;
         self.notify(CommitType::EVERYTHING, false);
@@ -631,6 +659,7 @@ impl DocumentController {
         self.redo_descs.clear();
         self.amend_state = None;
         self.commit_id += 1;
+        self.non_text_revision = self.non_text_revision.wrapping_add(1);
         self.saved_commit_id = self.commit_id;
         self.dirty = false;
         self.autosave_dirty = false;
@@ -722,5 +751,61 @@ mod tests {
         doc.reload_from_disk().expect("reload");
         assert!(!doc.needs_reload_from_disk());
         assert!(calls.load(Ordering::Relaxed) >= 5);
+    }
+
+    #[test]
+    fn revision_tracks_content_changes_and_ignores_selection() {
+        let mut script = ScriptFile::new_default();
+        let sec = script.ensure_events_section_mut();
+        sec.insert_event(
+            0,
+            AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(200), "Line 0"),
+        );
+        sec.insert_event(
+            1,
+            AssEvent::dialogue(AssTime::from_cs(200), AssTime::from_cs(400), "Line 1"),
+        );
+        let mut doc = DocumentController::new(script);
+        assert_eq!(doc.revision(), 0);
+        assert_eq!(doc.non_text_revision(), 0);
+
+        // Selection changes do not bump revision.
+        doc.set_selection(Some(1), &[1]);
+        assert_eq!(doc.revision(), 0);
+        assert_eq!(doc.non_text_revision(), 0);
+
+        // Consecutive same-line amend_text bumps revision() but not non_text_revision().
+        doc.amend_text(1, "typing", "Line 1a").expect("amend 1");
+        assert_eq!(doc.revision(), 1);
+        assert_eq!(doc.non_text_revision(), 0);
+        doc.amend_text(1, "typing", "Line 1ab").expect("amend 2");
+        assert_eq!(doc.revision(), 2);
+        assert_eq!(doc.non_text_revision(), 0);
+
+        // Undo bumps both revision() and non_text_revision().
+        let nt_before_undo = doc.non_text_revision();
+        doc.undo().expect("undo");
+        assert_eq!(doc.revision(), 3);
+        assert!(doc.non_text_revision() > nt_before_undo);
+
+        // Redo bumps both.
+        let nt_before_redo = doc.non_text_revision();
+        doc.redo().expect("redo");
+        assert_eq!(doc.revision(), 4);
+        assert!(doc.non_text_revision() > nt_before_redo);
+
+        // Commit bumps both.
+        let nt_before_commit = doc.non_text_revision();
+        doc.commit(
+            "insert",
+            EditCommand::InsertEvent {
+                index: 2,
+                event: AssEvent::dialogue(AssTime::from_cs(400), AssTime::from_cs(600), "Line 2"),
+            },
+            CommitType::ORDER,
+        )
+        .expect("commit");
+        assert_eq!(doc.revision(), 5);
+        assert!(doc.non_text_revision() > nt_before_commit);
     }
 }

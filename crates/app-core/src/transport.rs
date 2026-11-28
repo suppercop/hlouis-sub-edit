@@ -31,10 +31,17 @@ pub const AUDIO_EXTENSIONS: &[&str] = &[
 /// File extensions opened as subtitles.
 pub const SUBTITLE_EXTENSIONS: &[&str] = &["ass", "ssa", "srt"];
 
+/// Scripts above this many lines debounce text-only subtitle pushes to the renderer.
+const SUBTITLE_PUSH_DEBOUNCE_MIN_LINES: usize = 20_000;
+/// Debounce delay for those pushes (150 ms of typing silence).
+const SUBTITLE_PUSH_DEBOUNCE_NS: u64 = 150_000_000;
+
 /// Per-session transport bookkeeping (what was last pushed to the providers).
 #[derive(Debug, Default)]
 pub struct TransportState {
     last_commit: Option<u64>,
+    last_marker_rev: Option<u64>,
+    subtitle_push_at: Option<u64>,
     requested_frame: Option<u32>,
     last_active_line: Option<usize>,
     was_playing: bool,
@@ -47,6 +54,8 @@ impl TransportState {
     /// Forces the next frame to re-push the script and re-request the displayed frame.
     pub fn invalidate(&mut self) {
         self.last_commit = None;
+        self.last_marker_rev = None;
+        self.subtitle_push_at = None;
         self.requested_frame = None;
     }
 }
@@ -645,16 +654,49 @@ impl EditorApp {
             self.video.request_frame(f);
         }
 
-        // Script changed (including un-flushed typing): re-render subtitles on the frame.
-        let commit = self.shell.doc.commit_id();
-        if self.transport.last_commit != Some(commit) {
-            self.transport.last_commit = Some(commit);
-            if self.shell.playback.is_some() || self.video_path.is_some() {
-                let text = self.render_ass_text();
-                self.video.set_subtitles(text);
-            }
+        self.sync_script_outputs(ctx, clock);
+    }
+
+    /// Pushes script changes to the audio markers and the video renderer.
+    fn sync_script_outputs(&mut self, ctx: &egui::Context, clock: &dyn Clock) {
+        // Line-boundary markers only depend on timings/structure: text-only typing (which bumps
+        // `commit_id` every keystroke) must not rescan every event.
+        let marker_rev = self.shell.doc.non_text_revision();
+        let structure_changed = self.transport.last_marker_rev != Some(marker_rev);
+        if structure_changed {
+            self.transport.last_marker_rev = Some(marker_rev);
             if self.audio.is_some() {
                 self.rebuild_markers();
+            }
+        }
+
+        // Script changed (including un-flushed typing): re-render subtitles on the frame. For big
+        // scripts, text-only typing is debounced: serialising every event per keystroke is O(lines).
+        let commit = self.shell.doc.commit_id();
+        let now = clock.now_ns();
+        if self.transport.last_commit != Some(commit) {
+            self.transport.last_commit = Some(commit);
+            let big = self
+                .shell
+                .doc
+                .script()
+                .events_section()
+                .is_some_and(|s| s.event_count() > SUBTITLE_PUSH_DEBOUNCE_MIN_LINES);
+            if big && !structure_changed {
+                self.transport.subtitle_push_at = Some(now + SUBTITLE_PUSH_DEBOUNCE_NS);
+            } else {
+                self.transport.subtitle_push_at = Some(now);
+            }
+        }
+        if let Some(at) = self.transport.subtitle_push_at {
+            if now >= at {
+                self.transport.subtitle_push_at = None;
+                if self.shell.playback.is_some() || self.video_path.is_some() {
+                    let text = self.render_ass_text();
+                    self.video.set_subtitles(text);
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_nanos(at - now));
             }
         }
     }

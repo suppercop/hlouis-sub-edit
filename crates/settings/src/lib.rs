@@ -95,6 +95,18 @@ impl Default for AppearancePrefs {
     }
 }
 
+/// Visual marker drawn in the subtitle grid where an override `{...}` block was hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HiddenTagMarker {
+    /// Small low-contrast vector dot (default).
+    #[default]
+    SmallDot,
+    /// Compact low-contrast vector sun (Aegisub style).
+    AegisubSun,
+    /// Do not draw any marker for hidden override blocks.
+    None,
+}
+
 /// Interface & grid preference page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -104,6 +116,8 @@ pub struct InterfacePrefs {
     pub show_video: bool,
     pub show_audio: bool,
     pub hide_overrides_mode: u8,
+    pub hidden_tag_marker: HiddenTagMarker,
+    pub hide_karaoke_only_markers: bool,
     pub show_col_layer: bool,
     pub show_col_actor: bool,
     pub show_col_effect: bool,
@@ -120,6 +134,8 @@ impl Default for InterfacePrefs {
             show_video: true,
             show_audio: true,
             hide_overrides_mode: 1,
+            hidden_tag_marker: HiddenTagMarker::SmallDot,
+            hide_karaoke_only_markers: true,
             show_col_layer: false,
             show_col_actor: false,
             show_col_effect: false,
@@ -146,6 +162,9 @@ pub struct AudioPrefs {
     pub lead_in_ms: i64,
     pub lead_out_ms: i64,
     pub cache_ram_mb: u32,
+    pub auto_snap_keyframes: bool,
+    pub snap_to_lines: bool,
+    pub snap_distance_px: u32,
 }
 
 impl Default for AudioPrefs {
@@ -161,6 +180,9 @@ impl Default for AudioPrefs {
             lead_in_ms: 200,
             lead_out_ms: 300,
             cache_ram_mb: 512,
+            auto_snap_keyframes: true,
+            snap_to_lines: true,
+            snap_distance_px: 10,
         }
     }
 }
@@ -389,7 +411,16 @@ impl AppSettings {
     /// # Errors
     /// Returns [`SettingsError::Json`] if serialization fails.
     pub fn save_json(&self) -> Result<String, SettingsError> {
-        Ok(serde_json::to_string_pretty(self)?)
+        // Pre-sized buffer: pretty JSON of the full settings tree is a few KiB, so this avoids the
+        // repeated geometric reallocations of `to_string_pretty` (starts at 128 bytes).
+        let mut buf = Vec::with_capacity(8 * 1024);
+        serde_json::to_writer_pretty(&mut buf, self)?;
+        String::from_utf8(buf).map_err(|e| {
+            SettingsError::Json(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e,
+            )))
+        })
     }
 
     /// Applies forward schema migrations (e.g. v1 -> v2).
@@ -421,6 +452,7 @@ impl AppSettings {
         self.audio.lead_in_ms = self.audio.lead_in_ms.clamp(0, 10_000);
         self.audio.lead_out_ms = self.audio.lead_out_ms.clamp(0, 10_000);
         self.audio.cache_ram_mb = self.audio.cache_ram_mb.clamp(32, 4096);
+        self.audio.snap_distance_px = self.audio.snap_distance_px.clamp(1, 64);
         self.video.default_zoom_idx = self.video.default_zoom_idx.min(20);
         self.video.fast_jump_step = self.video.fast_jump_step.clamp(1, 1000);
         self.video.check_script_res = self.video.check_script_res.min(3);
@@ -590,5 +622,21 @@ mod tests {
             AppSettings::load_json_with_report(&AppSettings::default().save_json().unwrap())
                 .unwrap();
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn audio_snap_defaults_and_clamping() {
+        let mut s = AppSettings::default();
+        assert!(s.audio.auto_snap_keyframes);
+        assert!(s.audio.snap_to_lines);
+        assert_eq!(s.audio.snap_distance_px, 10);
+
+        s.audio.snap_distance_px = 0;
+        s.validate_and_clamp();
+        assert_eq!(s.audio.snap_distance_px, 1);
+
+        s.audio.snap_distance_px = 500;
+        s.validate_and_clamp();
+        assert_eq!(s.audio.snap_distance_px, 64);
     }
 }

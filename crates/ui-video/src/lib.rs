@@ -15,14 +15,14 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use egui::{
-    Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, TextureHandle,
+    Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureId,
     TextureOptions, Ui, Vec2,
 };
 use i18n_catalog::Catalog;
 use playback::{Clock, PlaybackController};
-use std::f32::consts::TAU;
 use std::fmt::Write as _;
 use theme::Palette;
+use ui_theme::icon_atlas::{IconAtlasBuilder, slot_uv};
 use ui_theme::{rgba, snap_px};
 use video_geometry::VideoDisplayState;
 use visual_tools::vector_clip::{VectorClipMode, VectorClipPath, VectorVertexKind};
@@ -119,6 +119,9 @@ pub struct VideoPanelState {
     uploaded_key: Option<(u32, u64)>,
     texture_uploads: u64,
     // Reusable scratch buffer for drawing 500+ vector clip segments without allocating.
+    // Cached 13-slot icon atlas (0 per-frame allocations / tessellation).
+    icon_atlas: Option<TextureHandle>,
+    icon_atlas_key: Option<(u32, bool)>,
     poly_scratch: Vec<Pos2>,
     frame_time_buf: String,
     offset_buf: String,
@@ -164,6 +167,8 @@ impl VideoPanelState {
             texture: None,
             uploaded_key: None,
             texture_uploads: 0,
+            icon_atlas: None,
+            icon_atlas_key: None,
             poly_scratch: Vec::with_capacity(1024),
             frame_time_buf: String::with_capacity(32),
             offset_buf: String::with_capacity(32),
@@ -216,191 +221,295 @@ impl VideoPanelState {
     }
 }
 
-/// Paints a coloured 16×16 vector icon for one of the 7 Aegisub visual tools with pressed frame.
-#[allow(clippy::too_many_lines)]
-fn visual_tool_icon_button(
+const VISUAL_ICON_SLOTS: usize = 13;
+const SLOT_PLAY: usize = 8;
+const SLOT_PLAY_LINE: usize = 9;
+const SLOT_PAUSE: usize = 10;
+const SLOT_AUTO_ON: usize = 11;
+const SLOT_AUTO_OFF: usize = 12;
+
+fn is_light_palette(pal: &Palette) -> bool {
+    u16::from(pal.grid_bg.r) + u16::from(pal.grid_bg.g) + u16::from(pal.grid_bg.b) > 384
+}
+
+fn paint_visual_tool_icons(atlas: &mut IconAtlasBuilder, is_light: bool) {
+    let blue = if is_light {
+        Color32::from_rgb(38, 114, 206)
+    } else {
+        Color32::from_rgb(104, 168, 236)
+    };
+    let blue_soft = Color32::from_rgba_unmultiplied(blue.r(), blue.g(), blue.b(), 72);
+    let red = if is_light {
+        Color32::from_rgb(206, 68, 68)
+    } else {
+        Color32::from_rgb(228, 112, 112)
+    };
+    let green = if is_light {
+        Color32::from_rgb(42, 156, 88)
+    } else {
+        Color32::from_rgb(98, 196, 134)
+    };
+    let amber = if is_light {
+        Color32::from_rgb(206, 132, 32)
+    } else {
+        Color32::from_rgb(228, 168, 78)
+    };
+    let purple = if is_light {
+        Color32::from_rgb(138, 76, 194)
+    } else {
+        Color32::from_rgb(176, 130, 224)
+    };
+    let purple_soft = Color32::from_rgba_unmultiplied(purple.r(), purple.g(), purple.b(), 64);
+
+    // 0: Standard pointer (Cross)
+    {
+        let mut s = atlas.slot(0);
+        s.fill_tri([3.5, 2.0], [3.5, 13.5], [7.2, 10.2], blue);
+        s.fill_tri([3.5, 2.0], [7.2, 10.2], [12.0, 10.2], blue);
+        s.line(7.4, 10.0, 10.2, 14.2, 1.8, blue);
+    }
+    // 1: Drag subtitles (4-way move arrows)
+    {
+        let mut s = atlas.slot(1);
+        s.line(3.5, 8.0, 12.5, 8.0, 1.7, blue);
+        s.line(8.0, 3.5, 8.0, 12.5, 1.7, blue);
+        s.fill_tri([8.0, 1.5], [5.4, 4.6], [10.6, 4.6], red);
+        s.fill_tri([8.0, 14.5], [5.4, 11.4], [10.6, 11.4], red);
+        s.fill_tri([1.5, 8.0], [4.6, 5.4], [4.6, 10.6], red);
+        s.fill_tri([14.5, 8.0], [11.4, 5.4], [11.4, 10.6], red);
+    }
+    // 2: Rotate Z (circular arc + arrowhead + pivot)
+    {
+        let mut s = atlas.slot(2);
+        s.arc(8.0, 8.0, 5.2, 5.2, -0.4, 4.3, 1.9, green);
+        s.fill_tri([12.8, 3.6], [9.2, 2.8], [11.6, 6.4], green);
+        s.fill_circle(8.0, 8.0, 2.1, red);
+    }
+    // 3: Rotate X/Y (3D orbit ellipse + tilted axis)
+    {
+        let mut s = atlas.slot(3);
+        s.stroke_ellipse(8.0, 8.0, 6.0, 3.2, 1.6, amber);
+        s.line(5.8, 2.2, 10.2, 13.8, 1.7, blue);
+        s.fill_circle(8.0, 8.0, 1.8, red);
+    }
+    // 4: Scale (duotone box + expand arrow)
+    {
+        let mut s = atlas.slot(4);
+        s.fill_rect(2.2, 2.2, 9.5, 9.5, 1.2, blue_soft);
+        s.stroke_rect(2.2, 2.2, 9.5, 9.5, 1.2, 1.5, blue);
+        s.line(8.8, 8.8, 13.4, 13.4, 1.8, green);
+        s.fill_tri([14.2, 14.2], [10.2, 13.8], [13.8, 10.2], red);
+    }
+    // 5: Rect clip (duotone frame + 4 corner nodes)
+    {
+        let mut s = atlas.slot(5);
+        s.fill_rect(3.0, 3.5, 13.0, 12.5, 0.8, purple_soft);
+        s.stroke_rect(3.0, 3.5, 13.0, 12.5, 0.8, 1.5, purple);
+        for (cx, cy) in [(3.0, 3.5), (13.0, 3.5), (3.0, 12.5), (13.0, 12.5)] {
+            s.fill_rect(cx - 1.6, cy - 1.6, cx + 1.6, cy + 1.6, 0.4, red);
+        }
+    }
+    // 6: Vector clip (bezier polygon + control nodes)
+    {
+        let mut s = atlas.slot(6);
+        let pts = [(3.0, 12.0), (5.5, 3.2), (13.2, 6.0), (10.5, 12.8)];
+        for i in 0..pts.len() {
+            let a = pts[i];
+            let b = pts[(i + 1) % pts.len()];
+            s.line(a.0, a.1, b.0, b.1, 1.5, amber);
+        }
+        for (cx, cy) in pts {
+            s.fill_rect(cx - 1.6, cy - 1.6, cx + 1.6, cy + 1.6, 0.5, blue);
+        }
+    }
+    // 7: Help (`?` inside soft circle, pure vector)
+    {
+        let mut s = atlas.slot(7);
+        s.fill_circle(8.0, 8.0, 6.4, blue);
+        let white = Color32::WHITE;
+        s.arc(8.0, 6.1, 2.2, 2.0, -2.7, 0.9, 1.6, white);
+        s.line(9.2, 7.6, 8.0, 9.2, 1.6, white);
+        s.fill_circle(8.0, 11.7, 1.1, white);
+    }
+}
+
+fn paint_playback_icons(atlas: &mut IconAtlasBuilder, is_light: bool) {
+    let fg = if is_light {
+        Color32::from_rgb(38, 42, 50)
+    } else {
+        Color32::from_rgb(218, 224, 232)
+    };
+    let muted = if is_light {
+        Color32::from_rgb(112, 118, 128)
+    } else {
+        Color32::from_rgb(142, 148, 160)
+    };
+    let red = if is_light {
+        Color32::from_rgb(196, 56, 56)
+    } else {
+        Color32::from_rgb(226, 108, 108)
+    };
+    let blue = if is_light {
+        Color32::from_rgb(38, 114, 206)
+    } else {
+        Color32::from_rgb(104, 168, 236)
+    };
+
+    // 8: Play
+    {
+        let mut s = atlas.slot(SLOT_PLAY);
+        s.fill_tri([4.5, 3.0], [13.0, 8.0], [4.5, 13.0], fg);
+    }
+    // 9: Play current line (`[▶]`)
+    {
+        let mut s = atlas.slot(SLOT_PLAY_LINE);
+        s.line(2.2, 3.2, 2.2, 12.8, 1.4, red);
+        s.line(2.2, 3.2, 4.4, 3.2, 1.4, red);
+        s.line(2.2, 12.8, 4.4, 12.8, 1.4, red);
+        s.line(13.8, 3.2, 13.8, 12.8, 1.4, red);
+        s.line(11.6, 3.2, 13.8, 3.2, 1.4, red);
+        s.line(11.6, 12.8, 13.8, 12.8, 1.4, red);
+        s.fill_tri([5.8, 4.6], [11.2, 8.0], [5.8, 11.4], fg);
+    }
+    // 10: Pause
+    {
+        let mut s = atlas.slot(SLOT_PAUSE);
+        s.fill_rect(4.2, 3.4, 6.8, 12.6, 0.5, fg);
+        s.fill_rect(9.2, 3.4, 11.8, 12.6, 0.5, fg);
+    }
+    // 11 & 12: AUTO sync icon (on / off)
+    for (slot, col) in [(SLOT_AUTO_ON, blue), (SLOT_AUTO_OFF, muted)] {
+        let mut s = atlas.slot(slot);
+        s.arc(8.0, 8.0, 4.8, 4.8, -0.5, 4.6, 1.6, col);
+        s.fill_tri([12.8, 4.2], [9.4, 3.2], [11.6, 6.8], col);
+        s.fill_circle(8.0, 8.0, 1.8, col);
+    }
+}
+
+fn ensure_visual_icon_atlas(
+    ctx: &egui::Context,
+    state: &mut VideoPanelState,
+    ppp: f32,
+    is_light: bool,
+) -> TextureId {
+    let key = (ppp.to_bits(), is_light);
+    if state.icon_atlas_key == Some(key)
+        && let Some(ref tex) = state.icon_atlas
+    {
+        return tex.id();
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    let slot_px = (16.0 * ppp.max(1.0)).round().clamp(16.0, 48.0) as usize;
+    let mut atlas = IconAtlasBuilder::new(VISUAL_ICON_SLOTS, slot_px);
+    paint_visual_tool_icons(&mut atlas, is_light);
+    paint_playback_icons(&mut atlas, is_light);
+
+    let img = atlas.into_color_image();
+    if let Some(ref mut tex) = state.icon_atlas {
+        tex.set(img, TextureOptions::NEAREST);
+        state.icon_atlas_key = Some(key);
+        tex.id()
+    } else {
+        let tex = ctx.load_texture("hlouis_visual_icons", img, TextureOptions::NEAREST);
+        let id = tex.id();
+        state.icon_atlas = Some(tex);
+        state.icon_atlas_key = Some(key);
+        id
+    }
+}
+
+fn visual_atlas_button(
     ui: &mut Ui,
-    tool: ActiveVisualTool,
+    atlas_id: TextureId,
+    slot: usize,
     selected: bool,
     pal: &Palette,
+    ppp: f32,
     tooltip: &str,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
     let p = ui.painter();
+    let is_light = is_light_palette(pal);
     let bg = if selected {
-        Color32::from_rgb(198, 224, 250)
+        if is_light {
+            Color32::from_rgb(206, 228, 250)
+        } else {
+            rgba(pal.selection_bg)
+        }
     } else if resp.hovered() {
         rgba(pal.hover)
     } else {
         rgba(pal.toolbar_bg)
     };
-    p.rect_filled(rect, 2.0, bg);
-    p.rect_stroke(
-        rect,
-        2.0,
-        Stroke::new(
-            if selected { 1.4 } else { 1.0 },
-            if selected {
-                Color32::from_rgb(42, 120, 214)
-            } else {
-                rgba(pal.border)
-            },
-        ),
-        egui::StrokeKind::Inside,
-    );
-    let c = rect.center();
-    let blue = Color32::from_rgb(38, 114, 210);
-    let red = Color32::from_rgb(212, 58, 58);
-    let green = Color32::from_rgb(38, 162, 82);
-    let orange = Color32::from_rgb(218, 128, 24);
-    let purple = Color32::from_rgb(148, 66, 198);
-
-    match tool {
-        ActiveVisualTool::Cross => {
-            p.add(egui::Shape::convex_polygon(
-                vec![
-                    Pos2::new(c.x - 4.0, c.y - 6.0),
-                    Pos2::new(c.x - 4.0, c.y + 5.0),
-                    Pos2::new(c.x - 1.0, c.y + 2.5),
-                    Pos2::new(c.x + 3.5, c.y + 3.0),
-                ],
-                blue,
-                Stroke::new(0.8, Color32::from_rgb(20, 56, 120)),
-            ));
-        }
-        ActiveVisualTool::Drag => {
-            let st = Stroke::new(1.5, blue);
-            p.line_segment([Pos2::new(c.x - 6.0, c.y), Pos2::new(c.x + 6.0, c.y)], st);
-            p.line_segment([Pos2::new(c.x, c.y - 6.0), Pos2::new(c.x, c.y + 6.0)], st);
-            for (dx, dy) in [(-6.0, 0.0), (6.0, 0.0), (0.0, -6.0), (0.0, 6.0)] {
-                p.circle_filled(Pos2::new(c.x + dx, c.y + dy), 1.8, red);
-            }
-        }
-        ActiveVisualTool::RotateZ => {
-            let r = 5.5;
-            let pts: Vec<Pos2> = (0..=12)
-                .map(|i| {
-                    let a = (i as f32 / 12.0) * TAU * 0.78 - 0.5;
-                    Pos2::new(c.x + a.cos() * r, c.y + a.sin() * r)
-                })
-                .collect();
-            p.add(egui::Shape::line(pts, Stroke::new(1.6, green)));
-            p.circle_filled(c, 1.8, red);
-        }
-        ActiveVisualTool::RotateXY => {
-            let pts: Vec<Pos2> = (0..=16)
-                .map(|i| {
-                    let a = (i as f32 / 16.0) * TAU;
-                    Pos2::new(c.x + a.cos() * 6.0, c.y + a.sin() * 3.0)
-                })
-                .collect();
-            p.add(egui::Shape::closed_line(pts, Stroke::new(1.4, orange)));
-            p.line_segment(
-                [
-                    Pos2::new(c.x - 2.0, c.y - 6.0),
-                    Pos2::new(c.x + 2.0, c.y + 6.0),
-                ],
-                Stroke::new(1.4, blue),
-            );
-        }
-        ActiveVisualTool::Scale => {
-            let b = Rect::from_min_max(
-                Pos2::new(c.x - 5.5, c.y - 5.5),
-                Pos2::new(c.x + 1.5, c.y + 1.5),
-            );
-            p.rect_stroke(b, 0.0, Stroke::new(1.4, blue), egui::StrokeKind::Inside);
-            p.line_segment(
-                [
-                    Pos2::new(c.x + 1.0, c.y + 1.0),
-                    Pos2::new(c.x + 6.0, c.y + 6.0),
-                ],
-                Stroke::new(1.6, green),
-            );
-            p.rect_filled(
-                Rect::from_center_size(Pos2::new(c.x + 5.5, c.y + 5.5), Vec2::splat(3.2)),
-                0.0,
-                red,
-            );
-        }
-        ActiveVisualTool::RectClip => {
-            let b = Rect::from_center_size(c, Vec2::new(11.0, 9.0));
-            p.rect_stroke(b, 0.0, Stroke::new(1.4, purple), egui::StrokeKind::Inside);
-            for corner in [
-                b.left_top(),
-                b.right_top(),
-                b.left_bottom(),
-                b.right_bottom(),
-            ] {
-                p.rect_filled(Rect::from_center_size(corner, Vec2::splat(3.0)), 0.0, red);
-            }
-        }
-        ActiveVisualTool::VectorClip => {
-            let v0 = Pos2::new(c.x - 5.5, c.y + 4.5);
-            let v1 = Pos2::new(c.x - 2.0, c.y - 5.0);
-            let v2 = Pos2::new(c.x + 5.5, c.y - 1.5);
-            let v3 = Pos2::new(c.x + 2.5, c.y + 5.0);
-            p.add(egui::Shape::closed_line(
-                vec![v0, v1, v2, v3],
-                Stroke::new(1.4, orange),
-            ));
-            for v in [v0, v1, v2, v3] {
-                p.rect_filled(Rect::from_center_size(v, Vec2::splat(3.0)), 0.0, blue);
-            }
-        }
+    p.rect_filled(rect, 2.5, bg);
+    if selected || resp.hovered() {
+        let bd_col = if selected {
+            rgba(pal.focus_ring)
+        } else {
+            rgba(pal.border)
+        };
+        p.rect_stroke(
+            rect,
+            2.5,
+            Stroke::new(if selected { 1.3 } else { 1.0 }, bd_col),
+            egui::StrokeKind::Inside,
+        );
     }
+    let icon_min = Pos2::new(
+        snap_px(rect.center().x - 8.0, ppp),
+        snap_px(rect.center().y - 8.0, ppp),
+    );
+    let icon_rect = Rect::from_min_size(icon_min, Vec2::splat(16.0));
+    p.image(
+        atlas_id,
+        icon_rect,
+        slot_uv(slot, VISUAL_ICON_SLOTS),
+        Color32::WHITE,
+    );
     resp.on_hover_text(tooltip).clicked()
 }
 
-/// Paints the 8th visual-tool button (`?` help) at the bottom of the left column.
-fn visual_help_button(ui: &mut Ui, active: bool, pal: &Palette) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+/// Paints a plain, borderless playback icon button from the cached atlas (0 allocations).
+fn playback_atlas_button(
+    ui: &mut Ui,
+    atlas_id: TextureId,
+    slot: usize,
+    active: bool,
+    pal: &Palette,
+    ppp: f32,
+    tooltip: &str,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(19.0, 18.0), Sense::click());
     let p = ui.painter();
-    let bg = if active {
-        Color32::from_rgb(198, 224, 250)
+    if active {
+        let tint = if is_light_palette(pal) {
+            Color32::from_rgb(208, 228, 248)
+        } else {
+            rgba(pal.selection_bg)
+        };
+        p.rect_filled(rect, 2.0, tint);
+        p.rect_stroke(
+            rect,
+            2.0,
+            Stroke::new(1.0, rgba(pal.focus_ring)),
+            egui::StrokeKind::Inside,
+        );
     } else if resp.hovered() {
-        rgba(pal.hover)
-    } else {
-        rgba(pal.toolbar_bg)
-    };
-    p.rect_filled(rect, 2.0, bg);
-    p.rect_stroke(
-        rect,
-        2.0,
-        Stroke::new(1.0, rgba(pal.border)),
-        egui::StrokeKind::Inside,
+        p.rect_filled(rect, 2.0, rgba(pal.hover));
+    }
+    let icon_min = Pos2::new(
+        snap_px(rect.center().x - 8.0, ppp),
+        snap_px(rect.center().y - 8.0, ppp),
     );
-    p.circle_filled(rect.center(), 6.5, Color32::from_rgb(42, 120, 214));
-    let c = rect.center();
-    let qst = Stroke::new(1.5, Color32::WHITE);
-    p.line_segment(
-        [
-            Pos2::new(c.x - 2.0, c.y - 2.2),
-            Pos2::new(c.x - 1.2, c.y - 3.6),
-        ],
-        qst,
+    let icon_rect = Rect::from_min_size(icon_min, Vec2::splat(16.0));
+    p.image(
+        atlas_id,
+        icon_rect,
+        slot_uv(slot, VISUAL_ICON_SLOTS),
+        Color32::WHITE,
     );
-    p.line_segment(
-        [
-            Pos2::new(c.x - 1.2, c.y - 3.6),
-            Pos2::new(c.x + 1.4, c.y - 3.6),
-        ],
-        qst,
-    );
-    p.line_segment(
-        [
-            Pos2::new(c.x + 1.4, c.y - 3.6),
-            Pos2::new(c.x + 2.0, c.y - 1.8),
-        ],
-        qst,
-    );
-    p.line_segment(
-        [Pos2::new(c.x + 2.0, c.y - 1.8), Pos2::new(c.x, c.y + 0.5)],
-        qst,
-    );
-    p.line_segment([Pos2::new(c.x, c.y + 0.5), Pos2::new(c.x, c.y + 1.8)], qst);
-    p.circle_filled(Pos2::new(c.x, c.y + 3.8), 1.0, Color32::WHITE);
-    resp.on_hover_text("Toggle visual typesetting tool help")
-        .clicked()
+    resp.on_hover_text(tooltip).clicked()
 }
 
 /// Paints the active visual tool overlay onto `painter` inside `video_rect` (0 allocations in
@@ -560,27 +669,51 @@ pub fn show_video_panel(
     let canvas_h = (ui.available_height() - bottom_bars_h).max(72.0);
     let canvas_w = (ui.available_width() - 28.0).max(120.0);
 
+    let is_light = is_light_palette(palette);
+    let atlas_id = ensure_visual_icon_atlas(ui.ctx(), state, ppp, is_light);
+
     ui.horizontal(|ui| {
-        // Left vertical visual tool toolbar: 8 entries (7 tools + `?` help at the bottom).
+        // Left vertical visual tool toolbar: 8 cached duotone entries (7 tools + `?` help).
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            for (tool, tip) in [
-                (ActiveVisualTool::Cross, "Standard mode"),
-                (ActiveVisualTool::Drag, "Drag subtitles (\\pos)"),
-                (ActiveVisualTool::RotateZ, "Rotate on Z axis (\\frz)"),
+            for (slot, tool, tip) in [
+                (0usize, ActiveVisualTool::Cross, "Standard mode"),
+                (1, ActiveVisualTool::Drag, "Drag subtitles (\\pos)"),
+                (2, ActiveVisualTool::RotateZ, "Rotate on Z axis (\\frz)"),
                 (
+                    3,
                     ActiveVisualTool::RotateXY,
                     "Rotate on X/Y axes (\\frx/\\fry)",
                 ),
-                (ActiveVisualTool::Scale, "Scale subtitles (\\fscx/\\fscy)"),
-                (ActiveVisualTool::RectClip, "Rectangular clip (\\clip)"),
-                (ActiveVisualTool::VectorClip, "Vector clip (\\clip)"),
+                (
+                    4,
+                    ActiveVisualTool::Scale,
+                    "Scale subtitles (\\fscx/\\fscy)",
+                ),
+                (5, ActiveVisualTool::RectClip, "Rectangular clip (\\clip)"),
+                (6, ActiveVisualTool::VectorClip, "Vector clip (\\clip)"),
             ] {
-                if visual_tool_icon_button(ui, tool, state.active_tool == tool, palette, tip) {
+                if visual_atlas_button(
+                    ui,
+                    atlas_id,
+                    slot,
+                    state.active_tool == tool,
+                    palette,
+                    ppp,
+                    tip,
+                ) {
                     state.active_tool = tool;
                 }
             }
-            if visual_help_button(ui, state.show_visual_help, palette) {
+            if visual_atlas_button(
+                ui,
+                atlas_id,
+                7,
+                state.show_visual_help,
+                palette,
+                ppp,
+                "Toggle visual typesetting tool help",
+            ) {
                 state.show_visual_help = !state.show_visual_help;
                 action = Some(VideoPanelAction::ShowVisualHelp);
             }
@@ -779,25 +912,35 @@ pub fn show_video_panel(
         });
     }
 
-    // Row 1 below video: dense seek bar with black keyframe tick marks + small slider thumb.
+    // Row 1 below video: light track + dense black keyframe ticks + dark grey vertical handle.
     let seek_w = (ui.available_width() - 4.0).max(80.0);
     let (seek_rect, seek_resp) =
         ui.allocate_exact_size(Vec2::new(seek_w, 16.0), Sense::click_and_drag());
     let sp = ui.painter_at(seek_rect);
     let track_rect = Rect::from_min_max(
-        Pos2::new(seek_rect.left() + 2.0, seek_rect.center().y - 3.0),
-        Pos2::new(seek_rect.right() - 2.0, seek_rect.center().y + 3.0),
+        Pos2::new(seek_rect.left() + 2.0, seek_rect.center().y - 3.5),
+        Pos2::new(seek_rect.right() - 2.0, seek_rect.center().y + 3.5),
     );
-    sp.rect_filled(track_rect, 1.0, rgba(palette.panel_bg));
+    let track_fill = if is_light {
+        Color32::from_rgb(242, 242, 244)
+    } else {
+        rgba(palette.grid_bg)
+    };
+    sp.rect_filled(track_rect, 0.5, track_fill);
     sp.rect_stroke(
         track_rect,
-        1.0,
+        0.5,
         Stroke::new(1.0, rgba(palette.border)),
         egui::StrokeKind::Inside,
     );
 
     // Draw black keyframe tick marks across the seek track without stride-missing real keyframes.
     let max_f = total.saturating_sub(1).max(1);
+    let tick_col = if is_light {
+        Color32::from_rgb(24, 24, 28)
+    } else {
+        rgba(palette.text_secondary)
+    };
     if let Some(kfs) = supplier.keyframes() {
         let step = (kfs.len() / 320).max(1);
         for &kf_f in kfs.iter().step_by(step) {
@@ -806,15 +949,15 @@ pub fn show_video_panel(
                 let tx = snap_px(track_rect.left() + frac * track_rect.width(), ppp);
                 sp.line_segment(
                     [
-                        Pos2::new(tx, track_rect.top() - 2.0),
-                        Pos2::new(tx, track_rect.bottom() + 2.0),
+                        Pos2::new(tx, track_rect.top() + 1.0),
+                        Pos2::new(tx, track_rect.bottom() - 1.0),
                     ],
-                    Stroke::new(1.0 / ppp.max(0.5), Color32::from_rgb(20, 22, 26)),
+                    Stroke::new(1.0 / ppp.max(0.5), tick_col),
                 );
             }
         }
     } else {
-        let kf_stride = (total / 120).max(1);
+        let kf_stride = (total / 160).max(1);
         let mut kf_f = 0u32;
         while kf_f < total {
             if supplier.is_keyframe(kf_f) {
@@ -822,28 +965,38 @@ pub fn show_video_panel(
                 let tx = snap_px(track_rect.left() + frac * track_rect.width(), ppp);
                 sp.line_segment(
                     [
-                        Pos2::new(tx, track_rect.top() - 2.0),
-                        Pos2::new(tx, track_rect.bottom() + 2.0),
+                        Pos2::new(tx, track_rect.top() + 1.0),
+                        Pos2::new(tx, track_rect.bottom() - 1.0),
                     ],
-                    Stroke::new(1.0 / ppp.max(0.5), Color32::from_rgb(20, 22, 26)),
+                    Stroke::new(1.0 / ppp.max(0.5), tick_col),
                 );
             }
             kf_f = kf_f.saturating_add(kf_stride);
         }
     }
 
-    // Draw small slider thumb.
+    // Small dark grey vertical handle thumb (matching Aegisub).
     let cur_frac = (frame as f32 / max_f as f32).clamp(0.0, 1.0);
-    let thumb_x = track_rect.left() + cur_frac * track_rect.width();
+    let thumb_x = snap_px(track_rect.left() + cur_frac * track_rect.width(), ppp);
     let thumb_r = Rect::from_center_size(
         Pos2::new(thumb_x, seek_rect.center().y),
-        Vec2::new(7.0, 13.0),
+        Vec2::new(6.0, 14.0),
     );
-    sp.rect_filled(thumb_r, 1.5, Color32::from_rgb(56, 136, 226));
+    let thumb_fill = if is_light {
+        Color32::from_rgb(86, 90, 98)
+    } else {
+        Color32::from_rgb(138, 144, 156)
+    };
+    let thumb_bd = if is_light {
+        Color32::from_rgb(44, 48, 54)
+    } else {
+        Color32::from_rgb(76, 82, 92)
+    };
+    sp.rect_filled(thumb_r, 1.0, thumb_fill);
     sp.rect_stroke(
         thumb_r,
-        1.5,
-        Stroke::new(1.0, Color32::from_rgb(24, 72, 148)),
+        1.0,
+        Stroke::new(1.0, thumb_bd),
         egui::StrokeKind::Inside,
     );
     if (seek_resp.clicked() || seek_resp.dragged())
@@ -857,48 +1010,61 @@ pub fn show_video_panel(
     }
 
     // Row 2 below seek bar (Aegisub exact order):
-    // Play | Play line ([▶]) | Pause/Stop | AUTO toggle | time-frame box | offset box | zoom combo.
+    // Plain Play | Play line | Pause icons | AUTO icon toggle | stretched time & offset | zoom.
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        let green = Color32::from_rgb(38, 168, 84);
-        let red = Color32::from_rgb(214, 58, 58);
-        let blue = Color32::from_rgb(42, 120, 214);
 
-        if ui
-            .small_button(RichText::new("▶").color(green))
-            .on_hover_text("Play video")
-            .clicked()
-        {
+        if playback_atlas_button(ui, atlas_id, SLOT_PLAY, false, palette, ppp, "Play video") {
             pb.toggle_play(clock);
             action = Some(VideoPanelAction::PlayToggle);
         }
-        if ui
-            .small_button(RichText::new("[▶]").color(green))
-            .on_hover_text("Play current line")
-            .clicked()
-        {
+        if playback_atlas_button(
+            ui,
+            atlas_id,
+            SLOT_PLAY_LINE,
+            false,
+            palette,
+            ppp,
+            "Play current line",
+        ) {
             action = Some(VideoPanelAction::PlayLine);
         }
-        if ui
-            .small_button(RichText::new(if pb.is_playing() { "II" } else { "■" }).color(red))
-            .on_hover_text("Pause / Stop video")
-            .clicked()
-        {
+        if playback_atlas_button(
+            ui,
+            atlas_id,
+            SLOT_PAUSE,
+            false,
+            palette,
+            ppp,
+            "Pause / Stop video",
+        ) {
             if pb.is_playing() {
                 pb.toggle_play(clock);
             }
             action = Some(VideoPanelAction::Stop);
         }
-        if ui
-            .selectable_label(
-                state.auto_scroll_video,
-                RichText::new("AUTO").small().color(blue),
-            )
-            .on_hover_text("Auto-seek video to active line")
-            .clicked()
-        {
+        let auto_slot = if state.auto_scroll_video {
+            SLOT_AUTO_ON
+        } else {
+            SLOT_AUTO_OFF
+        };
+        if playback_atlas_button(
+            ui,
+            atlas_id,
+            auto_slot,
+            state.auto_scroll_video,
+            palette,
+            ppp,
+            "Auto-seek video to active line",
+        ) {
             state.auto_scroll_video = !state.auto_scroll_video;
         }
+
+        // Time box and offset box stretch to share the remaining row width; zoom stays at right.
+        let zoom_w = 58.0;
+        let boxes_w = (ui.available_width() - zoom_w - 14.0).max(96.0);
+        let time_w = (boxes_w * 0.52).max(48.0);
+        let offset_w = (boxes_w - time_w).max(48.0);
 
         let cur_ms = pb.current_time_ms();
         let rkey = (
@@ -931,14 +1097,14 @@ pub fn show_video_panel(
             false,
             egui::TextEdit::singleline(&mut state.frame_time_buf)
                 .font(FontId::proportional(11.0))
-                .desired_width(114.0),
+                .desired_width(time_w),
         );
 
         ui.add_enabled(
             false,
             egui::TextEdit::singleline(&mut state.offset_buf)
                 .font(FontId::proportional(11.0))
-                .desired_width(98.0),
+                .desired_width(offset_w),
         )
         .on_hover_text("Offset from active line start / end");
 
@@ -948,7 +1114,7 @@ pub fn show_video_panel(
             format_zoom_tenths(state.zoom_tenths)
         };
         egui::ComboBox::from_id_salt("video_zoom_combo")
-            .width(56.0)
+            .width(zoom_w)
             .selected_text(RichText::new(zoom_text).small())
             .show_ui(ui, |ui| {
                 if ui

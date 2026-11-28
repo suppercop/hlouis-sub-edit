@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod icon_atlas;
+
 use egui::style::{Selection, TextCursorStyle, WidgetVisuals, Widgets};
 use egui::{
     Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke, Style,
@@ -20,6 +22,13 @@ use theme::{BaseTheme, Palette, Rgba8, ThemeSpec, eye_comfort_active};
 
 /// Maximum animation duration (seconds) allowed across the UI (`<= 150 ms`).
 pub const MAX_ANIMATION_SECS: f32 = 0.12;
+
+/// Font family entry name for the bundled Noto Sans UI font (full Vietnamese + Latin coverage).
+pub const BUNDLED_UI_FONT_NAME: &str = "hlouis_noto_sans";
+
+/// Bundled Noto Sans Regular (`SIL OFL 1.1`, recorded in `licenses/OFL-1.1-NotoSans.txt`).
+pub const BUNDLED_UI_FONT_BYTES: &[u8] =
+    include_bytes!("../../../assets/fonts/NotoSans-Regular.ttf");
 
 /// Converts [`theme::Rgba8`] into [`egui::Color32`] with zero allocations.
 #[inline]
@@ -106,51 +115,67 @@ pub fn default_cjk_vi_fallback_candidates() -> Vec<PathBuf> {
     ]
 }
 
-/// Builds [`FontDefinitions`] with proportional, monospace, and CJK/Vietnamese fallback chains,
-/// skipping any system paths that are not present on the current machine.
+fn insert_first_available_font(
+    defs: &mut FontDefinitions,
+    name: &str,
+    paths: &[PathBuf],
+    family: &FontFamily,
+    front: bool,
+) {
+    for p in paths {
+        if let Ok(bytes) = std::fs::read(p) {
+            defs.font_data
+                .insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
+            if let Some(list) = defs.families.get_mut(family) {
+                if front {
+                    list.insert(0, name.to_owned());
+                } else {
+                    list.push(name.to_owned());
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// Builds [`FontDefinitions`] with the bundled Noto Sans UI font (full precomposed and combining
+/// Vietnamese coverage), optional monospace edit-box font, and CJK fallback chain.
 #[must_use]
 pub fn build_font_definitions(cfg: &FontConfig) -> FontDefinitions {
     let mut defs = FontDefinitions::default();
-    let mut insert_first_available =
-        |name: &str, paths: &[PathBuf], family: FontFamily, front: bool| {
-            for p in paths {
-                if let Ok(bytes) = std::fs::read(p) {
-                    defs.font_data
-                        .insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
-                    if let Some(list) = defs.families.get_mut(&family) {
-                        if front {
-                            list.insert(0, name.to_owned());
-                        } else {
-                            list.push(name.to_owned());
-                        }
-                    }
-                    break;
-                }
-            }
-        };
 
-    insert_first_available(
-        "hlouis_ui",
-        &cfg.proportional_paths,
-        FontFamily::Proportional,
-        true,
+    // Always install bundled Noto Sans as the primary proportional UI font and as Vietnamese
+    // fallback for monospace so stacked diacritics ("Ầ", "ữ", "ỗ") render identically everywhere.
+    defs.font_data.insert(
+        BUNDLED_UI_FONT_NAME.to_owned(),
+        Arc::new(FontData::from_static(BUNDLED_UI_FONT_BYTES)),
     );
-    insert_first_available(
+    if let Some(list) = defs.families.get_mut(&FontFamily::Proportional) {
+        list.insert(0, BUNDLED_UI_FONT_NAME.to_owned());
+    }
+
+    insert_first_available_font(
+        &mut defs,
         "hlouis_mono",
         &cfg.monospace_paths,
-        FontFamily::Monospace,
+        &FontFamily::Monospace,
         true,
     );
-    insert_first_available(
+    if let Some(list) = defs.families.get_mut(&FontFamily::Monospace) {
+        list.push(BUNDLED_UI_FONT_NAME.to_owned());
+    }
+    insert_first_available_font(
+        &mut defs,
         "hlouis_cjk_vi_p",
         &cfg.fallback_paths,
-        FontFamily::Proportional,
+        &FontFamily::Proportional,
         false,
     );
-    insert_first_available(
+    insert_first_available_font(
+        &mut defs,
         "hlouis_cjk_vi_m",
         &cfg.fallback_paths,
-        FontFamily::Monospace,
+        &FontFamily::Monospace,
         false,
     );
     defs
@@ -499,6 +524,22 @@ mod tests {
             });
             harness.run();
         }
+    }
+
+    #[test]
+    fn bundled_noto_sans_is_primary_proportional_and_mono_fallback() {
+        let defs = build_font_definitions(&FontConfig::default());
+        assert!(defs.font_data.contains_key(BUNDLED_UI_FONT_NAME));
+        let prop = defs
+            .families
+            .get(&FontFamily::Proportional)
+            .expect("proportional family");
+        assert_eq!(prop.first().map(String::as_str), Some(BUNDLED_UI_FONT_NAME));
+        let mono = defs
+            .families
+            .get(&FontFamily::Monospace)
+            .expect("monospace family");
+        assert!(mono.iter().any(|name| name == BUNDLED_UI_FONT_NAME));
     }
 }
 

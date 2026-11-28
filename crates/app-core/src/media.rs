@@ -313,22 +313,110 @@ impl WavAudioProvider {
         })
     }
 
-    /// Generates a synthetic sine-wave audio provider (for demo/headless mode without a WAV file).
+    /// Generates a realistic speech-like + music test signal (syllable bursts with pauses,
+    /// formant harmonics, consonant transients, subtle musical backing, and a quiet noise floor)
+    /// for demo/headless mode without a WAV file.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
     pub fn synthetic(duration_ms: i64, sample_rate: u32) -> Self {
+        let sr = sample_rate.max(1);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let len = ((duration_ms.max(100) as u64 * u64::from(sample_rate)) / 1_000) as usize;
-        let capped = len.min(sample_rate as usize * 30);
+        let len = ((duration_ms.max(100) as u64 * u64::from(sr)) / 1_000) as usize;
+        let capped = len.min(sr as usize * 30);
         let mut mono = Vec::with_capacity(capped);
+        let mut rng: u32 = 0x5EED_C0DE;
+        let mut lp_noise: f32 = 0.0;
+        let mut prev_noise: f32 = 0.0;
+        let tau = std::f32::consts::TAU;
+        let sr_f = sr as f32;
+
+        // Speech-like phrase cadence: (phrase_len_s, pause_len_s) alternating with syllable modulation.
         for i in 0..capped {
-            let t = i as f32 / sample_rate.max(1) as f32;
+            let t = i as f32 / sr_f;
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let white = ((rng >> 16) as f32 / 32_768.0) - 1.0;
+            lp_noise = lp_noise * 0.88 + white * 0.12;
+            let hp_noise = white - prev_noise;
+            prev_noise = white;
+
+            // Quiet room-tone noise floor (~ -54 dBFS).
+            let floor = lp_noise * 0.004 + white * 0.0015;
+
+            // Phrase envelope: active speech for ~1.6 s, pause for ~0.55 s, varying per phrase.
+            let phrase_cycle = t % 2.15;
+            let phrase_idx = (t / 2.15) as u32;
+            let phrase_env = if phrase_cycle < 1.55 {
+                let attack = (phrase_cycle / 0.03).clamp(0.0, 1.0);
+                let release = ((1.55 - phrase_cycle) / 0.06).clamp(0.0, 1.0);
+                attack * release
+            } else {
+                0.0
+            };
+
+            // Syllable bursts (~4.2 syllables/sec) with sharp consonant onset transients.
+            let syl_period = 0.21 + ((phrase_idx % 3) as f32) * 0.025;
+            let syl_phase = (t % syl_period) / syl_period;
+            let syl_idx = (t / syl_period) as u32;
+            let voiced_env = if syl_phase > 0.14 && syl_phase < 0.86 {
+                let a = ((syl_phase - 0.14) / 0.08).clamp(0.0, 1.0);
+                let r = ((0.86 - syl_phase) / 0.14).clamp(0.0, 1.0);
+                a * r
+            } else {
+                0.0
+            };
+            let consonant_env = if syl_phase < 0.12 && syl_idx.is_multiple_of(2) {
+                (1.0 - syl_phase / 0.12) * 0.32
+            } else {
+                0.0
+            };
+
+            // Pitch contour + vowel formants (F0 ~145..205 Hz, F1 ~680 Hz, F2 ~1750 Hz, F3 ~2750 Hz).
+            let f0 = 152.0 + 28.0 * (tau * 0.45 * t).sin() + ((syl_idx % 5) as f32) * 7.0;
+            let f1 = 640.0 + ((syl_idx % 4) as f32) * 110.0;
+            let f2 = 1_650.0 + ((syl_idx % 5) as f32) * 180.0;
+            let f3 = 2_650.0 + ((syl_idx % 3) as f32) * 210.0;
+
+            let voice = voiced_env
+                * (0.42 * (tau * f0 * t).sin()
+                    + 0.24 * (tau * (f0 * 2.0) * t).sin()
+                    + 0.18 * (tau * f1 * t).sin()
+                    + 0.11 * (tau * f2 * t).sin()
+                    + 0.06 * (tau * f3 * t).sin());
+            let sibilant = consonant_env * hp_noise * 0.45;
+            let speech = phrase_env * (voice * 0.62 + sibilant);
+
+            // Subtle musical backing: warm chord pad + crisp 0.5 s percussive transient.
+            let beat_phase = t % 0.5;
+            let kick_env = (-beat_phase * 28.0).exp();
+            let kick =
+                kick_env * (tau * (58.0 + 70.0 * (-beat_phase * 35.0).exp()) * t).sin() * 0.14;
+            let hat_env = if (t % 0.25) < 0.025 {
+                (-((t % 0.25) * 140.0)).exp()
+            } else {
+                0.0
+            };
+            let hat = hat_env * hp_noise * 0.08;
+            let chord_root = if ((t / 4.0) as u32).is_multiple_of(2) {
+                220.0
+            } else {
+                196.0
+            };
+            let pad = (0.045 * (tau * chord_root * t).sin()
+                + 0.035 * (tau * (chord_root * 1.25) * t).sin()
+                + 0.030 * (tau * (chord_root * 1.5) * t).sin())
+                * (0.75 + 0.25 * (tau * 0.25 * t).sin());
+
+            let mixed = (floor + speech + kick + hat + pad).clamp(-0.98, 0.98);
             #[allow(clippy::cast_possible_truncation)]
-            let v = ((t * 440.0 * std::f32::consts::TAU).sin() * (t * 2.5).sin().abs() * 22_000.0)
-                as i16;
+            let v = (mixed * 32_767.0) as i16;
             mono.push(v);
         }
         Self {
-            sample_rate: sample_rate.max(1),
+            sample_rate: sr,
             channels: 1,
             mono_samples: mono,
         }
@@ -400,17 +488,14 @@ impl AudioProvider for WavAudioProvider {
             let mut mn = i16::MAX;
             let mut mx = i16::MIN;
             let mut sq = 0u64;
-            let stride = (slice.len() / 64).max(1);
-            let mut count = 0u64;
-            for &sample in slice.iter().step_by(stride) {
+            for &sample in slice {
                 mn = mn.min(sample);
                 mx = mx.max(sample);
                 let v = i64::from(sample);
                 sq = sq.saturating_add((v * v).unsigned_abs());
-                count += 1;
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let rms = ((sq as f64 / count.max(1) as f64).sqrt()) as u16;
+            let rms = ((sq as f64 / slice.len().max(1) as f64).sqrt()) as u16;
             out.push(PeakBucket {
                 min: mn,
                 max: mx,
@@ -435,6 +520,12 @@ impl AudioColumnProvider for AudioColumnAdapter<'_> {
         out: &mut Vec<PeakBucket>,
     ) {
         self.0.query_peaks_into(start_ms, end_ms, width_px, out);
+    }
+    fn sample_rate(&self) -> u32 {
+        self.0.sample_rate()
+    }
+    fn read_mono_i16(&self, start_sample: usize, count: usize, out: &mut Vec<i16>) {
+        self.0.read_mono_i16(start_sample, count, out);
     }
     fn render_spectrum_into(
         &self,

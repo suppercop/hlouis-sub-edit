@@ -103,6 +103,7 @@ pub struct EditorApp {
     pub audio: Option<Box<dyn AudioProvider>>,
     pub renderer: Box<dyn SubtitleRenderer>,
     pub fonts: Box<dyn FontProvider>,
+    last_audio_inactive_line: Option<usize>,
     /// Creates native video/audio providers (None = pure-Rust fallbacks only).
     pub factory: Option<Box<dyn media::MediaFactory>>,
     /// Native file dialogs (None = menu open/save commands report that no dialog is available).
@@ -150,6 +151,7 @@ impl EditorApp {
             audio: Some(Box::new(synth_audio)),
             renderer: Box::new(PlainTextBoxRenderer),
             fonts: Box::new(BasicFontProvider::default()),
+            last_audio_inactive_line: None,
             factory: None,
             file_dialogs: None,
             video_path: None,
@@ -422,10 +424,16 @@ impl EditorApp {
         self.shell.grid.model.columns.margin_l = iface.show_col_margins;
         self.shell.grid.model.columns.margin_r = iface.show_col_margins;
         self.shell.grid.model.columns.margin_v = iface.show_col_margins;
+        let aud = &self.shell.settings.audio;
+        self.shell.audio.spectrum_mode = aud.spectrum;
+        self.shell.audio.auto_snap_keyframes = aud.auto_snap_keyframes;
+        self.shell.audio.snap_to_lines = aud.snap_to_lines;
+        self.shell.audio.snap_distance_px = aud.snap_distance_px as f32;
     }
 
     /// Re-synchronizes grid, edit box, and style manager lists from `shell.doc`.
     pub fn sync_ui_from_doc(&mut self) {
+        self.last_audio_inactive_line = None;
         self.shell.grid.sync_from_script(self.shell.doc.script());
         self.shell.editbox.active_line = None;
         let styles: Vec<String> = self
@@ -696,13 +704,9 @@ impl EditorApp {
 
     /// Runs `ass_tools::resample_resolution` and updates the document.
     pub fn apply_resample(&mut self, opts: &ResampleOptions) -> Result<(), AppError> {
-        let mut clone = self.shell.doc.script().clone();
-        let cmd = resample_resolution(&clone, opts).map_err(|e| AppError::Edit(e.to_string()))?;
-        cmd.apply(&mut clone)
-            .map_err(|e| AppError::Document(e.to_string()))?;
-        self.shell.doc = DocumentController::new(clone);
-        self.sync_ui_from_doc();
-        Ok(())
+        let cmd = resample_resolution(self.shell.doc.script(), opts)
+            .map_err(|e| AppError::Edit(e.to_string()))?;
+        self.commit_and_sync("resample resolution", cmd, CommitType::EVERYTHING)
     }
 
     fn commit_and_sync(
@@ -719,9 +723,44 @@ impl EditorApp {
         Ok(())
     }
 
+    fn sync_audio_snap_and_spans(&mut self) {
+        // Keep audio snap prefs synced cheaply (3 scalar copies) and cache inactive neighbour
+        // spans keyed by `active_line` (invalidated by `sync_ui_from_doc`) so text-only edits
+        // (`amend_text`) never scan `EventsSection` per frame.
+        self.shell.audio.auto_snap_keyframes = self.shell.settings.audio.auto_snap_keyframes;
+        self.shell.audio.snap_to_lines = self.shell.settings.audio.snap_to_lines;
+        self.shell.audio.snap_distance_px = self.shell.settings.audio.snap_distance_px as f32;
+        let active_idx = self.shell.doc.active_line().unwrap_or(0);
+        if self.last_audio_inactive_line != Some(active_idx) {
+            self.shell.audio.inactive_spans.clear();
+            if let Some(sec) = self.shell.doc.script().events_section() {
+                if let Some(prev_ev) = active_idx.checked_sub(1).and_then(|i| sec.get_event(i)) {
+                    self.shell
+                        .audio
+                        .inactive_spans
+                        .push(timing_controller::TimeRangeMs {
+                            start_ms: prev_ev.start().as_ms().cast_signed(),
+                            end_ms: prev_ev.end().as_ms().cast_signed(),
+                        });
+                }
+                if let Some(next_ev) = sec.get_event(active_idx + 1) {
+                    self.shell
+                        .audio
+                        .inactive_spans
+                        .push(timing_controller::TimeRangeMs {
+                            start_ms: next_ev.start().as_ms().cast_signed(),
+                            end_ms: next_ev.end().as_ms().cast_signed(),
+                        });
+                }
+            }
+            self.last_audio_inactive_line = Some(active_idx);
+        }
+    }
+
     /// Renders one complete application frame into `ui` and processes drag-and-drop + prompts.
     pub fn show(&mut self, ui: &mut Ui, clock: &dyn Clock) {
         self.media_pre_show(clock);
+        self.sync_audio_snap_and_spans();
         let vid_adapter = VideoSupplierAdapter(self.video.as_ref());
         let aud_adapter = self.audio.as_deref().map(AudioColumnAdapter);
         let aud_ref: Option<&dyn ui_audio::AudioColumnProvider> = aud_adapter
@@ -881,53 +920,67 @@ fn parse_srt_ts(raw: &str) -> Option<AssTime> {
 #[must_use]
 pub fn build_demo_script(line_count: usize) -> ScriptFile {
     let header = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\nStyle: Sign,Arial,42,&H00FFE080,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1\nStyle: Romaji,Arial,44,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,8,10,10,10,1\nStyle: Translation,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
-    let mut script = parse_ass(header).value;
-    let sec = script.ensure_events_section_mut();
+    let mut buf = String::with_capacity(header.len() + line_count.saturating_mul(112));
+    buf.push_str(header);
     for i in 0..line_count {
         #[allow(clippy::cast_possible_truncation)]
-        let s = (i as u32) * 5;
-        let mut ev = match i % 20 {
-            0 => {
-                let mut e = AssEvent::dialogue(
-                    AssTime::from_cs(s),
-                    AssTime::from_cs(s + 180),
-                    r"{\an8\pos(960,80)\blur2}Typeset sign / Tiêu đề cảnh",
-                );
-                e.set_style("Sign");
-                e
-            }
-            5 => {
-                let mut e = AssEvent::dialogue(
-                    AssTime::from_cs(s),
-                    AssTime::from_cs(s + 240),
-                    r"{\k40}Yu{\k50}me {\k60}no {\k90}tsuzuki",
-                );
-                e.set_style("Romaji");
-                e.set_effect("karaoke");
-                e
-            }
-            10 => {
-                let mut e = AssEvent::dialogue(
-                    AssTime::from_cs(s),
-                    AssTime::from_cs(s + 100),
-                    "QC note: kiểm tra lại tên riêng nhân vật",
-                );
-                e.set_kind(EventKind::Comment);
-                e.set_style("Translation");
-                e
-            }
-            _ => AssEvent::dialogue(
-                AssTime::from_cs(s),
-                AssTime::from_cs(s + 120),
-                r"{\i1}Sample subtitle dialogue line\NPhụ đề tiếng Việt",
+        let s = (i as u32).saturating_mul(5);
+        let start = AssTime::from_cs(s);
+        let (prefix, dur_cs, style, effect, text) = match i % 20 {
+            0 => (
+                "Dialogue: 0,",
+                180u32,
+                "Sign",
+                "",
+                r"{\an8\pos(960,80)\blur2}Typeset sign / Tiêu đề cảnh",
+            ),
+            5 => (
+                "Dialogue: 0,",
+                240u32,
+                "Romaji",
+                "karaoke",
+                r"{\k40}Yu{\k50}me {\k60}no {\k90}tsuzuki",
+            ),
+            10 => (
+                "Comment: 0,",
+                100u32,
+                "Translation",
+                "",
+                "QC note: kiểm tra lại tên riêng nhân vật",
+            ),
+            15 => (
+                "Dialogue: 0,",
+                120u32,
+                "Default",
+                "",
+                r"{\i1}Italic dialogue line\NPhụ đề tiếng Việt",
+            ),
+            _ => (
+                "Dialogue: 0,",
+                120u32,
+                if i % 10 == 3 {
+                    "Translation"
+                } else {
+                    "Default"
+                },
+                "",
+                r"Sample subtitle dialogue line\NPhụ đề tiếng Việt (Ầ, ữ, ỗ)",
             ),
         };
-        if i % 10 == 3 {
-            ev.set_style("Translation");
-        }
-        sec.insert_event(i, ev);
+        let end = AssTime::from_cs(s.saturating_add(dur_cs));
+        buf.push_str(prefix);
+        start.write_ass(&mut buf);
+        buf.push(',');
+        end.write_ass(&mut buf);
+        buf.push(',');
+        buf.push_str(style);
+        buf.push_str(",,0,0,0,");
+        buf.push_str(effect);
+        buf.push(',');
+        buf.push_str(text);
+        buf.push('\n');
     }
-    script
+    parse_ass(&buf).value
 }
 
 /// Populates `HLouis` style counts and Template Doctor diagnostics on `app`.

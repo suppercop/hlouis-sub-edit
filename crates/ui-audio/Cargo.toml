@@ -13,6 +13,7 @@ audio-view = { path = "../audio-view" }
 egui = { workspace = true, features = ["default_fonts"] }
 i18n-catalog = { path = "../i18n-catalog" }
 karaoke-timing = { path = "../karaoke-timing" }
+spectrum = { path = "../spectrum" }
 theme = { path = "../theme" }
 timing-controller = { path = "../timing-controller" }
 ui-theme = { path = "../ui-theme" }

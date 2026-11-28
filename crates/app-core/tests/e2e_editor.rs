@@ -4,7 +4,8 @@
 #![forbid(unsafe_code)]
 
 use app_core::{EditorApp, build_demo_script};
-use ass_core::{AssEvent, AssTime, ScriptFile, serialize_ass};
+use ass_core::{AssEvent, AssTime, ScriptFile, parse_ass, serialize_ass};
+use ass_tools::ResampleOptions;
 use autosave::write_autosave_now;
 use egui::Vec2;
 use egui_kittest::Harness;
@@ -245,11 +246,60 @@ fn e2e_200k_lines_open_scroll_type_via_kittest() {
         .build_ui(move |ui| {
             app.show(ui, &ZeroClock);
         });
-    harness.run();
+    harness.step();
     harness.step();
     assert!(
         t0.elapsed().as_secs() < 15,
         "200k-line kittest took too long"
+    );
+}
+
+#[test]
+fn e2e_apply_resample_updates_script_and_undoes_cleanly() {
+    let raw = "\
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\pos(640,360)\\bord2\\fs40}Centered 720p
+";
+    let mut app = EditorApp::new(parse_ass(raw).value);
+    app.apply_resample(&ResampleOptions::new(1920, 1080))
+        .expect("resample 720p -> 1080p");
+
+    assert!(app.shell.doc.is_dirty());
+    assert_eq!(
+        app.shell
+            .doc
+            .script()
+            .script_info()
+            .and_then(|s| s.get("PlayResX")),
+        Some("1920")
+    );
+    assert_eq!(
+        app.shell.doc.script().events().next().expect("ev").text(),
+        r"{\pos(960,540)\bord3\fs60}Centered 720p"
+    );
+
+    app.execute_command("edit/undo").expect("undo resample");
+    assert_eq!(
+        app.shell
+            .doc
+            .script()
+            .script_info()
+            .and_then(|s| s.get("PlayResX")),
+        Some("1280")
+    );
+    assert_eq!(
+        app.shell.doc.script().events().next().expect("ev").text(),
+        r"{\pos(640,360)\bord2\fs40}Centered 720p"
     );
 }
 

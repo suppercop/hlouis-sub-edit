@@ -15,7 +15,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use ass_core::{AssTime, EditCommand, EventKind, ScriptFile};
+use ass_core::{AssEvent, AssTime, EditCommand, EventKind, ScriptFile};
 use document::{CommitType, DocumentController};
 use edit_box_ops::{
     ShiftEnterMode, TextSelection, autocomplete_actors, autocomplete_effects, insert_hard_space,
@@ -113,6 +113,11 @@ pub struct EditBoxState {
     pub edit_style_requested: bool,
     /// 4 active ASS colour swatches (Primary, Secondary, Outline, Shadow) rendered as `"AB"`.
     pub colour_swatches: [Color32; 4],
+    cached_event: Option<AssEvent>,
+    cached_event_key: Option<(u64, usize)>,
+    cached_doc_rev: Option<u64>,
+    event_cache_refreshes: u64,
+    event_lookups: u64,
     max_len_buf: String,
     last_max_len: Option<usize>,
     span_scratch: Vec<TokenSpan>,
@@ -148,6 +153,11 @@ impl Default for EditBoxState {
                 Color32::from_rgb(40, 150, 60),
                 Color32::from_rgb(90, 60, 140),
             ],
+            cached_event: None,
+            cached_event_key: None,
+            cached_doc_rev: None,
+            event_cache_refreshes: 0,
+            event_lookups: 0,
             max_len_buf: String::with_capacity(12),
             last_max_len: None,
             span_scratch: Vec::with_capacity(128),
@@ -159,21 +169,61 @@ impl Default for EditBoxState {
 }
 
 impl EditBoxState {
-    /// Synchronizes buffers when the active line changes.
+    /// Synchronizes buffers when the active line or document revision changes, reusing the cached
+    /// [`AssEvent`] snapshot on idle frames and during in-place same-line text amends.
     pub fn sync_active_line(&mut self, doc: &DocumentController, timecodes: Option<&Timecodes>) {
         let active = doc.active_line();
-        if self.active_line == active {
+        let doc_rev = doc.revision();
+        let non_text_rev = doc.non_text_revision();
+
+        if self.active_line == active && self.cached_doc_rev == Some(doc_rev) {
             return;
         }
-        self.active_line = active;
+
+        let Some(idx) = active else {
+            self.active_line = None;
+            self.cached_event = None;
+            self.cached_event_key = None;
+            self.cached_doc_rev = Some(doc_rev);
+            self.text_buf.clear();
+            self.original_snapshot.clear();
+            self.style_buf.clear();
+            self.actor_buf.clear();
+            self.effect_buf.clear();
+            return;
+        };
+
+        // Fast path: same active line and only an in-place `amend_text` bumped `doc_rev`.
+        if self.active_line == Some(idx)
+            && self.cached_event_key == Some((non_text_rev, idx))
+            && self.cached_event.is_some()
+        {
+            if let Some(text) = doc.effective_event_text(idx)
+                && self.text_buf != text
+            {
+                self.text_buf.clear();
+                self.text_buf.push_str(text);
+                self.tokenizer.set_text(&self.text_buf);
+            }
+            self.cached_doc_rev = Some(doc_rev);
+            self.event_cache_refreshes = self.event_cache_refreshes.saturating_add(1);
+            return;
+        }
+
+        self.active_line = Some(idx);
+        self.cached_doc_rev = Some(doc_rev);
         self.text_buf.clear();
         self.original_snapshot.clear();
         self.style_buf.clear();
         self.actor_buf.clear();
         self.effect_buf.clear();
 
-        if let Some(idx) = active
-            && let Some(ev) = doc.script().events_section().and_then(|s| s.get_event(idx))
+        self.event_lookups = self.event_lookups.saturating_add(1);
+        if let Some(ev) = doc
+            .script()
+            .events_section()
+            .and_then(|s| s.get_event(idx))
+            .cloned()
         {
             let text = doc.effective_event_text(idx).unwrap_or(ev.text());
             self.text_buf.push_str(text);
@@ -186,7 +236,39 @@ impl EditBoxState {
             let dur = AssTime::from_cs(ev.end().as_cs().saturating_sub(ev.start().as_cs()));
             format_time_field(dur, false, None, &mut self.dur_buf);
             self.tokenizer.set_text(&self.text_buf);
+            let style_opt = doc
+                .script()
+                .styles()
+                .find(|st| st.name().eq_ignore_ascii_case(ev.style()))
+                .or_else(|| doc.script().styles().next());
+            if let Some(st) = style_opt {
+                self.colour_swatches = [
+                    parse_ass_colour_rgb(st.primary_colour()).unwrap_or(Color32::WHITE),
+                    parse_ass_colour_rgb(st.secondary_colour())
+                        .unwrap_or(Color32::from_rgb(255, 0, 0)),
+                    parse_ass_colour_rgb(st.outline_colour()).unwrap_or(Color32::BLACK),
+                    parse_ass_colour_rgb(st.back_colour()).unwrap_or(Color32::BLACK),
+                ];
+            }
+            self.cached_event = Some(ev);
+            self.cached_event_key = Some((non_text_rev, idx));
+            self.event_cache_refreshes = self.event_cache_refreshes.saturating_add(1);
+        } else {
+            self.cached_event = None;
+            self.cached_event_key = None;
         }
+    }
+
+    /// Number of times the edit-box active-line cache was refreshed (including fast-path amends).
+    #[must_use]
+    pub const fn event_cache_refreshes(&self) -> u64 {
+        self.event_cache_refreshes
+    }
+
+    /// Number of times the edit box called `EventsSection::get_event` to load the active line.
+    #[must_use]
+    pub const fn event_lookups(&self) -> u64 {
+        self.event_lookups
     }
 }
 
@@ -329,7 +411,26 @@ pub fn count_visible_chars_and_cps(text: &str, dur_cs: u32) -> (usize, u32) {
     (max_line_chars, cps)
 }
 
-/// Paints a classic Aegisub `"AB"` colour-picker button (primary, secondary, outline, shadow).
+/// Parses an ASS `&HAABBGGRR` or `&HBBGGRR` colour string into an opaque [`Color32`].
+#[must_use]
+pub fn parse_ass_colour_rgb(raw: &str) -> Option<Color32> {
+    let trimmed = raw.trim().trim_end_matches('&');
+    let hex = trimmed
+        .strip_prefix("&H")
+        .or_else(|| trimmed.strip_prefix("&h"))
+        .unwrap_or(trimmed);
+    let val = u32::from_str_radix(hex, 16).ok()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let r = (val & 0xFF) as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let g = ((val >> 8) & 0xFF) as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let b = ((val >> 16) & 0xFF) as u8;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+/// Paints a classic Aegisub `"AB"` colour-picker button: bold `"AB"` in the active style's actual
+/// colour (primary, secondary, outline, shadow) on a normal white button.
 fn paint_ab_colour_button(
     ui: &mut Ui,
     fg_color: Color32,
@@ -339,10 +440,18 @@ fn paint_ab_colour_button(
     tooltip: &str,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(22.0, 18.0), Sense::click());
+    let is_light =
+        u16::from(pal.grid_bg.r) + u16::from(pal.grid_bg.g) + u16::from(pal.grid_bg.b) > 384;
     let bg = if resp.hovered() {
-        rgba(pal.hover)
+        if is_light {
+            Color32::from_rgb(238, 244, 252)
+        } else {
+            Color32::from_rgb(224, 228, 236)
+        }
+    } else if is_light {
+        Color32::WHITE
     } else {
-        rgba(pal.toolbar_bg)
+        Color32::from_rgb(238, 238, 240)
     };
     let galley = match cached {
         Some(entry) if entry.generation == generation && entry.color == fg_color => {
@@ -368,6 +477,13 @@ fn paint_ab_colour_button(
         Stroke::new(1.0, rgba(pal.border)),
         egui::StrokeKind::Inside,
     );
+    let lum = (u32::from(fg_color.r()) * 299
+        + u32::from(fg_color.g()) * 587
+        + u32::from(fg_color.b()) * 114)
+        / 1000;
+    if lum > 200 {
+        p.rect_filled(rect.shrink(2.0), 1.5, Color32::from_rgb(76, 82, 92));
+    }
     let gsize = galley.size();
     p.galley(
         Pos2::new(
@@ -378,6 +494,41 @@ fn paint_ab_colour_button(
         fg_color,
     );
     resp.on_hover_text(tooltip).clicked()
+}
+
+/// Paints a vector green checkmark commit button (avoids Unicode `"✓"` glyph lookup).
+fn paint_commit_check_button(ui: &mut Ui, pal: &Palette) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(20.0, 18.0), Sense::click());
+    let p = ui.painter();
+    let bg = if resp.hovered() {
+        rgba(pal.hover)
+    } else {
+        rgba(pal.toolbar_bg)
+    };
+    p.rect_filled(rect, 2.0, bg);
+    p.rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0, rgba(pal.border)),
+        egui::StrokeKind::Inside,
+    );
+    let c = rect.center();
+    let st = Stroke::new(1.8, Color32::from_rgb(38, 168, 84));
+    p.line_segment(
+        [
+            Pos2::new(c.x - 4.5, c.y + 0.5),
+            Pos2::new(c.x - 1.5, c.y + 3.5),
+        ],
+        st,
+    );
+    p.line_segment(
+        [
+            Pos2::new(c.x - 1.5, c.y + 3.5),
+            Pos2::new(c.x + 4.5, c.y - 3.5),
+        ],
+        st,
+    );
+    resp.on_hover_text("Commit changes (Enter)").clicked()
 }
 
 /// Paints a spin box with compact up/down arrows (no text prefix, matching Aegisub Layer).
@@ -526,12 +677,7 @@ pub fn show_edit_box(
     let Some(line_idx) = state.active_line else {
         return false;
     };
-    let Some(ev_snapshot) = doc
-        .script()
-        .events_section()
-        .and_then(|s| s.get_event(line_idx))
-        .cloned()
-    else {
+    let Some(ev_snapshot) = state.cached_event.clone() else {
         return false;
     };
 
@@ -580,9 +726,10 @@ pub fn show_edit_box(
             changed = true;
         }
 
+        let style_w = (ui.available_width() * 0.28).clamp(90.0, 190.0);
         let prev_style = state.style_buf.clone();
         egui::ComboBox::from_id_salt(("edit_style_combo", line_idx))
-            .width(86.0)
+            .width(style_w)
             .selected_text(&state.style_buf)
             .show_ui(ui, |ui| {
                 let mut any_style = false;
@@ -620,12 +767,19 @@ pub fn show_edit_box(
             state.edit_style_requested = true;
         }
 
+        // Stretch Actor (~190 px cap) and Effect (remaining width) so max line length sits flush
+        // at the far right edge with no empty trailing gap.
+        let len_box_w = 28.0;
+        let rem_for_combos = (ui.available_width() - len_box_w - 50.0).max(80.0);
+        let actor_w = (rem_for_combos * 0.48).clamp(40.0, 190.0);
+        let effect_w = (rem_for_combos - actor_w).max(40.0);
+
         if editable_combo(
             ui,
             ("edit_actor", line_idx),
             &mut state.actor_buf,
             catalog.get("grid-col-actor").unwrap_or("Actor"),
-            64.0,
+            actor_w,
             doc.script(),
             autocomplete_actors,
         ) {
@@ -648,7 +802,7 @@ pub fn show_edit_box(
             ("edit_effect", line_idx),
             &mut state.effect_buf,
             catalog.get("grid-col-effect").unwrap_or("Effect"),
-            64.0,
+            effect_w,
             doc.script(),
             autocomplete_effects,
         ) {
@@ -820,12 +974,7 @@ pub fn show_edit_box(
             }
         }
 
-        let commit_col = Color32::from_rgb(38, 168, 84);
-        if ui
-            .small_button(RichText::new("✓").color(commit_col).strong())
-            .on_hover_text("Commit changes (Enter)")
-            .clicked()
-        {
+        if paint_commit_check_button(ui, palette) {
             let _ = doc.amend_text(line_idx, "commit", &state.text_buf);
             changed = true;
         }
@@ -970,7 +1119,7 @@ pub fn show_edit_box(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ass_core::{AssEvent, ScriptFile};
+    use ass_core::ScriptFile;
     use egui_kittest::Harness;
     use i18n_catalog::Locale;
     use theme::ThemeSpec;
@@ -1046,5 +1195,132 @@ mod tests {
         ctx.set_fonts(egui::FontDefinitions::default());
         assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
         assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+    }
+
+    #[test]
+    fn edit_box_renders_with_default_fonts_and_reuses_cached_event() {
+        let mut script = ScriptFile::new_default();
+        script.ensure_events_section_mut().insert_event(
+            0,
+            AssEvent::dialogue(
+                AssTime::ZERO,
+                AssTime::from_cs(250),
+                r"{\an5\blur2}Cached\Nevent",
+            ),
+        );
+        let mut doc = DocumentController::new(script);
+        let mut state = EditBoxState::default();
+        let pal = theme::palette(ThemeSpec::Light);
+        let cat = Catalog::for_locale(Locale::En);
+        let lookups = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let lookups_c = lookups.clone();
+
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui(move |ui| {
+                let _ = show_edit_box(ui, &mut doc, &mut state, None, &pal, &cat);
+                lookups_c.set(state.event_lookups());
+            });
+        for _ in 0..5 {
+            harness.step();
+        }
+        assert_eq!(
+            lookups.get(),
+            1,
+            "edit-box active event should be looked up once across 5 unchanged frames"
+        );
+    }
+
+    #[test]
+    fn edit_box_event_cache_refreshes_on_amend_undo_and_line_change_only() {
+        let mut script = ScriptFile::new_default();
+        let sec = script.ensure_events_section_mut();
+        sec.insert_event(
+            0,
+            AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(200), "Original 0"),
+        );
+        sec.insert_event(
+            1,
+            AssEvent::dialogue(AssTime::from_cs(200), AssTime::from_cs(400), "Original 1"),
+        );
+        let mut doc = DocumentController::new(script);
+        let mut state = EditBoxState::default();
+
+        // Initial load fetches event 0 once.
+        state.sync_active_line(&doc, None);
+        assert_eq!(state.text_buf, "Original 0");
+        assert_eq!(state.event_cache_refreshes(), 1);
+        assert_eq!(state.event_lookups(), 1);
+
+        // Idle frames must not refresh or call get_event.
+        for _ in 0..5 {
+            state.sync_active_line(&doc, None);
+        }
+        assert_eq!(state.event_cache_refreshes(), 1);
+        assert_eq!(state.event_lookups(), 1);
+
+        // Same-line amend_text refreshes text_buf in O(1) without calling get_event.
+        doc.amend_text(0, "typing", "Amended 0").expect("amend");
+        state.sync_active_line(&doc, None);
+        assert_eq!(state.text_buf, "Amended 0");
+        assert_eq!(state.event_cache_refreshes(), 2);
+        assert_eq!(state.event_lookups(), 1);
+
+        // Undo refreshes cached event and restores original text.
+        doc.undo().expect("undo");
+        state.sync_active_line(&doc, None);
+        assert_eq!(state.text_buf, "Original 0");
+        assert_eq!(state.event_cache_refreshes(), 3);
+        assert_eq!(state.event_lookups(), 2);
+
+        // Active-line change refreshes cached event for line 1.
+        doc.set_selection(Some(1), &[1]);
+        state.sync_active_line(&doc, None);
+        assert_eq!(state.text_buf, "Original 1");
+        assert_eq!(state.event_cache_refreshes(), 4);
+        assert_eq!(state.event_lookups(), 3);
+
+        // Subsequent idle frames stay cached.
+        state.sync_active_line(&doc, None);
+        assert_eq!(state.event_cache_refreshes(), 4);
+        assert_eq!(state.event_lookups(), 3);
+    }
+
+    #[test]
+    fn parse_ass_colour_and_sync_active_style_swatches() {
+        assert_eq!(
+            parse_ass_colour_rgb("&H00FFE080"),
+            Some(Color32::from_rgb(0x80, 0xE0, 0xFF))
+        );
+        assert_eq!(
+            parse_ass_colour_rgb("&H000000FF&"),
+            Some(Color32::from_rgb(0xFF, 0x00, 0x00))
+        );
+        let raw = "[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Sign,Arial,42,&H00FFE080,&H000000FF,&H00102030,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Sign,,0,0,0,,Test
+";
+        let doc = DocumentController::new(ass_core::parse_ass(raw).value);
+        let mut state = EditBoxState::default();
+        state.sync_active_line(&doc, None);
+        assert_eq!(
+            state.colour_swatches[0],
+            Color32::from_rgb(0x80, 0xE0, 0xFF)
+        );
+        assert_eq!(
+            state.colour_swatches[1],
+            Color32::from_rgb(0xFF, 0x00, 0x00)
+        );
+        assert_eq!(
+            state.colour_swatches[2],
+            Color32::from_rgb(0x30, 0x20, 0x10)
+        );
+        assert_eq!(
+            state.colour_swatches[3],
+            Color32::from_rgb(0x00, 0x00, 0x00)
+        );
     }
 }
