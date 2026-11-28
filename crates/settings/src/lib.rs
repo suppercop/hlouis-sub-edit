@@ -411,7 +411,16 @@ impl AppSettings {
     /// # Errors
     /// Returns [`SettingsError::Json`] if serialization fails.
     pub fn save_json(&self) -> Result<String, SettingsError> {
-        Ok(serde_json::to_string_pretty(self)?)
+        // Pre-sized buffer: pretty JSON of the full settings tree is a few KiB, so this avoids the
+        // repeated geometric reallocations of `to_string_pretty` (starts at 128 bytes).
+        let mut buf = Vec::with_capacity(8 * 1024);
+        serde_json::to_writer_pretty(&mut buf, self)?;
+        String::from_utf8(buf).map_err(|e| {
+            SettingsError::Json(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e,
+            )))
+        })
     }
 
     /// Applies forward schema migrations (e.g. v1 -> v2).
