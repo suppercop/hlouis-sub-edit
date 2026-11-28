@@ -502,6 +502,51 @@ mod tests {
     }
 }
 
+/// Detects when egui invalidated every cached text layout, so widgets may keep `Arc<Galley>`
+/// across frames safely.
+///
+/// A galley embeds font-atlas UVs and the pixels-per-point it was laid out at. egui clears its
+/// whole galley cache exactly when those become invalid (atlas reset at 80% fill, new text
+/// options or pixels-per-point, new fonts or glyph rasterizers). A sentinel galley laid out every
+/// frame is served from that cache, so as long as it is the same `Arc` as last frame nothing was
+/// invalidated; a different `Arc` means a reset and [`GalleyEpoch::sync`] bumps the generation.
+/// Widgets store the generation next to every cached galley and treat a mismatch as a miss.
+#[derive(Clone, Default)]
+pub struct GalleyEpoch {
+    sentinel: Option<std::sync::Arc<egui::Galley>>,
+    generation: u64,
+}
+
+impl std::fmt::Debug for GalleyEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GalleyEpoch")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GalleyEpoch {
+    /// Call once per frame before using cached galleys; returns the current generation.
+    pub fn sync(&mut self, ctx: &egui::Context) -> u64 {
+        let fresh = ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                "x".to_owned(),
+                egui::FontId::proportional(10.0),
+                egui::Color32::WHITE,
+            )
+        });
+        let same = self
+            .sentinel
+            .as_ref()
+            .is_some_and(|s| std::sync::Arc::ptr_eq(s, &fresh));
+        if !same {
+            self.generation += 1;
+            self.sentinel = Some(fresh);
+        }
+        self.generation
+    }
+}
+
 /// Helpers for tests that guard against stale `Arc<Galley>` values (galleys embed font-atlas
 /// UVs and the pixels-per-point they were laid out at, so keeping one across frames breaks
 /// as soon as egui grows or rebuilds its font atlas).

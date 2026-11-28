@@ -15,13 +15,68 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use ass_core::{AssEvent, AssTime, EventKind, ScriptFile};
-use egui::{Align, Color32, FontId, Key, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2};
+use egui::{
+    Align, Color32, FontId, Galley, Key, Layout, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, Vec2,
+};
 use grid_model::{ColumnVisibility, GridColumn, GridModel, KeyNav, RowFlags, RowTiming};
 use i18n_catalog::Catalog;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use syntax_highlight::{GridDisplayConfig, format_grid_text_into};
 use theme::Palette;
 use ui_theme::{one_px_stroke, rgba, snap_px};
+
+/// Header label galley kept across frames; valid only for the [`ui_theme::GalleyEpoch`]
+/// generation it was laid out in.
+#[derive(Clone)]
+struct CachedHeaderGalley {
+    label: String,
+    font_bits: u32,
+    color: Color32,
+    generation: u64,
+    galley: Arc<Galley>,
+}
+
+impl std::fmt::Debug for CachedHeaderGalley {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedHeaderGalley")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Cell galleys of one row kept across frames (same generation rule as the header).
+#[derive(Clone)]
+struct CachedGridRowGalleys {
+    row_idx: usize,
+    rev: u64,
+    text_col: Color32,
+    font_bits: u32,
+    generation: u64,
+    cols: [Option<Arc<Galley>>; 12],
+}
+
+impl Default for CachedGridRowGalleys {
+    fn default() -> Self {
+        Self {
+            row_idx: usize::MAX,
+            rev: 0,
+            text_col: Color32::TRANSPARENT,
+            font_bits: 0,
+            generation: 0,
+            cols: std::array::from_fn(|_| None),
+        }
+    }
+}
+
+impl std::fmt::Debug for CachedGridRowGalleys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedGridRowGalleys")
+            .field("row_idx", &self.row_idx)
+            .field("rev", &self.rev)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Action emitted by the subtitle grid (mouse/keyboard selection or context menu).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +122,9 @@ pub struct SubtitleGridState {
     time_buf_start: String,
     time_buf_end: String,
     num_buf: String,
+    galley_epoch: ui_theme::GalleyEpoch,
+    header_galleys: [Option<CachedHeaderGalley>; 12],
+    row_galley_cache: Vec<CachedGridRowGalleys>,
 }
 
 impl Default for SubtitleGridState {
@@ -125,6 +183,9 @@ impl Default for SubtitleGridState {
             time_buf_start: String::with_capacity(16),
             time_buf_end: String::with_capacity(16),
             num_buf: String::with_capacity(16),
+            galley_epoch: ui_theme::GalleyEpoch::default(),
+            header_galleys: std::array::from_fn(|_| None),
+            row_galley_cache: vec![CachedGridRowGalleys::default(); 128],
         }
     }
 }
@@ -422,6 +483,10 @@ pub fn show_subtitle_grid(
     );
 
     let ctx = ui.ctx().clone();
+    // Cached galleys are only reused while egui has not invalidated its layouts (atlas reset,
+    // new fonts / pixels-per-point); see `GalleyEpoch`.
+    let generation = state.galley_epoch.sync(&ctx);
+    let font_bits = font_body.size.to_bits();
     let mut hx = header_rect.left();
     for &col in &state.column_order {
         if !SubtitleGridState::is_column_visible(&state.model.columns, col) {
@@ -436,10 +501,29 @@ pub fn show_subtitle_grid(
         let label = catalog
             .get(SubtitleGridState::column_header_key(col))
             .unwrap_or("?");
-        // No cross-frame galley cache: galleys embed font-atlas UVs, which go stale when
-        // egui grows or rebuilds the atlas. egui's own layout cache is atlas-aware.
-        let hgalley = ctx
-            .fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font_body.clone(), header_text_col));
+        let hgalley = match &mut state.header_galleys[col_idx] {
+            Some(c)
+                if c.generation == generation
+                    && c.font_bits == font_bits
+                    && c.color == header_text_col
+                    && c.label == label =>
+            {
+                Arc::clone(&c.galley)
+            }
+            slot => {
+                let built = ctx.fonts_mut(|f| {
+                    f.layout_no_wrap(label.to_owned(), font_body.clone(), header_text_col)
+                });
+                *slot = Some(CachedHeaderGalley {
+                    label: label.to_owned(),
+                    font_bits,
+                    color: header_text_col,
+                    generation,
+                    galley: Arc::clone(&built),
+                });
+                built
+            }
+        };
         let gh = hgalley.size().y;
         painter.galley(
             Pos2::new(hx + 4.0, header_rect.center().y - gh * 0.5),
@@ -584,6 +668,22 @@ pub fn show_subtitle_grid(
 
             let mut cx = row_rect.left();
             let cy = row_rect.center().y;
+            let cache_slot = &mut state.row_galley_cache[row_idx & 127];
+            if cache_slot.row_idx != row_idx
+                || cache_slot.rev != row.rev
+                || cache_slot.text_col != text_col
+                || cache_slot.font_bits != font_bits
+                || cache_slot.generation != generation
+            {
+                cache_slot.row_idx = row_idx;
+                cache_slot.rev = row.rev;
+                cache_slot.text_col = text_col;
+                cache_slot.font_bits = font_bits;
+                cache_slot.generation = generation;
+                for c in &mut cache_slot.cols {
+                    *c = None;
+                }
+            }
             for &col in &state.column_order {
                 if !SubtitleGridState::is_column_visible(&state.model.columns, col) {
                     continue;
@@ -625,7 +725,9 @@ pub fn show_subtitle_grid(
                     }
                 }
 
-                let cell_galley = {
+                let cell_galley = if let Some(ref existing) = cache_slot.cols[col_idx] {
+                    Arc::clone(existing)
+                } else {
                     let cell_txt: &str = match col {
                         GridColumn::LineNumber => {
                             state.num_buf.clear();
@@ -676,9 +778,11 @@ pub fn show_subtitle_grid(
                         }
                         GridColumn::Text => &row.display_text,
                     };
-                    ctx.fonts_mut(|f| {
+                    let built = ctx.fonts_mut(|f| {
                         f.layout_no_wrap(cell_txt.to_owned(), font_body.clone(), text_col)
-                    })
+                    });
+                    cache_slot.cols[col_idx] = Some(Arc::clone(&built));
+                    built
                 };
                 let gsize = cell_galley.size();
                 match col {
@@ -931,5 +1035,48 @@ mod tests {
         assert_eq!(frame(&ctx, &script, &mut state), 0);
         ctx.set_pixels_per_point(1.0);
         assert_eq!(frame(&ctx, &script, &mut state), 0);
+
+        // Rebuilding the fonts invalidates every galley.
+        let gen_before = state.galley_epoch.sync(&ctx);
+        ctx.set_fonts(egui::FontDefinitions::default());
+        assert_eq!(frame(&ctx, &script, &mut state), 0);
+        assert!(
+            state.galley_epoch.sync(&ctx) > gen_before,
+            "font rebuild not noticed"
+        );
+
+        // Fill the glyph atlas past egui's reset threshold with many large glyph sizes.
+        let mut filled = false;
+        for round in 0..400u32 {
+            let size = 40.0 + round as f32 * 0.37;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = ui.fonts_mut(|f| {
+                    f.layout_no_wrap(
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".to_owned(),
+                        FontId::proportional(size),
+                        Color32::WHITE,
+                    )
+                });
+                // The method path form does not satisfy the higher-ranked closure bound.
+                #[allow(clippy::redundant_closure_for_method_calls)]
+                let ratio = ui.fonts(|f| f.font_atlas_fill_ratio());
+                filled = ratio > 0.8;
+            });
+            out.textures_delta.clear();
+            if filled {
+                break;
+            }
+        }
+        assert!(filled, "could not fill the font atlas for the reset test");
+        let gen_before = state.galley_epoch.sync(&ctx);
+        assert_eq!(
+            frame(&ctx, &script, &mut state),
+            0,
+            "stale galleys after atlas reset"
+        );
+        assert!(
+            state.galley_epoch.sync(&ctx) > gen_before,
+            "atlas reset not noticed by the galley epoch"
+        );
     }
 }

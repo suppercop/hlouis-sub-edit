@@ -22,12 +22,13 @@ use audio_view::{
     build_frame_layout,
 };
 use egui::{
-    Align2, Color32, ColorImage, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions,
-    Ui, Vec2,
+    Align2, Color32, ColorImage, FontId, Galley, Pos2, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, Vec2,
 };
 use i18n_catalog::Catalog;
 use karaoke_timing::KaraokeTimingController;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use theme::Palette;
 use timing_controller::{DialogueTimingController, DragTarget, PlayRangeKind, TimeRangeMs};
 use ui_theme::{rgba, snap_px};
@@ -87,6 +88,17 @@ struct TextureCacheKey {
     palette_rev: u64,
 }
 
+/// Ruler label cache key; `generation` is the [`ui_theme::GalleyEpoch`] generation so labels laid
+/// out before an atlas reset are never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RulerCacheKey {
+    start_ms: i64,
+    end_ms: i64,
+    width_bits: u32,
+    ppp_bits: u32,
+    generation: u64,
+}
+
 /// Persistent UI state + cached waveform texture + reusable scratch buffers for the audio panel.
 #[allow(clippy::struct_excessive_bools)]
 pub struct AudioPanelState {
@@ -113,6 +125,9 @@ pub struct AudioPanelState {
     pixel_buf: Vec<Color32>,
     frame_layout: AudioFrameLayout,
     ruler_buf: String,
+    galley_epoch: ui_theme::GalleyEpoch,
+    ruler_key: Option<RulerCacheKey>,
+    ruler_ticks: Vec<(f32, Arc<Galley>)>,
 }
 
 impl Default for AudioPanelState {
@@ -157,6 +172,9 @@ impl AudioPanelState {
             pixel_buf: Vec::with_capacity(2048 * 160),
             frame_layout: AudioFrameLayout::with_capacity(2048),
             ruler_buf: String::with_capacity(16),
+            galley_epoch: ui_theme::GalleyEpoch::default(),
+            ruler_key: None,
+            ruler_ticks: Vec::with_capacity(32),
         }
     }
 
@@ -724,27 +742,44 @@ pub fn show_audio_panel(
             let first_tick = ((vis.start_ms + step_ms - 1) / step_ms) * step_ms;
             let tick_font = FontId::proportional(9.5);
             let tick_col = Color32::from_rgb(208, 216, 230);
-            // Ruler labels are laid out every frame (egui caches layouts internally); a
-            // cross-frame Arc<Galley> cache would keep stale font-atlas UVs.
-            let mut t_ms = first_tick;
-            let mut tick_idx = 0usize;
-            while t_ms <= vis.end_ms {
-                let frac = (t_ms - vis.start_ms) as f32 / span_ms as f32;
-                let rel_x = frac * ruler_rect.width();
-                let total_s = (t_ms / 1_000).max(0);
-                let h = total_s / 3600;
-                let m = (total_s / 60) % 60;
-                let s = total_s % 60;
-                state.ruler_buf.clear();
-                if tick_idx == 0 || s == 0 {
-                    let _ = write!(state.ruler_buf, "{h}:{m:02}:{s:02}");
-                } else {
-                    let _ = write!(state.ruler_buf, "{s:02}");
+            // Ruler labels are cached across frames, but only while egui has not invalidated its
+            // layouts (atlas reset, new fonts / pixels-per-point): see `GalleyEpoch`.
+            let generation = state.galley_epoch.sync(ui.ctx());
+            let rkey = RulerCacheKey {
+                start_ms: vis.start_ms,
+                end_ms: vis.end_ms,
+                width_bits: canvas_w.to_bits(),
+                ppp_bits: ppp.to_bits(),
+                generation,
+            };
+            if state.ruler_key != Some(rkey) {
+                state.ruler_ticks.clear();
+                let mut t_ms = first_tick;
+                let mut tick_idx = 0usize;
+                while t_ms <= vis.end_ms {
+                    let frac = (t_ms - vis.start_ms) as f32 / span_ms as f32;
+                    let rel_x = frac * ruler_rect.width();
+                    let total_s = (t_ms / 1_000).max(0);
+                    let h = total_s / 3600;
+                    let m = (total_s / 60) % 60;
+                    let s = total_s % 60;
+                    state.ruler_buf.clear();
+                    if tick_idx == 0 || s == 0 {
+                        let _ = write!(state.ruler_buf, "{h}:{m:02}:{s:02}");
+                    } else {
+                        let _ = write!(state.ruler_buf, "{s:02}");
+                    }
+                    let g = ui.fonts_mut(|f| {
+                        f.layout_no_wrap(state.ruler_buf.clone(), tick_font.clone(), tick_col)
+                    });
+                    state.ruler_ticks.push((rel_x, g));
+                    t_ms += step_ms;
+                    tick_idx += 1;
                 }
-                let g = ui.fonts_mut(|f| {
-                    f.layout_no_wrap(state.ruler_buf.clone(), tick_font.clone(), tick_col)
-                });
-                let tx = snap_px(ruler_rect.left() + rel_x, ppp);
+                state.ruler_key = Some(rkey);
+            }
+            for (rel_x, g) in &state.ruler_ticks {
+                let tx = snap_px(ruler_rect.left() + *rel_x, ppp);
                 rp.line_segment(
                     [
                         Pos2::new(tx, ruler_rect.bottom() - 4.0),
@@ -752,9 +787,11 @@ pub fn show_audio_panel(
                     ],
                     Stroke::new(1.0 / ppp.max(0.5), tick_col),
                 );
-                rp.galley(Pos2::new(tx + 2.0, ruler_rect.top() + 2.0), g, tick_col);
-                t_ms += step_ms;
-                tick_idx += 1;
+                rp.galley(
+                    Pos2::new(tx + 2.0, ruler_rect.top() + 2.0),
+                    Arc::clone(g),
+                    tick_col,
+                );
             }
 
             // 2. Main waveform / spectrum canvas.
@@ -1362,5 +1399,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression: the cached ruler labels must never survive a font-atlas rebuild.
+    #[test]
+    fn ruler_galleys_are_fresh_after_atlas_rebuild() {
+        let pal = theme::palette(ThemeSpec::Dark);
+        let cat = Catalog::for_locale(Locale::En);
+        let markers = TimelineMarkerIndex::new(vec![], vec![]);
+        let mut state = AudioPanelState::new(120_000);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(ui_theme::build_font_definitions(
+            &ui_theme::FontConfig::default(),
+        ));
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 300.0))),
+            ..Default::default()
+        };
+        let mut frame = |ctx: &egui::Context| {
+            let mut out = ctx.run_ui(raw.clone(), |ui| {
+                let _ = show_audio_panel(
+                    ui,
+                    &mut state,
+                    &SineProvider,
+                    &markers,
+                    None,
+                    None,
+                    &pal,
+                    1,
+                    &cat,
+                );
+            });
+            out.textures_delta.clear();
+            let labels = ui_theme::galley_check::text_galleys(&out.shapes)
+                .iter()
+                .filter(|g| g.job.text.starts_with("0:00:"))
+                .count();
+            assert!(labels > 0, "ruler label missing");
+            ui_theme::galley_check::count_stale(ctx, &out.shapes)
+        };
+        assert_eq!(frame(&ctx), 0);
+        assert_eq!(frame(&ctx), 0);
+        ctx.set_pixels_per_point(1.5);
+        assert_eq!(frame(&ctx), 0);
+        ctx.set_fonts(egui::FontDefinitions::default());
+        assert_eq!(frame(&ctx), 0);
+        assert_eq!(frame(&ctx), 0);
     }
 }
