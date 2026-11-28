@@ -83,6 +83,8 @@ fn frame_hash(app: &EditorApp) -> u64 {
     h
 }
 
+// One linear scripted scenario (open, play, step, edit, time, save, reopen) reads best as one test.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn native_editor_end_to_end_on_generated_clip() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -127,7 +129,7 @@ fn native_editor_end_to_end_on_generated_clip() {
     );
     let open_to_first_frame = t_open.elapsed();
     eprintln!("open -> first frame: {open_to_first_frame:?}");
-    assert_eq!(app.borrow().shell.video.display.video_w as u32, 640);
+    assert!((app.borrow().shell.video.display.video_w - 640.0).abs() < 0.5);
 
     // 2. Audio decodes in the background and shows up in the audio panel.
     assert!(

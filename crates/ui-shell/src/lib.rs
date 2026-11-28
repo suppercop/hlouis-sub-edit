@@ -896,6 +896,7 @@ impl AppShell {
                     ] {
                         if ui.button(format!("Zoom {label}")).clicked() {
                             self.video.zoom_tenths = tenths;
+                            self.video.zoom_mode = ui_video::ZoomMode::Fixed;
                             ui.close();
                         }
                     }
