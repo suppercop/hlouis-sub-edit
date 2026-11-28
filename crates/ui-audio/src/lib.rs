@@ -1274,7 +1274,9 @@ mod tests {
 
     fn flatten(shape: &egui::epaint::Shape, out: &mut Vec<egui::epaint::Shape>) {
         if let egui::epaint::Shape::Vec(v) = shape {
-            v.iter().for_each(|s| flatten(s, out));
+            for s in v {
+                flatten(s, out);
+            }
         } else {
             out.push(shape.clone());
         }

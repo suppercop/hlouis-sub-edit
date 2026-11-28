@@ -676,10 +676,9 @@ pub fn show_subtitle_grid(
                         }
                         GridColumn::Text => &row.display_text,
                     };
-                    let built = ctx.fonts_mut(|f| {
+                    ctx.fonts_mut(|f| {
                         f.layout_no_wrap(cell_txt.to_owned(), font_body.clone(), text_col)
-                    });
-                    built
+                    })
                 };
                 let gsize = cell_galley.size();
                 match col {

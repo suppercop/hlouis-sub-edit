@@ -513,7 +513,11 @@ pub mod galley_check {
     fn collect(shape: &Shape, out: &mut Vec<Arc<Galley>>) {
         match shape {
             Shape::Text(t) => out.push(Arc::clone(&t.galley)),
-            Shape::Vec(v) => v.iter().for_each(|s| collect(s, out)),
+            Shape::Vec(v) => {
+                for s in v {
+                    collect(s, out);
+                }
+            }
             _ => {}
         }
     }

@@ -532,6 +532,7 @@ mod tests {
     use super::*;
     use theme::ThemeSpec;
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn tone_block(block: usize, frames: usize, total: usize) -> Box<[i16]> {
         let start = block * 65_536;
         (0..frames.min(total - start))

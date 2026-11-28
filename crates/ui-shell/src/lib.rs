@@ -56,14 +56,23 @@ impl Default for LastPaneRects {
     }
 }
 
+/// Who controls the width of the video panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoSplit {
+    /// The panel width follows the video display aspect (Fit mode).
+    Auto,
+    /// The user dragged the splitter.
+    Manual,
+}
+
 /// Full application shell state combining all UI panels, document, playback, settings, and telemetry.
 pub struct AppShell {
     pub doc: DocumentController,
     pub settings: AppSettings,
     pub layout_state: LayoutState,
-    /// `true` once the user dragged the video splitter: the video panel then stops sizing itself
-    /// to the video aspect (until the next video is attached).
-    pub video_split_manual: bool,
+    /// Whether the video panel sizes itself to the video aspect or the user took over the
+    /// splitter (until the next video is attached).
+    pub video_split: VideoSplit,
     pub theme: ThemeController,
     pub catalog: Catalog,
     pub commands: CommandRegistry,
@@ -551,7 +560,7 @@ impl AppShell {
             doc,
             settings: AppSettings::default(),
             layout_state: LayoutState::default(),
-            video_split_manual: false,
+            video_split: VideoSplit::Auto,
             theme: ThemeController::new(ThemeSpec::Dark, FontConfig::default()),
             catalog: Catalog::for_locale(Locale::En),
             commands: CommandRegistry::new_default(),
@@ -609,7 +618,7 @@ impl AppShell {
             PlaybackConfig::default(),
         ));
         self.video = VideoPanelState::new(width, height);
-        self.video_split_manual = false;
+        self.video_split = VideoSplit::Auto;
     }
 
     /// Sets the stream's sample aspect ratio (anamorphic video is displayed at `DAR = w/h * SAR`).
@@ -1206,7 +1215,7 @@ impl AppShell {
                 // The video panel sizes itself to the video's display aspect (like Aegisub) while
                 // in Fit mode, unless the user took manual control of the splitter.
                 self.layout_state.video_aspect = (self.playback.is_some()
-                    && !self.video_split_manual
+                    && self.video_split == VideoSplit::Auto
                     && self.video.zoom_mode == ui_video::ZoomMode::Fit
                     && self.video.display_aspect.is_finite()
                     && self.video.display_aspect > 0.0)
@@ -1393,10 +1402,10 @@ impl AppShell {
                         ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
                     }
                     if tv_resp.dragged() {
-                        if !self.video_split_manual {
+                        if self.video_split == VideoSplit::Auto {
                             // Start from the width the panel currently has (aspect-derived).
                             self.layout_state.video_width_ratio = tv.x / avail.width().max(1.0);
-                            self.video_split_manual = true;
+                            self.video_split = VideoSplit::Manual;
                         }
                         let dx = tv_resp.drag_delta().x / avail.width().max(1.0);
                         self.layout_state.video_width_ratio =
@@ -1850,12 +1859,9 @@ mod tests {
                     bar_x.max(bar_y) < 2.0,
                     "{label}: letterbox bars {bar_x} x {bar_y} px (canvas {canvas:?}, video {video:?})"
                 );
-                let centre_dx = (video.center().x - canvas.center().x).abs();
-                let centre_dy = (video.center().y - canvas.center().y).abs();
-                assert!(
-                    centre_dx < 0.5 && centre_dy < 0.5,
-                    "{label}: bars not symmetric"
-                );
+                let off_x = (video.center().x - canvas.center().x).abs();
+                let off_y = (video.center().y - canvas.center().y).abs();
+                assert!(off_x < 0.5 && off_y < 0.5, "{label}: bars not symmetric");
             }
         }
     }
