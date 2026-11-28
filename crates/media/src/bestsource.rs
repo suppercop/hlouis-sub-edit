@@ -194,6 +194,8 @@ impl BestSourceProvider {
                 duration_ms,
                 keyframes,
                 frame_pts_ms,
+                sar_num: u32::try_from(p.sar_num).unwrap_or(0),
+                sar_den: u32::try_from(p.sar_den).unwrap_or(0),
             },
             planar,
             track: p.track,

@@ -252,3 +252,90 @@ fn e2e_200k_lines_open_scroll_type_via_kittest() {
         "200k-line kittest took too long"
     );
 }
+
+/// Selecting a line must seek to the first frame whose timestamp is at or after the line start
+/// (Aegisub `FrameAtTime(.., START)`), never the frame before it, so the subtitle is visible.
+#[test]
+fn e2e_selecting_line_seeks_to_first_visible_frame_23_976() {
+    let mut script = ScriptFile::new_default();
+    let sec = script.ensure_events_section_mut();
+    sec.insert_event(
+        0,
+        AssEvent::dialogue(AssTime::from_cs(100), AssTime::from_cs(300), "first"),
+    );
+    // 0:00:57.90 lies inside frame 1388 (57.891 s) but the line only shows from frame 1389.
+    sec.insert_event(
+        1,
+        AssEvent::dialogue(AssTime::from_cs(5_790), AssTime::from_cs(6_080), "target"),
+    );
+    let mut app = EditorApp::new(script);
+    let tc = keyframes::Timecodes::from_cfr(24_000, 1_001).expect("cfr");
+    app.shell
+        .attach_video(tc.clone(), 5_000, vec![0], 1920, 1080);
+    app.shell.doc.set_selection(Some(1), &[1]);
+    app.shell.grid.model.click(1);
+
+    let mut harness = Harness::builder()
+        .with_size(Vec2::new(1280.0, 800.0))
+        .with_accessibility_check(false)
+        .build_ui_state(
+            |ui, app: &mut EditorApp| {
+                app.show(ui, &ZeroClock);
+            },
+            app,
+        );
+    harness.run();
+    let app = harness.state();
+    let pb = app.shell.playback.as_ref().expect("playback");
+    let frame = pb.current_frame();
+    assert_eq!(
+        frame, 1_389,
+        "line at 57.90 must seek to frame 1389, not 1388"
+    );
+    assert!(
+        tc.frame_to_time_ms(frame, keyframes::TimeType::Exact) >= 57_900,
+        "the sought frame must be displayed at or after the line start"
+    );
+}
+
+/// Selecting a line must leave its start, end and the selection overlay inside the audio view,
+/// also for lines much longer than the initial visible span.
+#[test]
+fn e2e_selecting_line_keeps_whole_line_visible_in_audio_view() {
+    let mut script = ScriptFile::new_default();
+    let sec = script.ensure_events_section_mut();
+    sec.insert_event(
+        0,
+        AssEvent::dialogue(AssTime::from_cs(500), AssTime::from_cs(900), "short"),
+    );
+    sec.insert_event(
+        1,
+        AssEvent::dialogue(AssTime::from_cs(300), AssTime::from_cs(2_700), "long line"),
+    );
+    let mut app = EditorApp::new(script);
+    app.shell.doc.set_selection(Some(1), &[1]);
+    app.shell.grid.model.click(1);
+    let mut harness = Harness::builder()
+        .with_size(Vec2::new(1280.0, 800.0))
+        .with_accessibility_check(false)
+        .build_ui_state(
+            |ui, app: &mut EditorApp| {
+                app.show(ui, &ZeroClock);
+            },
+            app,
+        );
+    harness.run();
+    let app = harness.state();
+    let vis = app.shell.audio.viewport.visible_range_ms();
+    let sel = app.shell.audio.active_selection;
+    assert_eq!((sel.start_ms, sel.end_ms), (3_000, 27_000));
+    assert!(
+        vis.start_ms <= sel.start_ms && vis.end_ms >= sel.end_ms,
+        "line {sel:?} not inside the audio view {vis:?}"
+    );
+    assert!(
+        vis.end_ms - vis.start_ms >= 8_000,
+        "initial audio zoom shows only {} ms",
+        vis.end_ms - vis.start_ms
+    );
+}

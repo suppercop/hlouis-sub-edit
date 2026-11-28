@@ -108,6 +108,12 @@ pub struct VideoPanelState {
     pub zoom_tenths: u16,
     pub active_line_start_ms: i64,
     pub active_line_end_ms: i64,
+    /// Display aspect ratio (width / height) the frame is shown at: `video_w / video_h` times
+    /// the stream's sample aspect ratio (anamorphic video is stretched, never cropped).
+    pub display_aspect: f32,
+    /// Canvas (whole drawing area) and the video rectangle painted inside it on the last frame.
+    pub last_canvas_rect: Rect,
+    pub last_video_rect: Rect,
     // Cached GPU texture + revision key (0 re-upload when unchanged).
     texture: Option<TextureHandle>,
     uploaded_key: Option<(u32, u64)>,
@@ -152,6 +158,9 @@ impl VideoPanelState {
             zoom_tenths: 375,
             active_line_start_ms: 0,
             active_line_end_ms: 2_000,
+            display_aspect: video_w.max(1) as f32 / video_h.max(1) as f32,
+            last_canvas_rect: Rect::NOTHING,
+            last_video_rect: Rect::NOTHING,
             texture: None,
             uploaded_key: None,
             texture_uploads: 0,
@@ -160,6 +169,18 @@ impl VideoPanelState {
             offset_buf: String::with_capacity(32),
             last_readout_key: None,
         }
+    }
+
+    /// Sets the sample aspect ratio of the stream (`num:den`, e.g. `32:27` for NTSC 4:3
+    /// anamorphic DVD); invalid values mean square pixels.
+    pub fn set_sar(&mut self, num: u32, den: u32) {
+        let (n, d) = if num == 0 || den == 0 {
+            (1.0, 1.0)
+        } else {
+            (num as f32, den as f32)
+        };
+        self.display_aspect =
+            (self.display.video_w.max(1.0) as f32 * n) / (self.display.video_h.max(1.0) as f32 * d);
     }
 
     #[inline]
@@ -570,7 +591,11 @@ pub fn show_video_panel(
             ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::click_and_drag());
         let vw = state.display.video_w.max(1.0) as f32;
         let vh = state.display.video_h.max(1.0) as f32;
-        let video_aspect = vw / vh;
+        let video_aspect = if state.display_aspect.is_finite() && state.display_aspect > 0.0 {
+            state.display_aspect
+        } else {
+            vw / vh
+        };
         let box_aspect = rect.width() / rect.height().max(1.0);
         let (draw_w, draw_h) = if state.zoom_mode == ZoomMode::Fit {
             if box_aspect > video_aspect {
@@ -580,9 +605,11 @@ pub fn show_video_panel(
             }
         } else {
             let scale = (f32::from(state.zoom_tenths) / 1000.0).max(0.05);
-            (vw * scale, vh * scale)
+            (vh * scale * video_aspect, vh * scale)
         };
         let video_rect = Rect::from_center_size(rect.center(), Vec2::new(draw_w, draw_h));
+        state.last_canvas_rect = rect;
+        state.last_video_rect = video_rect;
 
         // Upload RGBA frame texture ONLY when `(frame, revision)` changes.
         let rev = supplier.frame_revision(frame);

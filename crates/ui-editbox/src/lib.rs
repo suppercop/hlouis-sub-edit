@@ -31,12 +31,15 @@ use syntax_highlight::{IncrementalTokenizer, TokenKind, TokenSpan, tokenize_into
 use theme::Palette;
 use ui_theme::rgba;
 
+/// Edit-box text galley kept across frames; valid only for the [`ui_theme::GalleyEpoch`]
+/// generation it was laid out in.
 #[derive(Clone)]
 struct CachedEditGalley {
     text: String,
     wrap_width_bits: u32,
     use_monospace: bool,
     pal_sig: [u32; 9],
+    generation: u64,
     galley: Arc<Galley>,
 }
 
@@ -49,9 +52,11 @@ impl std::fmt::Debug for CachedEditGalley {
     }
 }
 
+/// "AB" colour-button galley kept across frames (same generation rule).
 #[derive(Clone)]
 struct CachedAbGalley {
     color: Color32,
+    generation: u64,
     galley: Arc<Galley>,
 }
 
@@ -111,6 +116,7 @@ pub struct EditBoxState {
     max_len_buf: String,
     last_max_len: Option<usize>,
     span_scratch: Vec<TokenSpan>,
+    galley_epoch: ui_theme::GalleyEpoch,
     galley_cache: Option<CachedEditGalley>,
     ab_galleys: [Option<CachedAbGalley>; 4],
 }
@@ -145,6 +151,7 @@ impl Default for EditBoxState {
             max_len_buf: String::with_capacity(12),
             last_max_len: None,
             span_scratch: Vec::with_capacity(128),
+            galley_epoch: ui_theme::GalleyEpoch::default(),
             galley_cache: None,
             ab_galleys: [None, None, None, None],
         }
@@ -327,6 +334,7 @@ fn paint_ab_colour_button(
     ui: &mut Ui,
     fg_color: Color32,
     cached: &mut Option<CachedAbGalley>,
+    generation: u64,
     pal: &Palette,
     tooltip: &str,
 ) -> bool {
@@ -337,13 +345,16 @@ fn paint_ab_colour_button(
         rgba(pal.toolbar_bg)
     };
     let galley = match cached {
-        Some(entry) if entry.color == fg_color => Arc::clone(&entry.galley),
+        Some(entry) if entry.generation == generation && entry.color == fg_color => {
+            Arc::clone(&entry.galley)
+        }
         slot => {
             let g = ui.fonts_mut(|f| {
                 f.layout_no_wrap("AB".to_owned(), FontId::proportional(10.5), fg_color)
             });
             *slot = Some(CachedAbGalley {
                 color: fg_color,
+                generation,
                 galley: Arc::clone(&g),
             });
             g
@@ -509,6 +520,9 @@ pub fn show_edit_box(
     catalog: &Catalog,
 ) -> bool {
     state.sync_active_line(doc, timecodes);
+    // Cached galleys are only reused while egui has not invalidated its layouts (atlas reset,
+    // new fonts / pixels-per-point); see `GalleyEpoch`.
+    let generation = state.galley_epoch.sync(ui.ctx());
     let Some(line_idx) = state.active_line else {
         return false;
     };
@@ -795,6 +809,7 @@ pub fn show_edit_box(
                 ui,
                 state.colour_swatches[idx],
                 &mut state.ab_galleys[idx],
+                generation,
                 palette,
                 tip,
             ) {
@@ -849,7 +864,6 @@ pub fn show_edit_box(
 
     // ── Row 4: White (in Light mode) proportional UI font syntax-highlighted multiline TextEdit.
     let pal_clone = palette.clone();
-    let pal_sig = palette_syntax_sig(palette);
     let use_monospace = state.use_monospace;
     let edit_font = if use_monospace {
         FontId::monospace(12.5)
@@ -866,6 +880,7 @@ pub fn show_edit_box(
     } else {
         rgba(palette.grid_bg)
     };
+    let pal_sig = palette_syntax_sig(palette);
     let mut galley_cache = state.galley_cache.take();
     let mut span_scratch = std::mem::take(&mut state.span_scratch);
     let output = {
@@ -873,6 +888,7 @@ pub fn show_edit_box(
             let s = text.as_str();
             let wrap_bits = wrap_width.to_bits();
             if let Some(ref c) = galley_cache
+                && c.generation == generation
                 && c.wrap_width_bits == wrap_bits
                 && c.use_monospace == use_monospace
                 && c.pal_sig == pal_sig
@@ -890,6 +906,7 @@ pub fn show_edit_box(
                 old.wrap_width_bits = wrap_bits;
                 old.use_monospace = use_monospace;
                 old.pal_sig = pal_sig;
+                old.generation = generation;
                 old.galley = Arc::clone(&g);
                 old
             } else {
@@ -898,6 +915,7 @@ pub fn show_edit_box(
                     wrap_width_bits: wrap_bits,
                     use_monospace,
                     pal_sig,
+                    generation,
                     galley: Arc::clone(&g),
                 }
             };
@@ -984,5 +1002,49 @@ mod tests {
             let _ = show_edit_box(ui, &mut doc, &mut state, None, &pal, &cat);
         });
         harness.run();
+    }
+
+    /// Regression: the edit box (text layouter and the four "AB" colour buttons) must never
+    /// paint galleys cached across a font-atlas rebuild.
+    #[test]
+    fn edit_box_galleys_are_fresh_after_atlas_rebuild() {
+        let mut script = ScriptFile::new_default();
+        script.ensure_events_section_mut().insert_event(
+            0,
+            AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(250), r"{\an5}Hello\Nworld"),
+        );
+        let mut doc = DocumentController::new(script);
+        let mut state = EditBoxState::default();
+        let pal = theme::palette(ThemeSpec::Light);
+        let cat = Catalog::for_locale(Locale::En);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(ui_theme::build_font_definitions(
+            &ui_theme::FontConfig::default(),
+        ));
+        let frame =
+            |ctx: &egui::Context, doc: &mut DocumentController, state: &mut EditBoxState| {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let _ = show_edit_box(ui, doc, state, None, &pal, &cat);
+                });
+                out.textures_delta.clear();
+                let galleys = ui_theme::galley_check::text_galleys(&out.shapes);
+                assert!(
+                    galleys.iter().any(|g| g.job.text == "AB"),
+                    "AB buttons must be painted"
+                );
+                ui_theme::galley_check::count_stale(ctx, &out.shapes)
+            };
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        let _ = doc.amend_text(0, "test", "Tiếng Việt ắặẳẵ ứừửữự 日本語の字幕");
+        state.sync_active_line(&doc, None);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        ctx.set_pixels_per_point(1.5);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        // Rebuilt fonts (new atlas) invalidate every galley, including the cached AB buttons.
+        ctx.set_fonts(egui::FontDefinitions::default());
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
+        assert_eq!(frame(&ctx, &mut doc, &mut state), 0);
     }
 }

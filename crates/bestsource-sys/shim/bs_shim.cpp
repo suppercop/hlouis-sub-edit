@@ -362,6 +362,8 @@ extern "C" void bs_video_get_props(const bs_video *v, bs_video_props *o) {
     o->bits = P.VF.Bits;
     o->sub_sampling_w = P.VF.SubSamplingW;
     o->sub_sampling_h = P.VF.SubSamplingH;
+    o->sar_num = static_cast<int>(P.SAR.Num);
+    o->sar_den = static_cast<int>(P.SAR.Den);
 }
 
 extern "C" int bs_video_frame_table(const bs_video *v, int64_t *pts, uint8_t *keyframe, int64_t count) {
@@ -843,6 +845,8 @@ extern "C" void bs_quick_get_props(const bs_quick *q, bs_quick_props *o) {
     o->time_base_den = q->VP.TimeBase.Den;
     o->first_pts = q->FirstPTS;
     o->duration = q->VP.Duration > 0 ? q->VP.Duration : 0;
+    o->sar_num = static_cast<int>(q->VP.SAR.Num);
+    o->sar_den = static_cast<int>(q->VP.SAR.Den);
 }
 
 extern "C" int bs_quick_get_frame_rgba(bs_quick *q, int64_t n, uint8_t *dst, ptrdiff_t stride, int width, int height,

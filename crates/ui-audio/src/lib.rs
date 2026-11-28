@@ -88,12 +88,15 @@ struct TextureCacheKey {
     palette_rev: u64,
 }
 
+/// Ruler label cache key; `generation` is the [`ui_theme::GalleyEpoch`] generation so labels laid
+/// out before an atlas reset are never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RulerCacheKey {
     start_ms: i64,
     end_ms: i64,
     width_bits: u32,
     ppp_bits: u32,
+    generation: u64,
 }
 
 /// Persistent UI state + cached waveform texture + reusable scratch buffers for the audio panel.
@@ -122,6 +125,7 @@ pub struct AudioPanelState {
     pixel_buf: Vec<Color32>,
     frame_layout: AudioFrameLayout,
     ruler_buf: String,
+    galley_epoch: ui_theme::GalleyEpoch,
     ruler_key: Option<RulerCacheKey>,
     ruler_ticks: Vec<(f32, Arc<Galley>)>,
 }
@@ -149,7 +153,8 @@ impl AudioPanelState {
             auto_commit: false,
             auto_next: true,
             auto_scroll: true,
-            h_zoom: 1.0,
+            // Matches the viewport default of 10 ms/px through `ms_per_px = 12 / h_zoom`.
+            h_zoom: 1.2,
             v_zoom: 1.0,
             volume: 1.0,
             link_zoom_volume: true,
@@ -167,6 +172,7 @@ impl AudioPanelState {
             pixel_buf: Vec::with_capacity(2048 * 160),
             frame_layout: AudioFrameLayout::with_capacity(2048),
             ruler_buf: String::with_capacity(16),
+            galley_epoch: ui_theme::GalleyEpoch::default(),
             ruler_key: None,
             ruler_ticks: Vec::with_capacity(32),
         }
@@ -736,11 +742,15 @@ pub fn show_audio_panel(
             let first_tick = ((vis.start_ms + step_ms - 1) / step_ms) * step_ms;
             let tick_font = FontId::proportional(9.5);
             let tick_col = Color32::from_rgb(208, 216, 230);
+            // Ruler labels are cached across frames, but only while egui has not invalidated its
+            // layouts (atlas reset, new fonts / pixels-per-point): see `GalleyEpoch`.
+            let generation = state.galley_epoch.sync(ui.ctx());
             let rkey = RulerCacheKey {
                 start_ms: vis.start_ms,
                 end_ms: vis.end_ms,
                 width_bits: canvas_w.to_bits(),
                 ppp_bits: ppp.to_bits(),
+                generation,
             };
             if state.ruler_key != Some(rkey) {
                 state.ruler_ticks.clear();
@@ -1297,5 +1307,143 @@ mod tests {
             });
         harness.run();
         harness.step();
+    }
+
+    fn flatten(shape: &egui::epaint::Shape, out: &mut Vec<egui::epaint::Shape>) {
+        if let egui::epaint::Shape::Vec(v) = shape {
+            for s in v {
+                flatten(s, out);
+            }
+        } else {
+            out.push(shape.clone());
+        }
+    }
+
+    /// The active-line selection overlay, its start/end markers and the keyframe lines must be
+    /// painted over the decoded audio in both spectrum and waveform mode.
+    #[test]
+    fn selection_overlay_markers_and_keyframes_are_painted_in_both_modes() {
+        let pal = theme::palette(ThemeSpec::Dark);
+        let cat = Catalog::for_locale(Locale::En);
+        let markers = TimelineMarkerIndex::new(vec![58_500, 59_700, 61_000], vec![57_900, 60_800]);
+        for spectrum in [true, false] {
+            let mut state = AudioPanelState::new(120_000);
+            state.spectrum_mode = spectrum;
+            state.viewport.scroll_ms = 55_000.0;
+            state.active_selection = TimeRangeMs {
+                start_ms: 57_900,
+                end_ms: 60_800,
+            };
+            let ctx = egui::Context::default();
+            ctx.set_fonts(ui_theme::build_font_definitions(
+                &ui_theme::FontConfig::default(),
+            ));
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 300.0))),
+                ..Default::default()
+            };
+            let mut shapes = Vec::new();
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(raw.clone(), |ui| {
+                    let _ = show_audio_panel(
+                        ui,
+                        &mut state,
+                        &SineProvider,
+                        &markers,
+                        None,
+                        None,
+                        &pal,
+                        1,
+                        &cat,
+                    );
+                });
+                out.textures_delta.clear();
+                shapes.clear();
+                for cs in &out.shapes {
+                    flatten(&cs.shape, &mut shapes);
+                }
+            }
+            // Initial zoom shows several seconds, not a sliver.
+            let vis = state.viewport.visible_range_ms();
+            assert!(
+                vis.end_ms - vis.start_ms >= 6_000,
+                "visible span too small: {vis:?}"
+            );
+            let sel = ui_theme::rgba(pal.audio_selection);
+            let has_fill = shapes.iter().any(|s| {
+                matches!(s, egui::epaint::Shape::Rect(r) if r.fill == sel && r.rect.width() > 20.0)
+            });
+            assert!(
+                has_fill,
+                "selection overlay not painted (spectrum={spectrum})"
+            );
+            let line_colours: Vec<egui::Color32> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::epaint::Shape::LineSegment { stroke, .. } => Some(stroke.color),
+                    _ => None,
+                })
+                .collect();
+            let key = ui_theme::rgba(pal.audio_keyframe);
+            assert!(
+                line_colours.iter().filter(|&&c| c == key).count() >= 2,
+                "keyframe lines not painted (spectrum={spectrum})"
+            );
+            for c in [
+                Color32::from_rgb(235, 65, 65),
+                Color32::from_rgb(235, 110, 185),
+            ] {
+                assert!(
+                    line_colours.contains(&c),
+                    "selection start/end marker {c:?} missing (spectrum={spectrum})"
+                );
+            }
+        }
+    }
+
+    /// Regression: the cached ruler labels must never survive a font-atlas rebuild.
+    #[test]
+    fn ruler_galleys_are_fresh_after_atlas_rebuild() {
+        let pal = theme::palette(ThemeSpec::Dark);
+        let cat = Catalog::for_locale(Locale::En);
+        let markers = TimelineMarkerIndex::new(vec![], vec![]);
+        let mut state = AudioPanelState::new(120_000);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(ui_theme::build_font_definitions(
+            &ui_theme::FontConfig::default(),
+        ));
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 300.0))),
+            ..Default::default()
+        };
+        let mut frame = |ctx: &egui::Context| {
+            let mut out = ctx.run_ui(raw.clone(), |ui| {
+                let _ = show_audio_panel(
+                    ui,
+                    &mut state,
+                    &SineProvider,
+                    &markers,
+                    None,
+                    None,
+                    &pal,
+                    1,
+                    &cat,
+                );
+            });
+            out.textures_delta.clear();
+            let labels = ui_theme::galley_check::text_galleys(&out.shapes)
+                .iter()
+                .filter(|g| g.job.text.starts_with("0:00:"))
+                .count();
+            assert!(labels > 0, "ruler label missing");
+            ui_theme::galley_check::count_stale(ctx, &out.shapes)
+        };
+        assert_eq!(frame(&ctx), 0);
+        assert_eq!(frame(&ctx), 0);
+        ctx.set_pixels_per_point(1.5);
+        assert_eq!(frame(&ctx), 0);
+        ctx.set_fonts(egui::FontDefinitions::default());
+        assert_eq!(frame(&ctx), 0);
+        assert_eq!(frame(&ctx), 0);
     }
 }

@@ -70,6 +70,7 @@ fn meta_from(info: &VideoInfo) -> Option<VideoMeta> {
         frame_count,
         timecodes: tc,
         keyframes,
+        sar: info.sar(),
     })
 }
 
