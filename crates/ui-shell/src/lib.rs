@@ -83,6 +83,13 @@ pub struct AppShell {
     pub autosave_interval_ns: u64,
     pub system_is_dark: bool,
     pub last_pane_rects: LastPaneRects,
+    /// Command IDs the shell does not handle itself (open video/audio, save, ...), drained by the
+    /// application layer every frame.
+    pub pending_commands: Vec<String>,
+    /// Last action emitted by the video panel this frame (cleared by the host after handling).
+    pub last_video_action: Option<ui_video::VideoPanelAction>,
+    /// Last action emitted by the audio panel this frame (cleared by the host after handling).
+    pub last_audio_action: Option<ui_audio::AudioPanelAction>,
     fonts_installed: bool,
     last_theme_rev: u64,
     status_line_cache: (Option<usize>, usize, String),
@@ -563,6 +570,9 @@ impl AppShell {
             autosave_interval_ns: 60_000_000_000,
             system_is_dark: true,
             last_pane_rects: LastPaneRects::default(),
+            pending_commands: Vec::new(),
+            last_video_action: None,
+            last_audio_action: None,
             fonts_installed: false,
             last_theme_rev: 0,
             status_line_cache: (None, usize::MAX, String::with_capacity(32)),
@@ -708,6 +718,7 @@ impl AppShell {
             }
             _ => {
                 self.status_message = format!("Command: {cmd_id}");
+                self.pending_commands.push(cmd_id.to_owned());
             }
         }
     }
@@ -1202,7 +1213,7 @@ impl AppShell {
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(vr));
                     child.set_clip_rect(vr);
                     if let (Some(vs), Some(pb)) = (video_supplier, self.playback.as_mut()) {
-                        let _ = show_video_panel(
+                        self.last_video_action = show_video_panel(
                             &mut child,
                             &mut self.video,
                             vs,
@@ -1234,7 +1245,7 @@ impl AppShell {
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ar));
                     child.set_clip_rect(ar);
                     if let Some(ap) = audio_provider {
-                        let _ = show_audio_panel(
+                        self.last_audio_action = show_audio_panel(
                             &mut child,
                             &mut self.audio,
                             ap,
@@ -1463,6 +1474,7 @@ impl AppShell {
             match mkv_action {
                 MkvImportAction::ImportSelected { track_numbers, .. } => {
                     self.status_message = format!("Imported {} MKV track(s)", track_numbers.len());
+                    self.pending_commands.push("mkv/import".to_owned());
                     self.dialogs.open = None;
                 }
                 MkvImportAction::Close => {

@@ -302,6 +302,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-native"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "app-core",
+ "ass-core",
+ "audio-cache",
+ "audio-out",
+ "audio-peaks",
+ "egui",
+ "fonts",
+ "fonts-dwrite",
+ "keyframes",
+ "media",
+ "render",
+ "rfd",
+ "spectrum",
+ "tempfile",
+ "theme",
+]
+
+[[package]]
 name = "app-services"
 version = "0.1.0"
 dependencies = [

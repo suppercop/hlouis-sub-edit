@@ -21,6 +21,34 @@ pub struct SubtitleBBox {
     pub line_index: usize,
 }
 
+/// Timing metadata of an opened video, reported once the source is ready (and again when a
+/// frame-exact index replaces an approximate fast-open source).
+#[derive(Debug, Clone)]
+pub struct VideoMeta {
+    pub width: u32,
+    pub height: u32,
+    pub frame_count: u32,
+    pub timecodes: Timecodes,
+    pub keyframes: Vec<u32>,
+}
+
+/// Event produced by a background media provider; always surfaced to the user (never silent).
+#[derive(Debug, Clone)]
+pub enum MediaEvent {
+    /// The video source is ready: attach it to the playback controller.
+    VideoReady(VideoMeta),
+    /// A frame-exact index replaced the fast-open source: refresh timing metadata in place.
+    VideoRefined(VideoMeta),
+    /// Decoded audio is available with this total duration.
+    AudioReady { duration_ms: i64 },
+    /// More decoded audio became available: redraw waveform/spectrum.
+    AudioDataChanged,
+    /// Informational progress (indexing %, ETA, provider fallback notices, ...).
+    Status(String),
+    /// A failure that must be shown to the user; the provider fell back or stopped.
+    Error(String),
+}
+
 /// Trait supplying decoded video frames, timecodes, and keyframes.
 pub trait VideoProvider {
     fn width(&self) -> u32;
@@ -33,6 +61,16 @@ pub trait VideoProvider {
     }
     /// Returns tightly packed RGBA8 pixels (`width * height * 4`) for `frame`.
     fn frame_rgba(&self, frame: u32) -> Option<&[u8]>;
+    /// Content revision of the pixels returned by [`Self::frame_rgba`] (bump on any change).
+    fn revision(&self, frame: u32) -> u64 {
+        u64::from(frame) + 1
+    }
+    /// Hints that the UI now shows `frame` (asynchronous providers start decoding it).
+    fn request_frame(&mut self, _frame: u32) {}
+    /// Supplies the current subtitle script (full `.ass` text) for compositing on frames.
+    fn set_subtitles(&mut self, _ass_text: String) {}
+    /// Drains background events (open progress, ready, errors) into `out`.
+    fn poll(&mut self, _out: &mut Vec<MediaEvent>) {}
 }
 
 /// Trait supplying PCM audio samples and waveform peak columns.
@@ -48,6 +86,63 @@ pub trait AudioProvider {
         width_px: usize,
         out: &mut Vec<PeakBucket>,
     );
+    /// Drains background events (decode progress, ready, errors) into `out`.
+    fn poll(&mut self, _out: &mut Vec<MediaEvent>) {}
+    /// Starts audible playback of `[start_ms, end_ms]` (no-op for silent providers).
+    fn play(&mut self, _start_ms: i64, _end_ms: i64) {}
+    /// Stops audible playback.
+    fn stop(&mut self) {}
+    /// Current playback position in ms while audible playback is running, else `None`.
+    fn position_ms(&self) -> Option<i64> {
+        None
+    }
+    /// Sets the output gain (`0.0 ..= 1.0`).
+    fn set_volume(&mut self, _volume: f32) {}
+    /// Renders STFT spectrum pixels for `[start_ms, end_ms]` (`width_px * height_px`, row-major)
+    /// into `out`; returns `false` when unsupported so the caller falls back to peaks.
+    fn render_spectrum_into(
+        &self,
+        _start_ms: i64,
+        _end_ms: i64,
+        _width_px: usize,
+        _height_px: usize,
+        _palette: &theme::Palette,
+        _out: &mut Vec<egui::Color32>,
+    ) -> bool {
+        false
+    }
+}
+
+/// Creates native (or any other) media providers on demand; implemented by the platform layer.
+pub trait MediaFactory {
+    /// Starts opening `path` as a video (returns immediately; readiness arrives as events).
+    fn open_video(
+        &mut self,
+        path: &Path,
+        ctx: &egui::Context,
+        ass_text: String,
+    ) -> Result<Box<dyn VideoProvider>, String>;
+    /// Starts decoding the audio of `path` (a video container or a pure audio file).
+    fn open_audio(
+        &mut self,
+        path: &Path,
+        ctx: &egui::Context,
+    ) -> Result<Box<dyn AudioProvider>, String>;
+}
+
+/// What a native file dialog should pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickKind {
+    Subtitles,
+    Video,
+    Audio,
+    Mkv,
+}
+
+/// Native file dialogs (implemented with `rfd` by the platform layer).
+pub trait FileDialogs {
+    fn pick_file(&mut self, kind: PickKind) -> Option<std::path::PathBuf>;
+    fn pick_save(&mut self, suggested_name: &str) -> Option<std::path::PathBuf>;
 }
 
 /// Trait compositing subtitles over an RGBA8 video frame at `time_ms`.
@@ -136,7 +231,10 @@ impl VideoFrameSupplier for VideoSupplierAdapter<'_> {
         self.0.is_keyframe(frame)
     }
     fn frame_revision(&self, frame: u32) -> u64 {
-        u64::from(frame) + 1
+        self.0.revision(frame)
+    }
+    fn keyframes(&self) -> Option<&[u32]> {
+        Some(self.0.keyframes())
     }
     fn frame_rgba(&self, frame: u32) -> Option<RgbaFrameRef<'_>> {
         let rgba = self.0.frame_rgba(frame)?;
@@ -335,6 +433,18 @@ impl AudioColumnProvider for AudioColumnAdapter<'_> {
         out: &mut Vec<PeakBucket>,
     ) {
         self.0.query_peaks_into(start_ms, end_ms, width_px, out);
+    }
+    fn render_spectrum_into(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        width_px: usize,
+        height_px: usize,
+        palette: &theme::Palette,
+        out: &mut Vec<egui::Color32>,
+    ) -> bool {
+        self.0
+            .render_spectrum_into(start_ms, end_ms, width_px, height_px, palette, out)
     }
 }
 

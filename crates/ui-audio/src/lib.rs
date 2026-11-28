@@ -133,6 +133,12 @@ impl Default for AudioPanelState {
 }
 
 impl AudioPanelState {
+    /// Drops the cached waveform/spectrum texture so the next frame re-queries the provider
+    /// (call when more decoded audio became available for the already visible range).
+    pub fn invalidate_texture(&mut self) {
+        self.cache_key = None;
+    }
+
     /// Creates an audio panel state initialized for `duration_ms`.
     #[must_use]
     pub fn new(duration_ms: i64) -> Self {

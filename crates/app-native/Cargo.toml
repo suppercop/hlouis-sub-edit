@@ -1,0 +1,28 @@
+[package]
+name = "app-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+app-core = { path = "../app-core" }
+audio-cache = { path = "../audio-cache" }
+audio-out = { path = "../audio-out" }
+audio-peaks = { path = "../audio-peaks" }
+egui.workspace = true
+fonts = { path = "../fonts" }
+fonts-dwrite = { path = "../fonts-dwrite" }
+keyframes = { path = "../keyframes" }
+media = { path = "../media" }
+render = { path = "../render" }
+rfd.workspace = true
+ass-core = { path = "../ass-core" }
+spectrum = { path = "../spectrum" }
+theme = { path = "../theme" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

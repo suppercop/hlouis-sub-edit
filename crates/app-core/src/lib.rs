@@ -10,6 +10,7 @@
 pub mod bench_scenarios;
 pub mod media;
 pub mod owner_defaults;
+pub mod transport;
 
 use ass_core::{
     AssEvent, AssStyle, AssTime, EditCommand, EventKind, ScriptFile, parse_ass, serialize_ass,
@@ -81,6 +82,8 @@ pub enum AppError {
     Mkv(String),
     #[error("audio error: {0}")]
     Audio(String),
+    #[error("media error: {0}")]
+    Media(String),
     #[error("settings error: {0}")]
     Settings(String),
 }
@@ -100,6 +103,16 @@ pub struct EditorApp {
     pub audio: Option<Box<dyn AudioProvider>>,
     pub renderer: Box<dyn SubtitleRenderer>,
     pub fonts: Box<dyn FontProvider>,
+    /// Creates native video/audio providers (None = pure-Rust fallbacks only).
+    pub factory: Option<Box<dyn media::MediaFactory>>,
+    /// Native file dialogs (None = menu open/save commands report that no dialog is available).
+    pub file_dialogs: Option<Box<dyn media::FileDialogs>>,
+    pub video_path: Option<PathBuf>,
+    pub audio_path: Option<PathBuf>,
+    /// Pending dismissable error notice (provider failure, open failure, ...).
+    pub notice: Option<String>,
+    pub transport: transport::TransportState,
+    pub(crate) keyframe_ms: Vec<i64>,
 }
 
 impl EditorApp {
@@ -137,6 +150,13 @@ impl EditorApp {
             audio: Some(Box::new(synth_audio)),
             renderer: Box::new(PlainTextBoxRenderer),
             fonts: Box::new(BasicFontProvider::default()),
+            factory: None,
+            file_dialogs: None,
+            video_path: None,
+            audio_path: None,
+            notice: None,
+            transport: transport::TransportState::default(),
+            keyframe_ms: Vec::new(),
         }
     }
 
@@ -697,6 +717,7 @@ impl EditorApp {
 
     /// Renders one complete application frame into `ui` and processes drag-and-drop + prompts.
     pub fn show(&mut self, ui: &mut Ui, clock: &dyn Clock) {
+        self.media_pre_show(clock);
         let vid_adapter = VideoSupplierAdapter(self.video.as_ref());
         let aud_adapter = self.audio.as_deref().map(AudioColumnAdapter);
         let aud_ref: Option<&dyn ui_audio::AudioColumnProvider> = aud_adapter
@@ -705,11 +726,29 @@ impl EditorApp {
 
         self.shell.show(ui, Some(&vid_adapter), aud_ref, clock);
 
-        // Process any dropped files from the OS.
+        // Process any dropped files from the OS (video / audio / subtitles by extension).
         let dropped = std::mem::take(&mut self.shell.dropped_files);
+        let ctx = ui.ctx().clone();
         for p in dropped {
-            if let Err(err) = self.open_file(&p) {
-                self.shell.status_message = format!("Open failed: {err}");
+            if let Err(err) = self.open_any(&p, &ctx) {
+                self.notify_error(format!("Open failed: {err}"));
+            }
+        }
+        self.media_post_show(&ctx, clock);
+
+        if let Some(msg) = self.notice.clone() {
+            let mut dismiss = false;
+            egui::Window::new("Notice")
+                .order(Order::Foreground)
+                .collapsible(false)
+                .show(&ctx, |ui| {
+                    ui.label(&msg);
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                });
+            if dismiss {
+                self.notice = None;
             }
         }
 
