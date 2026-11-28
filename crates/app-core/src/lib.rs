@@ -621,11 +621,15 @@ impl EditorApp {
                 let e_cs = (r.end_ms.max(0) / 10) as u32;
                 self.shell
                     .doc
-                    .amend_time(active, true, "audio timing start", AssTime::from_cs(s_cs))
+                    .amend_time(active, false, "audio timing start", AssTime::from_cs(s_cs))
                     .map_err(|e| AppError::Document(e.to_string()))?;
                 self.shell
                     .doc
-                    .amend_time(active, false, "audio timing end", AssTime::from_cs(e_cs))
+                    .amend_time(active, true, "audio timing end", AssTime::from_cs(e_cs))
+                    .map_err(|e| AppError::Document(e.to_string()))?;
+                self.shell
+                    .doc
+                    .flush_amend()
                     .map_err(|e| AppError::Document(e.to_string()))?;
                 self.sync_ui_from_doc();
             }

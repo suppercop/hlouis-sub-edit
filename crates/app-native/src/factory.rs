@@ -60,7 +60,9 @@ impl FileDialogs for NativeFileDialogs {
                 .add_filter("Subtitles", &["ass", "ssa", "srt"]),
             PickKind::Video => d.set_title("Open video").add_filter(
                 "Video",
-                &["mkv", "mp4", "m4v", "avi", "mov", "webm", "ts", "m2ts", "wmv"],
+                &[
+                    "mkv", "mp4", "m4v", "avi", "mov", "webm", "ts", "m2ts", "wmv",
+                ],
             ),
             PickKind::Audio => d.set_title("Open audio").add_filter(
                 "Audio / video",

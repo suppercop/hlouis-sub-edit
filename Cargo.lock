@@ -312,15 +312,19 @@ dependencies = [
  "audio-out",
  "audio-peaks",
  "egui",
+ "egui_kittest",
  "fonts",
  "fonts-dwrite",
  "keyframes",
  "media",
+ "playback",
  "render",
  "rfd",
  "spectrum",
  "tempfile",
  "theme",
+ "ui-audio",
+ "ui-video",
 ]
 
 [[package]]
@@ -2315,6 +2319,8 @@ name = "hlouis-sub-edit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "app-core",
+ "app-native",
  "ass-core",
  "criterion",
  "dark-light",
@@ -2324,7 +2330,9 @@ dependencies = [
  "egui_extras",
  "fluent",
  "i18n",
+ "layout",
  "media",
+ "playback",
  "render",
  "rfd",
  "settings",

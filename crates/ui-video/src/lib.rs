@@ -853,7 +853,7 @@ pub fn show_video_panel(
             action = Some(VideoPanelAction::PlayLine);
         }
         if ui
-            .small_button(RichText::new(if pb.is_playing() { "⏸" } else { "■" }).color(red))
+            .small_button(RichText::new(if pb.is_playing() { "II" } else { "■" }).color(red))
             .on_hover_text("Pause / Stop video")
             .clicked()
         {

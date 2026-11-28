@@ -338,9 +338,11 @@ impl AudioProvider for NativeAudio {
         let span_ms = (end_ms - start_ms).max(1);
         // Columns before time zero stay empty.
         let pad = if start_ms < 0 {
-            usize::try_from((-start_ms).saturating_mul(i64::try_from(width_px).unwrap_or(0)) / span_ms)
-                .unwrap_or(0)
-                .min(width_px)
+            usize::try_from(
+                (-start_ms).saturating_mul(i64::try_from(width_px).unwrap_or(0)) / span_ms,
+            )
+            .unwrap_or(0)
+            .min(width_px)
         } else {
             0
         };
@@ -445,7 +447,10 @@ impl AudioProvider for NativeAudio {
         let sr = u64::from(l.sample_rate);
         let ch = usize::from(self.channels.max(1));
         let want_s = self.frames_for_ms(start_ms.max(0));
-        let want_e = self.frames_for_ms(end_ms).min(l.total_frames).max(want_s + 1);
+        let want_e = self
+            .frames_for_ms(end_ms)
+            .min(l.total_frames)
+            .max(want_s + 1);
         let span = want_e - want_s;
         let mut sc = self.scratch.borrow_mut();
         let covered = sc
