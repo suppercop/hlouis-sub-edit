@@ -125,6 +125,69 @@ fn normalize_selection(selected: &[usize], count: usize) -> Vec<usize> {
     idxs
 }
 
+/// Builds a new empty dialogue event with Aegisub-compatible timing, style, and layer for
+/// inserting before (`after == false`) or after (`after == true`) `active` in `script`.
+///
+/// - **Before**: `[prev.end, active.start]`, or `[active.start - default, active.start]` (clamped
+///   to `>= 0`) for the first line. If `prev.end > active.start` (overlap), produces a zero-length
+///   line at `active.start`.
+/// - **After**: `[active.end, next.start]`, or `[active.end, active.end + default]` for the last
+///   line. If `next.start < active.end` (overlap), produces a zero-length line at `active.end`.
+/// - **Empty script**: `[0, default]` with style `"Default"` and layer `0`.
+#[must_use]
+pub fn build_inserted_event(
+    script: &ScriptFile,
+    active: usize,
+    after: bool,
+    default_duration_ms: i64,
+) -> AssEvent {
+    let default_cs = u32::try_from((default_duration_ms.max(0) + 5) / 10).unwrap_or(200);
+    let Some(sec) = script.events_section() else {
+        return AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(default_cs), "");
+    };
+    let count = sec.event_count();
+    if count == 0 {
+        return AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(default_cs), "");
+    }
+    let idx = active.min(count - 1);
+    let Some(cur) = sec.get_event(idx) else {
+        return AssEvent::dialogue(AssTime::ZERO, AssTime::from_cs(default_cs), "");
+    };
+
+    let (start, end) = if after {
+        let s = cur.end();
+        let e = if idx + 1 < count {
+            let next_start = sec.get_event(idx + 1).map_or(s, AssEvent::start);
+            if next_start < s {
+                s
+            } else {
+                next_start
+            }
+        } else {
+            AssTime::from_cs(s.as_cs().saturating_add(default_cs))
+        };
+        (s, e)
+    } else {
+        let e = cur.start();
+        let s = if idx > 0 {
+            let prev_end = sec.get_event(idx - 1).map_or(e, AssEvent::end);
+            if prev_end > e {
+                e
+            } else {
+                prev_end
+            }
+        } else {
+            AssTime::from_cs(e.as_cs().saturating_sub(default_cs))
+        };
+        (s, e)
+    };
+
+    let mut ev = AssEvent::dialogue(start, end, "");
+    ev.set_style(cur.style().to_owned());
+    ev.set_layer(cur.layer());
+    ev
+}
+
 /// Inserts `event` immediately before `index`.
 ///
 /// # Errors

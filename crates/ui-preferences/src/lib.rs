@@ -291,6 +291,7 @@ pub fn show_preferences_dialog(
                     ui.horizontal(|ui| {
                         ui.label("Hidden tag marker:");
                         let current_label = match settings.interface.hidden_tag_marker {
+                            HiddenTagMarker::AegisubCircle => "Aegisub circle",
                             HiddenTagMarker::SmallDot => "Small dot",
                             HiddenTagMarker::AegisubSun => "Aegisub sun",
                             HiddenTagMarker::None => "None",
@@ -298,6 +299,11 @@ pub fn show_preferences_dialog(
                         egui::ComboBox::from_id_salt("prefs_hidden_tag_marker")
                             .selected_text(current_label)
                             .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut settings.interface.hidden_tag_marker,
+                                    HiddenTagMarker::AegisubCircle,
+                                    "Aegisub circle",
+                                );
                                 ui.selectable_value(
                                     &mut settings.interface.hidden_tag_marker,
                                     HiddenTagMarker::SmallDot,

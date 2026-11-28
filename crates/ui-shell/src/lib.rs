@@ -82,6 +82,8 @@ pub struct AppShell {
     pub editbox: EditBoxState,
     pub audio: AudioPanelState,
     pub audio_markers: TimelineMarkerIndex,
+    pub karaoke: Option<ui_audio::KaraokeTimingController>,
+    karaoke_sync_key: Option<(usize, u64)>,
     pub video: VideoPanelState,
     pub dialogs: DialogHostState,
     pub prefs_dialog: PreferencesDialogState,
@@ -510,6 +512,8 @@ impl AppShell {
             editbox: EditBoxState::default(),
             audio: AudioPanelState::new(0),
             audio_markers: TimelineMarkerIndex::new(Vec::new(), Vec::new()),
+            karaoke: None,
+            karaoke_sync_key: None,
             video: VideoPanelState::new(0, 0),
             dialogs,
             prefs_dialog: PreferencesDialogState::default(),
@@ -720,16 +724,76 @@ impl AppShell {
             }
         });
 
-        // Global hotkey dispatch (Ctrl+Shift+P opens command palette; otherwise consults registry).
-        if !ctx.egui_wants_keyboard_input() {
-            if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(Key::P)) {
-                self.command_palette_open = !self.command_palette_open;
-            } else if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Z))
-                && let Some(chord) = KeyChord::from_parts(KeyChord::CTRL, "Z")
-                && let Some(cmd) = self.commands.lookup(HotkeyContext::Default, chord)
-            {
-                let owned = cmd.to_owned();
-                self.execute_command(&owned);
+        // Global hotkey dispatch with Aegisub-like focus routing:
+        // - When focus is NOT in a text field (grid, audio, video): Audio-context keys (e.g.
+        //   Space / S -> audio/play/selection), then SubtitleGrid, Video, Default, Always.
+        // - When focus IS in a text field (e.g. edit box): plain keys go to the text field so
+        //   Space types a space; only modifier chords in SubtitleEditBox / Always / Ctrl+Space
+        //   fire.
+        if self.dialogs.open.is_none() && !self.command_palette_open {
+            let in_text = ctx.egui_wants_keyboard_input();
+            let pressed: Vec<(egui::Modifiers, Key)> = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|ev| match *ev {
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } => Some((modifiers, key)),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for (mods, key) in pressed {
+                if !in_text && mods.ctrl && mods.shift && key == Key::P {
+                    self.command_palette_open = !self.command_palette_open;
+                    continue;
+                }
+                let Some(chord) = egui_key_to_chord(mods, key) else {
+                    continue;
+                };
+                let cmd = if in_text {
+                    if mods.ctrl || mods.alt {
+                        self.commands
+                            .lookup_in_context(HotkeyContext::SubtitleEditBox, chord)
+                            .or_else(|| {
+                                self.commands
+                                    .lookup_in_context(HotkeyContext::Always, chord)
+                            })
+                            .or_else(|| {
+                                (key == Key::Space)
+                                    .then(|| {
+                                        self.commands
+                                            .lookup_in_context(HotkeyContext::Default, chord)
+                                    })
+                                    .flatten()
+                            })
+                    } else {
+                        None
+                    }
+                } else {
+                    self.commands
+                        .lookup_in_context(HotkeyContext::Audio, chord)
+                        .or_else(|| {
+                            self.commands
+                                .lookup_in_context(HotkeyContext::SubtitleGrid, chord)
+                        })
+                        .or_else(|| self.commands.lookup_in_context(HotkeyContext::Video, chord))
+                        .or_else(|| {
+                            self.commands
+                                .lookup_in_context(HotkeyContext::Default, chord)
+                        })
+                        .or_else(|| {
+                            self.commands
+                                .lookup_in_context(HotkeyContext::Always, chord)
+                        })
+                };
+                if let Some(cmd_id) = cmd {
+                    let owned = cmd_id.to_owned();
+                    self.execute_command(&owned);
+                }
             }
         }
 
@@ -1234,6 +1298,26 @@ impl AppShell {
                     rects.audio = Some(ar);
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ar));
                     child.set_clip_rect(ar);
+                    if self.audio.karaoke_mode {
+                        if let Some(active_idx) = self.doc.active_line() {
+                            let key = (active_idx, self.doc.revision());
+                            if (self.karaoke.is_none() || self.karaoke_sync_key != Some(key))
+                                && let Some(ev) = self
+                                    .doc
+                                    .script()
+                                    .events_section()
+                                    .and_then(|s| s.get_event(active_idx))
+                            {
+                                self.karaoke = Some(ui_audio::KaraokeTimingController::from_event(
+                                    active_idx, ev,
+                                ));
+                                self.karaoke_sync_key = Some(key);
+                            }
+                        }
+                    } else if self.karaoke.is_some() {
+                        self.karaoke = None;
+                        self.karaoke_sync_key = None;
+                    }
                     if let Some(ap) = audio_provider {
                         self.last_audio_action = show_audio_panel(
                             &mut child,
@@ -1241,7 +1325,7 @@ impl AppShell {
                             ap,
                             &self.audio_markers,
                             None,
-                            None,
+                            self.karaoke.as_mut(),
                             &pal,
                             pal_rev,
                             &self.catalog,
@@ -1269,11 +1353,12 @@ impl AppShell {
                     rects.edit_box = Some(er);
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(er));
                     child.set_clip_rect(er);
+                    let edit_tc = self.playback.as_ref().map(PlaybackController::timecodes);
                     if show_edit_box(
                         &mut child,
                         &mut self.doc,
                         &mut self.editbox,
-                        None,
+                        edit_tc,
                         &pal,
                         &self.catalog,
                     ) && let Some(active) = self.doc.active_line()
@@ -1566,6 +1651,86 @@ impl AppShell {
             }
         }
     }
+}
+
+fn egui_key_to_chord(mods: egui::Modifiers, key: Key) -> Option<KeyChord> {
+    let mut mask = 0u8;
+    if mods.ctrl || mods.command {
+        mask |= KeyChord::CTRL;
+    }
+    if mods.shift {
+        mask |= KeyChord::SHIFT;
+    }
+    if mods.alt {
+        mask |= KeyChord::ALT;
+    }
+    let name = match key {
+        Key::A => "A",
+        Key::B => "B",
+        Key::C => "C",
+        Key::D => "D",
+        Key::E => "E",
+        Key::F => "F",
+        Key::G => "G",
+        Key::H => "H",
+        Key::I => "I",
+        Key::J => "J",
+        Key::K => "K",
+        Key::L => "L",
+        Key::M => "M",
+        Key::N => "N",
+        Key::O => "O",
+        Key::P => "P",
+        Key::Q => "Q",
+        Key::R => "R",
+        Key::S => "S",
+        Key::T => "T",
+        Key::U => "U",
+        Key::V => "V",
+        Key::W => "W",
+        Key::X => "X",
+        Key::Y => "Y",
+        Key::Z => "Z",
+        Key::Num0 => "0",
+        Key::Num1 => "1",
+        Key::Num2 => "2",
+        Key::Num3 => "3",
+        Key::Num4 => "4",
+        Key::Num5 => "5",
+        Key::Num6 => "6",
+        Key::Num7 => "7",
+        Key::Num8 => "8",
+        Key::Num9 => "9",
+        Key::Space => "Space",
+        Key::Enter => "Return",
+        Key::Escape => "Escape",
+        Key::Tab => "Tab",
+        Key::Backspace => "Back",
+        Key::Delete => "Delete",
+        Key::Insert => "Insert",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "PageUp",
+        Key::PageDown => "PageDown",
+        Key::ArrowLeft => "Left",
+        Key::ArrowRight => "Right",
+        Key::ArrowUp => "Up",
+        Key::ArrowDown => "Down",
+        Key::F1 => "F1",
+        Key::F2 => "F2",
+        Key::F3 => "F3",
+        Key::F4 => "F4",
+        Key::F5 => "F5",
+        Key::F6 => "F6",
+        Key::F7 => "F7",
+        Key::F8 => "F8",
+        Key::F9 => "F9",
+        Key::F10 => "F10",
+        Key::F11 => "F11",
+        Key::F12 => "F12",
+        _ => return None,
+    };
+    KeyChord::from_parts(mask, name)
 }
 
 #[cfg(test)]
@@ -1919,5 +2084,67 @@ mod tests {
             shell.window_title(),
             "*Demons' Crest - 05.ass - hlouis-sub-edit"
         );
+    }
+
+    #[test]
+    fn karaoke_mode_renders_syllables_boundaries_and_edits_at_100_and_200_dpi() {
+        let mut script = ScriptFile::new_default();
+        let ev = AssEvent::dialogue(
+            AssTime::from_cs(100),
+            AssTime::from_cs(300),
+            r"{\k50}Ni{\k50}ge{\k50}ta{\k50}ku",
+        );
+        script
+            .ensure_events_section_mut()
+            .insert_event(0, ev.clone());
+        let themes = [
+            ThemeSpec::Light,
+            ThemeSpec::Dark,
+            ThemeSpec::EyeComfort {
+                base: theme::BaseTheme::Dark,
+                strength: 65,
+            },
+        ];
+        for spec in themes {
+            for ppp in [1.0_f32, 2.0_f32] {
+                let mut shell = AppShell::new(script.clone());
+                shell.set_theme(spec);
+                shell.attach_audio(
+                    10_000,
+                    TimelineMarkerIndex::new(vec![1_000, 2_000, 3_000], vec![1_000, 3_000]),
+                );
+                shell.audio.karaoke_mode = true;
+                shell.audio.active_selection.start_ms = 1_000;
+                shell.audio.active_selection.end_ms = 3_000;
+                shell.audio.viewport.scroll_ms = 500.0;
+                shell.audio.viewport.ms_per_px = 5.0;
+                let mut harness = Harness::builder()
+                    .with_size(Vec2::new(1024.0, 640.0))
+                    .with_pixels_per_point(ppp)
+                    .with_accessibility_check(false)
+                    .build_ui(|ui| {
+                        shell.show(ui, None, None, &ZeroClock);
+                    });
+                harness.run_steps(2);
+            }
+        }
+
+        let mut kara = ui_audio::KaraokeTimingController::from_event(0, &ev);
+        assert_eq!(kara.syllable_count(), 4);
+        kara.begin_drag_boundary(1).expect("begin drag");
+        let moved = kara
+            .update_drag_boundary(1_700, &[], 0, true)
+            .expect("moved");
+        assert_eq!(moved, 1_700);
+        kara.end_drag_boundary();
+        kara.split_at(0, 1).expect("split");
+        assert_eq!(kara.syllable_count(), 5);
+        kara.join_range(0, 1).expect("join");
+        assert_eq!(kara.syllable_count(), 4);
+        let cmd = kara.commit(ev.text()).expect("commit command");
+        let ass_core::EditCommand::ModifyEventText { after, .. } = cmd else {
+            panic!("expected ModifyEventText");
+        };
+        assert!(after.contains(r"\k70"), "expected retimed \\k70 in {after}");
     }
 }

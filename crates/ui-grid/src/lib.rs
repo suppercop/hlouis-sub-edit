@@ -151,8 +151,8 @@ impl Default for SubtitleGridState {
         Self {
             model,
             display_cfg: GridDisplayConfig::default(),
-            tag_marker: HiddenTagMarker::SmallDot,
-            hide_karaoke_only_markers: true,
+            tag_marker: HiddenTagMarker::AegisubCircle,
+            hide_karaoke_only_markers: false,
             row_height: 14.0,
             column_order: vec![
                 GridColumn::LineNumber,
@@ -449,25 +449,21 @@ pub fn format_grid_row_text(
     let mut pos = 0usize;
     let mut emitted_chars = 0usize;
     let mut truncated = false;
-    let mut pending_marker = false;
 
     while pos < len {
         if bytes[pos] == b'{'
             && let Some(rel_close) = bytes[pos + 1..].iter().position(|&c| c == b'}')
         {
             let body = &raw[pos + 1..pos + 1 + rel_close];
-            if emit_markers && !(hide_karaoke_only && is_karaoke_only_block(body)) {
-                pending_marker = true;
+            // One marker per override block, never merged across adjacent `{...}{...}` blocks.
+            if emit_markers
+                && !(hide_karaoke_only && is_karaoke_only_block(body))
+                && let Ok(off) = u16::try_from(out.len())
+            {
+                marker_offsets.push(off);
             }
             pos += rel_close + 2;
             continue;
-        }
-
-        if pending_marker {
-            if let Ok(off) = u16::try_from(out.len()) {
-                marker_offsets.push(off);
-            }
-            pending_marker = false;
         }
 
         let seg_start = pos;
@@ -498,12 +494,6 @@ pub fn format_grid_row_text(
         pos = next_brace;
     }
 
-    if pending_marker
-        && !truncated
-        && let Ok(off) = u16::try_from(out.len())
-    {
-        marker_offsets.push(off);
-    }
     if truncated {
         out.push_str(cfg.ellipsis);
     }
@@ -518,6 +508,9 @@ fn paint_tag_marker(
     color: Color32,
 ) {
     match marker {
+        HiddenTagMarker::AegisubCircle => {
+            p.circle_stroke(center, diameter * 0.48, Stroke::new(1.1, color));
+        }
         HiddenTagMarker::SmallDot => {
             p.circle_filled(center, diameter * 0.40, color);
         }
@@ -543,10 +536,10 @@ fn paint_tag_marker(
     }
 }
 
-/// Diameter of the hidden-tag marker for a body font of `font_size` points.
+/// Diameter of the hidden-tag marker for a body font of `font_size` points (~0.55x cap height).
 #[inline]
 fn marker_diameter(font_size: f32) -> f32 {
-    (font_size * 0.72 * 0.60).clamp(3.6, 5.6)
+    (font_size * 0.72 * 0.55).clamp(3.8, 6.0)
 }
 
 /// Horizontal space reserved for one hidden-tag marker in the Text column.
@@ -1058,36 +1051,58 @@ pub fn show_subtitle_grid(
                     GridColumn::Text if !row.marker_offsets.is_empty() => {
                         let clip_p = row_painter.with_clip_rect(cell_rect);
                         let origin = Pos2::new(cx + 4.0, cy - gsize.y * 0.5);
-                        // Low-contrast theme text colour at ~45% alpha, never darker than text.
+                        // Aegisub circle uses ~70% alpha of theme text colour; subtle dot/sun ~45%.
+                        let marker_alpha = if state.tag_marker == HiddenTagMarker::AegisubCircle {
+                            178
+                        } else {
+                            115
+                        };
                         let marker_col = Color32::from_rgba_unmultiplied(
                             text_col.r(),
                             text_col.g(),
                             text_col.b(),
-                            115,
+                            marker_alpha,
                         );
                         let marker_d = marker_diameter(font_body.size);
                         let marker_adv = marker_advance(font_body.size);
                         let text_len = row.display_text.len();
-                        for &off_u16 in &row.marker_offsets {
+                        let offsets = &row.marker_offsets;
+                        let mut i = 0usize;
+                        while i < offsets.len() {
+                            let off_u16 = offsets[i];
+                            let mut run_end = i + 1;
+                            while run_end < offsets.len() && offsets[run_end] == off_u16 {
+                                run_end += 1;
+                            }
+                            let run_len = run_end - i;
                             let off = usize::from(off_u16).min(text_len);
-                            let x_rel =
-                                if off >= text_len || !row.display_text.is_char_boundary(off) {
-                                    cell_galley.rect.max.x + marker_adv * 0.5
+                            let is_tail =
+                                off >= text_len || !row.display_text.is_char_boundary(off);
+                            let base_x = if is_tail {
+                                cell_galley.rect.max.x
+                            } else {
+                                let ci = row.display_text[..off].chars().count();
+                                cell_galley
+                                    .pos_from_cursor(egui::text::CCursor::new(ci))
+                                    .min
+                                    .x
+                            };
+                            for k in 0..run_len {
+                                #[allow(clippy::cast_precision_loss)]
+                                let x_rel = if is_tail {
+                                    base_x + (k as f32 + 0.5) * marker_adv
                                 } else {
-                                    let ci = row.display_text[..off].chars().count();
-                                    cell_galley
-                                        .pos_from_cursor(egui::text::CCursor::new(ci))
-                                        .min
-                                        .x
-                                        - marker_adv * 0.5
+                                    base_x - ((run_len - k) as f32 - 0.5) * marker_adv
                                 };
-                            paint_tag_marker(
-                                &clip_p,
-                                Pos2::new(origin.x + x_rel, cy),
-                                state.tag_marker,
-                                marker_d,
-                                marker_col,
-                            );
+                                paint_tag_marker(
+                                    &clip_p,
+                                    Pos2::new(origin.x + x_rel, cy),
+                                    state.tag_marker,
+                                    marker_d,
+                                    marker_col,
+                                );
+                            }
+                            i = run_end;
                         }
                         clip_p.galley(origin, cell_galley, text_col);
                     }
@@ -1339,6 +1354,7 @@ mod tests {
         // Fill the glyph atlas past egui's reset threshold with many large glyph sizes.
         let mut filled = false;
         for round in 0..400u32 {
+            #[allow(clippy::cast_precision_loss)]
             let size = 40.0 + round as f32 * 0.37;
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let _ = ui.fonts_mut(|f| {
@@ -1408,17 +1424,32 @@ mod tests {
         assert_eq!(markers, vec![0, 2]);
         assert_eq!(out, "Nige");
 
-        // Consecutive hidden blocks collapse to ONE marker.
+        // Consecutive hidden blocks emit ONE marker per override block (never merged).
         format_grid_row_text(
             r"{\an8}{\blur2}Typeset",
             &cfg,
-            HiddenTagMarker::SmallDot,
-            true,
+            HiddenTagMarker::AegisubCircle,
+            false,
             &mut out,
             &mut markers,
         );
-        assert_eq!(markers, vec![0]);
+        assert_eq!(markers, vec![0, 0]);
         assert_eq!(out, "Typeset");
+
+        // Default SubtitleGridState uses AegisubCircle with hide_karaoke_only_markers = false.
+        let def = SubtitleGridState::default();
+        assert_eq!(def.tag_marker, HiddenTagMarker::AegisubCircle);
+        assert!(!def.hide_karaoke_only_markers);
+        format_grid_row_text(
+            r"{\k40}Ni{\k50}ge{\k60}ta{\k30}ku {\k40}na{\k50}ru",
+            &cfg,
+            def.tag_marker,
+            def.hide_karaoke_only_markers,
+            &mut out,
+            &mut markers,
+        );
+        assert_eq!(markers, vec![0, 2, 4, 6, 9, 11]);
+        assert_eq!(out, "Nigetaku naru");
 
         // Plain line has zero markers.
         format_grid_row_text(

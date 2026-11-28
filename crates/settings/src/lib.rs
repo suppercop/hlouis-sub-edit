@@ -98,8 +98,11 @@ impl Default for AppearancePrefs {
 /// Visual marker drawn in the subtitle grid where an override `{...}` block was hidden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HiddenTagMarker {
-    /// Small low-contrast vector dot (default).
+    /// Hollow vector circle (~0.55x cap height, theme text colour at ~70% alpha), one per override
+    /// block (default, matching Aegisub).
     #[default]
+    AegisubCircle,
+    /// Small low-contrast vector dot.
     SmallDot,
     /// Compact low-contrast vector sun (Aegisub style).
     AegisubSun,
@@ -134,8 +137,8 @@ impl Default for InterfacePrefs {
             show_video: true,
             show_audio: true,
             hide_overrides_mode: 1,
-            hidden_tag_marker: HiddenTagMarker::SmallDot,
-            hide_karaoke_only_markers: true,
+            hidden_tag_marker: HiddenTagMarker::AegisubCircle,
+            hide_karaoke_only_markers: false,
             show_col_layer: false,
             show_col_actor: false,
             show_col_effect: false,

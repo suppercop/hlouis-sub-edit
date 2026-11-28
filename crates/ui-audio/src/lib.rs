@@ -26,7 +26,7 @@ use egui::{
     TextureOptions, Ui, Vec2,
 };
 use i18n_catalog::Catalog;
-use karaoke_timing::KaraokeTimingController;
+pub use karaoke_timing::KaraokeTimingController;
 use spectrum::{ColorLut, RealtimeSpectrumRenderer, SpectrumColorScheme, SpectrumViewportSpec};
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -89,6 +89,8 @@ pub enum AudioPanelAction {
     AddLeadOut,
     OpenTimingOptions,
     SelectionChanged(TimeRangeMs),
+    PlayRange(TimeRangeMs),
+    KaraokeCommit,
 }
 
 /// Active magnetic snap target shown while dragging a timing boundary.
@@ -154,6 +156,7 @@ pub struct AudioPanelState {
     pub active_selection: TimeRangeMs,
     pub inactive_spans: Vec<TimeRangeMs>,
     pub dragging: Option<DragTarget>,
+    pub karaoke_dragging_boundary: Option<usize>,
     pub active_snap_hint: Option<SnapHint>,
     // Cached GPU texture + dirty key + ring-buffer head (0 re-uploads when unchanged,
     // partial-strip set_partial on horizontal scroll instead of full-buffer clone).
@@ -221,6 +224,7 @@ impl AudioPanelState {
             },
             inactive_spans: Vec::with_capacity(4),
             dragging: None,
+            karaoke_dragging_boundary: None,
             active_snap_hint: None,
             texture: None,
             cache_key: None,
@@ -1071,7 +1075,7 @@ pub fn show_audio_panel(
     provider: &dyn AudioColumnProvider,
     markers: &TimelineMarkerIndex,
     timing: Option<&mut DialogueTimingController>,
-    karaoke: Option<&KaraokeTimingController>,
+    mut karaoke: Option<&mut KaraokeTimingController>,
     palette: &Palette,
     palette_rev: u64,
     _catalog: &Catalog,
@@ -1080,11 +1084,16 @@ pub fn show_audio_panel(
     let ppp = ui.ctx().pixels_per_point();
 
     let ruler_h = 16.0;
+    let kara_bar_h = if state.karaoke_mode && karaoke.is_some() {
+        22.0
+    } else {
+        0.0
+    };
     let scrollbar_h = 11.0;
     let toolbar_h = 24.0;
     let slider_strip_w = 56.0;
     let total_canvas_h = (ui.available_height() - toolbar_h).max(76.0);
-    let wave_h = (total_canvas_h - ruler_h - scrollbar_h).max(48.0);
+    let wave_h = (total_canvas_h - ruler_h - kara_bar_h - scrollbar_h).max(44.0);
     let canvas_w = (ui.available_width() - slider_strip_w - 6.0).max(100.0);
 
     ui.horizontal(|ui| {
@@ -1469,7 +1478,16 @@ pub fn show_audio_panel(
                 painter.rect_filled(rect, 0.0, Color32::from_rgb(11, 15, 26));
             }
 
-            let kara_bounds = karaoke.map_or(&[][..], KaraokeTimingController::boundaries_ms);
+            let kara_bounds = karaoke
+                .as_deref()
+                .map_or(&[][..], KaraokeTimingController::boundaries_ms);
+            let active_kara_syl = if state.karaoke_mode {
+                karaoke
+                    .as_deref()
+                    .map(KaraokeTimingController::active_syllable)
+            } else {
+                None
+            };
             let input = AudioFrameInput {
                 viewport: state.viewport,
                 selection: state.active_selection,
@@ -1484,7 +1502,7 @@ pub fn show_audio_panel(
                     }
                 }),
                 karaoke_boundaries_ms: if state.karaoke_mode { kara_bounds } else { &[] },
-                active_karaoke_syllable: None,
+                active_karaoke_syllable: active_kara_syl,
             };
             build_frame_layout(&input, None, &mut state.frame_layout);
 
@@ -1515,7 +1533,7 @@ pub fn show_audio_panel(
                 painter.rect_filled(sr, 0.0, role_color(span.role, palette));
             }
 
-            // Pass 1: subtle line boundaries, video cursor, karaoke boundaries.
+            // Pass 1: subtle line boundaries and video cursor.
             let thin_w = 1.0 / ppp.max(0.5);
             for m in &state.frame_layout.markers {
                 if matches!(
@@ -1524,6 +1542,7 @@ pub fn show_audio_panel(
                         | ColorRole::SelectionStartMarker
                         | ColorRole::SelectionEndMarker
                         | ColorRole::PlayCursor
+                        | ColorRole::KaraokeBoundary
                 ) {
                     continue;
                 }
@@ -1545,6 +1564,30 @@ pub fn show_audio_panel(
                     [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
                     Stroke::new(kf_w, role_color(m.role, palette)),
                 );
+            }
+
+            // Pass 2b: prominent karaoke syllable boundaries (golden vertical dividers + top notch).
+            if state.karaoke_mode {
+                let kara_col = Color32::from_rgb(245, 198, 66);
+                let kara_w = (2.0 / ppp.max(0.5)).max(1.5);
+                for m in &state.frame_layout.markers {
+                    if m.role != ColorRole::KaraokeBoundary {
+                        continue;
+                    }
+                    let sx = snap_px(rect.left() + m.x, ppp);
+                    painter.line_segment(
+                        [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
+                        Stroke::new(kara_w, kara_col),
+                    );
+                    painter.rect_filled(
+                        Rect::from_center_size(
+                            Pos2::new(sx, rect.top() + 3.0),
+                            Vec2::new(5.0, 6.0),
+                        ),
+                        1.0,
+                        kara_col,
+                    );
+                }
             }
 
             // Pass 3: active selection start/end boundary lines + crisp corner notches (no Vec alloc).
@@ -1600,60 +1643,198 @@ pub fn show_audio_panel(
                 }
             }
 
-            // Interaction: drag/click start & end boundaries with magnetic keyframe/line snapping
-            // (hold Shift to temporarily disable snapping).
+            // Interaction: drag/click karaoke boundaries (when karaoke mode is active) or
+            // start & end boundaries with magnetic keyframe/line snapping (Shift disables snap).
             let shift_held = ui.input(|i| i.modifiers.shift);
             if let Some(pos) = resp.interact_pointer_pos() {
                 let local_x = pos.x - rect.left();
                 let local_y = pos.y - rect.top();
                 if resp.drag_started() {
-                    match state.frame_layout.hit_test(
-                        local_x,
-                        local_y,
-                        6.0,
-                        &state.viewport,
-                        state.active_selection,
-                        kara_bounds,
-                    ) {
-                        HitTarget::StartMarker => state.dragging = Some(DragTarget::Start),
-                        HitTarget::EndMarker => state.dragging = Some(DragTarget::End),
-                        _ => {
-                            let raw_ms = state.viewport.x_to_ms(local_x).max(0);
-                            let (ms, hint) = apply_snap(raw_ms, shift_held, state, markers);
-                            state.active_selection.start_ms = ms;
-                            if state.active_selection.end_ms < ms {
-                                state.active_selection.end_ms = ms + 500;
+                    let mut hit_kara: Option<usize> = None;
+                    if state.karaoke_mode
+                        && let Some(k) = karaoke.as_deref()
+                    {
+                        let bounds = k.boundaries_ms();
+                        let mut best_dx = 7.0_f32;
+                        for (b_idx, &b_ms) in bounds
+                            .iter()
+                            .enumerate()
+                            .take(bounds.len().saturating_sub(1))
+                            .skip(1)
+                        {
+                            let bx = state.viewport.ms_to_x(b_ms);
+                            let dx = (local_x - bx).abs();
+                            if dx < best_dx {
+                                best_dx = dx;
+                                hit_kara = Some(b_idx);
                             }
-                            state.dragging = Some(DragTarget::End);
-                            state.active_snap_hint = hint;
-                            action =
-                                Some(AudioPanelAction::SelectionChanged(state.active_selection));
+                        }
+                    }
+                    if let Some(b_idx) = hit_kara
+                        && let Some(k) = karaoke.as_deref_mut()
+                        && k.begin_drag_boundary(b_idx).is_ok()
+                    {
+                        state.karaoke_dragging_boundary = Some(b_idx);
+                    } else {
+                        let k_bounds = karaoke
+                            .as_deref()
+                            .map_or(&[][..], KaraokeTimingController::boundaries_ms);
+                        match state.frame_layout.hit_test(
+                            local_x,
+                            local_y,
+                            6.0,
+                            &state.viewport,
+                            state.active_selection,
+                            k_bounds,
+                        ) {
+                            HitTarget::StartMarker => state.dragging = Some(DragTarget::Start),
+                            HitTarget::EndMarker => state.dragging = Some(DragTarget::End),
+                            _ => {
+                                let raw_ms = state.viewport.x_to_ms(local_x).max(0);
+                                let (ms, hint) = apply_snap(raw_ms, shift_held, state, markers);
+                                state.active_selection.start_ms = ms;
+                                if state.active_selection.end_ms < ms {
+                                    state.active_selection.end_ms = ms + 500;
+                                }
+                                state.dragging = Some(DragTarget::End);
+                                state.active_snap_hint = hint;
+                                action = Some(AudioPanelAction::SelectionChanged(
+                                    state.active_selection,
+                                ));
+                            }
                         }
                     }
                 }
-                if resp.dragged()
-                    && let Some(target) = state.dragging
-                {
+                if resp.dragged() {
                     let raw_ms = state.viewport.x_to_ms(local_x).max(0);
-                    let (ms, hint) = apply_snap(raw_ms, shift_held, state, markers);
-                    state.active_snap_hint = hint;
-                    match target {
-                        DragTarget::Start => {
-                            state.active_selection.start_ms = ms.min(state.active_selection.end_ms);
+                    if state.karaoke_dragging_boundary.is_some()
+                        && let Some(k) = karaoke.as_deref_mut()
+                    {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let snap_ms = (f64::from(state.snap_distance_px) * state.viewport.ms_per_px)
+                            .round() as i64;
+                        let _ = k.update_drag_boundary(
+                            raw_ms,
+                            &markers.keyframes_ms,
+                            if state.auto_snap_keyframes {
+                                snap_ms
+                            } else {
+                                0
+                            },
+                            shift_held,
+                        );
+                    } else if let Some(target) = state.dragging {
+                        let (ms, hint) = apply_snap(raw_ms, shift_held, state, markers);
+                        state.active_snap_hint = hint;
+                        match target {
+                            DragTarget::Start => {
+                                state.active_selection.start_ms =
+                                    ms.min(state.active_selection.end_ms);
+                            }
+                            DragTarget::End => {
+                                state.active_selection.end_ms =
+                                    ms.max(state.active_selection.start_ms);
+                            }
+                            DragTarget::Both { .. } => {}
                         }
-                        DragTarget::End => {
-                            state.active_selection.end_ms = ms.max(state.active_selection.start_ms);
-                        }
-                        DragTarget::Both { .. } => {}
+                        action = Some(AudioPanelAction::SelectionChanged(state.active_selection));
                     }
-                    action = Some(AudioPanelAction::SelectionChanged(state.active_selection));
                 }
                 if resp.drag_stopped() {
+                    if state.karaoke_dragging_boundary.take().is_some()
+                        && let Some(k) = karaoke.as_deref_mut()
+                    {
+                        k.end_drag_boundary();
+                    }
                     state.dragging = None;
                     state.active_snap_hint = None;
                 }
-            } else if state.dragging.is_none() {
+            } else if state.dragging.is_none() && state.karaoke_dragging_boundary.is_none() {
                 state.active_snap_hint = None;
+            }
+
+            // 2b. Karaoke syllable bar (visible when Karaoke mode is active): shows each
+            //     syllable aligned to its [start_ms, end_ms] span; clicking selects & plays it.
+            if kara_bar_h > 0.0
+                && let Some(k) = karaoke.as_deref_mut()
+            {
+                let (kbar_rect, kbar_resp) =
+                    ui.allocate_exact_size(Vec2::new(canvas_w, kara_bar_h), Sense::click());
+                let kp = ui.painter_at(kbar_rect);
+                kp.rect_filled(kbar_rect, 0.0, Color32::from_rgb(24, 28, 38));
+                kp.line_segment(
+                    [kbar_rect.left_top(), kbar_rect.right_top()],
+                    Stroke::new(1.0, Color32::from_rgb(72, 82, 102)),
+                );
+                let active_syl = k.active_syllable();
+                let syl_count = k.syllable_count();
+                let mut clicked_syl: Option<(usize, i64, i64)> = None;
+                let click_pos = if kbar_resp.clicked() {
+                    kbar_resp.interact_pointer_pos()
+                } else {
+                    None
+                };
+                for idx in 0..syl_count {
+                    let Some(syl) = k.syllable(idx) else {
+                        continue;
+                    };
+                    let x0 = (kbar_rect.left() + state.viewport.ms_to_x(syl.start_ms))
+                        .clamp(kbar_rect.left(), kbar_rect.right());
+                    let x1 = (kbar_rect.left() + state.viewport.ms_to_x(syl.end_ms))
+                        .clamp(kbar_rect.left(), kbar_rect.right());
+                    if x1 <= x0 + 1.0 {
+                        continue;
+                    }
+                    let srect = Rect::from_min_max(
+                        Pos2::new(x0, kbar_rect.top() + 1.0),
+                        Pos2::new(x1, kbar_rect.bottom() - 1.0),
+                    );
+                    let fill = if idx == active_syl {
+                        Color32::from_rgb(88, 70, 32)
+                    } else if idx % 2 == 0 {
+                        Color32::from_rgb(36, 44, 58)
+                    } else {
+                        Color32::from_rgb(44, 52, 68)
+                    };
+                    let border = if idx == active_syl {
+                        Color32::from_rgb(245, 198, 66)
+                    } else {
+                        Color32::from_rgb(92, 104, 126)
+                    };
+                    kp.rect_filled(srect, 2.0, fill);
+                    kp.rect_stroke(
+                        srect,
+                        2.0,
+                        Stroke::new(1.0, border),
+                        egui::StrokeKind::Inside,
+                    );
+                    if srect.width() >= 10.0 {
+                        let label_clip = kp.with_clip_rect(srect.shrink(2.0));
+                        label_clip.text(
+                            srect.center(),
+                            Align2::CENTER_CENTER,
+                            syl.text,
+                            FontId::proportional(11.0),
+                            if idx == active_syl {
+                                Color32::from_rgb(255, 240, 185)
+                            } else {
+                                Color32::from_rgb(225, 232, 242)
+                            },
+                        );
+                    }
+                    if let Some(cp) = click_pos
+                        && srect.contains(cp)
+                    {
+                        clicked_syl = Some((idx, syl.start_ms, syl.end_ms));
+                    }
+                }
+                if let Some((idx, s_ms, e_ms)) = clicked_syl {
+                    k.set_active_syllable(idx);
+                    action = Some(AudioPanelAction::PlayRange(TimeRangeMs {
+                        start_ms: s_ms,
+                        end_ms: e_ms,
+                    }));
+                }
             }
 
             // Snap halo + "KF" badge ONLY while actively dragging (never in the static view).
@@ -1926,7 +2107,11 @@ pub fn show_audio_panel(
             palette,
             "Commit timing (G)",
         ) {
-            action = Some(AudioPanelAction::Commit);
+            action = Some(if state.karaoke_mode {
+                AudioPanelAction::KaraokeCommit
+            } else {
+                AudioPanelAction::Commit
+            });
         }
         if audio_tool_button(
             ui,
@@ -1997,6 +2182,38 @@ pub fn show_audio_panel(
             "Toggle Karaoke timing mode",
         ) {
             state.karaoke_mode = !state.karaoke_mode;
+        }
+        if state.karaoke_mode
+            && let Some(k) = karaoke
+        {
+            let active_syl = k.active_syllable();
+            let can_split = k
+                .syllable(active_syl)
+                .is_some_and(|s| s.text.chars().count() >= 2);
+            if ui
+                .add_enabled(can_split, egui::Button::new("Split").small())
+                .on_hover_text("Split active karaoke syllable")
+                .clicked()
+                && let Some(s) = k.syllable(active_syl)
+            {
+                let mid = (s.text.chars().count() / 2).max(1);
+                let _ = k.split_at(active_syl, mid);
+            }
+            let can_join = active_syl + 1 < k.syllable_count();
+            if ui
+                .add_enabled(can_join, egui::Button::new("Join").small())
+                .on_hover_text("Join active karaoke syllable with next")
+                .clicked()
+            {
+                let _ = k.join_range(active_syl, active_syl + 1);
+            }
+            if ui
+                .small_button("Commit \\k")
+                .on_hover_text("Write karaoke \\k timings to line")
+                .clicked()
+            {
+                action = Some(AudioPanelAction::KaraokeCommit);
+            }
         }
         if audio_tool_button(
             ui,
