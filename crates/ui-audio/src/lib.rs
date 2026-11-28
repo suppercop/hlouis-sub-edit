@@ -34,7 +34,7 @@ use timing_controller::{DialogueTimingController, DragTarget, PlayRangeKind, Tim
 use ui_theme::{rgba, snap_px};
 
 /// Trait supplying waveform peak columns for a requested `[start_ms, end_ms]` range into a
-/// caller-owned buffer.
+/// caller-owned buffer, and optionally pre-rendered STFT spectrum pixels.
 pub trait AudioColumnProvider {
     /// Total audio duration in milliseconds.
     fn duration_ms(&self) -> i64;
@@ -46,6 +46,19 @@ pub trait AudioColumnProvider {
         width_px: usize,
         out: &mut Vec<PeakBucket>,
     );
+    /// Optional spectrum renderer writing `width_px * height_px` row-major [`Color32`] pixels
+    /// for `[start_ms, end_ms]` into `out`. Returns `true` if filled, else falls back to peaks.
+    fn render_spectrum_into(
+        &self,
+        _start_ms: i64,
+        _end_ms: i64,
+        _width_px: usize,
+        _height_px: usize,
+        _palette: &Palette,
+        _out: &mut Vec<Color32>,
+    ) -> bool {
+        false
+    }
 }
 
 /// Action emitted by the audio panel toolbar or mouse interactions.
@@ -785,13 +798,25 @@ pub fn show_audio_panel(
             };
 
             if state.cache_key != Some(key) {
-                provider.query_columns_into(
-                    vis.start_ms,
-                    vis.end_ms,
-                    tex_w,
-                    &mut state.columns_buf,
-                );
-                state.rasterize_columns(tex_w, tex_h, palette);
+                let spectrum_ok = state.spectrum_mode
+                    && provider.render_spectrum_into(
+                        vis.start_ms,
+                        vis.end_ms,
+                        tex_w,
+                        tex_h,
+                        palette,
+                        &mut state.pixel_buf,
+                    )
+                    && state.pixel_buf.len() == tex_w.saturating_mul(tex_h);
+                if !spectrum_ok {
+                    provider.query_columns_into(
+                        vis.start_ms,
+                        vis.end_ms,
+                        tex_w,
+                        &mut state.columns_buf,
+                    );
+                    state.rasterize_columns(tex_w, tex_h, palette);
+                }
                 let img = ColorImage {
                     size: [tex_w, tex_h],
                     source_size: Vec2::new(tex_w as f32, tex_h as f32),
@@ -829,11 +854,36 @@ pub fn show_audio_panel(
                 inactive_spans: &[],
                 markers,
                 play_cursor_ms: state.play_cursor_ms,
-                video_marker: None,
+                video_marker: state.video_marker_ms.map(|ms| {
+                    timing_controller::VideoPositionMarker {
+                        position_ms: ms,
+                        frame_start_ms: ms,
+                        frame_end_ms: ms,
+                    }
+                }),
                 karaoke_boundaries_ms: if state.karaoke_mode { kara_bounds } else { &[] },
                 active_karaoke_syllable: None,
             };
             build_frame_layout(&input, None, &mut state.frame_layout);
+
+            if resp.hovered() {
+                let (wheel_y, ctrl) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl));
+                if wheel_y.abs() > 0.1 {
+                    if ctrl {
+                        let factor = if wheel_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
+                        state.h_zoom = (state.h_zoom * factor).clamp(0.25, 8.0);
+                        state.viewport.ms_per_px =
+                            (12.0 / f64::from(state.h_zoom)).clamp(0.5, 200.0);
+                    } else {
+                        let delta_ms = f64::from(-wheel_y) * state.viewport.ms_per_px * 1.5;
+                        let max_scroll = (provider.duration_ms().max(1) as f64
+                            - f64::from(state.viewport.width_px) * state.viewport.ms_per_px)
+                            .max(0.0);
+                        state.viewport.scroll_ms =
+                            (state.viewport.scroll_ms + delta_ms).clamp(0.0, max_scroll);
+                    }
+                }
+            }
 
             for span in &state.frame_layout.spans {
                 let sr = Rect::from_min_max(

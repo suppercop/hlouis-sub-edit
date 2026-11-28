@@ -54,6 +54,10 @@ pub trait VideoFrameSupplier {
     fn total_frames(&self) -> u32;
     /// Returns `true` if `frame` is a keyframe.
     fn is_keyframe(&self, frame: u32) -> bool;
+    /// Optional sorted slice of keyframe indices so seek bar ticks render without stride misses.
+    fn keyframes(&self) -> Option<&[u32]> {
+        None
+    }
     /// Revision token for `frame` (bump when subtitle overlay changes to trigger re-upload).
     fn frame_revision(&self, frame: u32) -> u64;
     /// Borrows the RGBA8 pixels for `frame`.
@@ -73,6 +77,15 @@ pub enum VideoPanelAction {
     ShowVisualHelp,
 }
 
+/// How the video is scaled inside the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomMode {
+    /// Scale proportionally to fill the panel.
+    Fit,
+    /// Use `VideoPanelState::zoom_tenths` directly.
+    Fixed,
+}
+
 /// Persistent UI state for the video panel + visual tool overlay.
 pub struct VideoPanelState {
     pub display: VideoDisplayState,
@@ -81,10 +94,16 @@ pub struct VideoPanelState {
     pub vclip_path: VectorClipPath,
     pub rect_clip: [f64; 4],
     pub drag_pos: [f64; 2],
+    pub rotate_z_deg: f64,
+    pub rotate_xy_deg: [f64; 2],
+    pub scale_pct: [f64; 2],
     pub dragging_vertex: Option<usize>,
     pub show_overscan: bool,
     pub auto_scroll_video: bool,
     pub show_visual_help: bool,
+    /// When `true`, scales video proportionally to fill the panel canvas; when `false`, uses
+    /// [`Self::zoom_tenths`] directly.
+    pub zoom_mode: ZoomMode,
     /// Zoom percentage × 10 (e.g. `375` = `37.5%`, `500` = `50%`, `1000` = `100%`).
     pub zoom_tenths: u16,
     pub active_line_start_ms: i64,
@@ -122,10 +141,14 @@ impl VideoPanelState {
             vclip_path: VectorClipPath::default(),
             rect_clip: [160.0, 120.0, 1760.0, 960.0],
             drag_pos: [960.0, 540.0],
+            rotate_z_deg: 0.0,
+            rotate_xy_deg: [0.0, 0.0],
+            scale_pct: [100.0, 100.0],
             dragging_vertex: None,
             show_overscan: false,
             auto_scroll_video: true,
             show_visual_help: false,
+            zoom_mode: ZoomMode::Fit,
             zoom_tenths: 375,
             active_line_start_ms: 0,
             active_line_end_ms: 2_000,
@@ -549,12 +572,17 @@ pub fn show_video_panel(
         let vh = state.display.video_h.max(1.0) as f32;
         let video_aspect = vw / vh;
         let box_aspect = rect.width() / rect.height().max(1.0);
-        let (fit_w, fit_h) = if box_aspect > video_aspect {
-            (rect.height() * video_aspect, rect.height())
+        let (draw_w, draw_h) = if state.zoom_mode == ZoomMode::Fit {
+            if box_aspect > video_aspect {
+                (rect.height() * video_aspect, rect.height())
+            } else {
+                (rect.width(), rect.width() / video_aspect)
+            }
         } else {
-            (rect.width(), rect.width() / video_aspect)
+            let scale = (f32::from(state.zoom_tenths) / 1000.0).max(0.05);
+            (vw * scale, vh * scale)
         };
-        let video_rect = Rect::from_center_size(rect.center(), Vec2::new(fit_w, fit_h));
+        let video_rect = Rect::from_center_size(rect.center(), Vec2::new(draw_w, draw_h));
 
         // Upload RGBA frame texture ONLY when `(frame, revision)` changes.
         let rev = supplier.frame_revision(frame);
@@ -636,6 +664,68 @@ pub fn show_video_panel(
             } else if state.active_tool == ActiveVisualTool::Drag && resp.dragged() {
                 state.drag_pos = [vpos.x, vpos.y];
                 action = Some(VideoPanelAction::VisualOverlayEdited);
+            } else if state.active_tool == ActiveVisualTool::RotateZ && resp.dragged() {
+                let dx = vpos.x - state.drag_pos[0];
+                let dy = vpos.y - state.drag_pos[1];
+                state.rotate_z_deg = -dy.atan2(dx).to_degrees();
+                action = Some(VideoPanelAction::VisualOverlayEdited);
+            } else if state.active_tool == ActiveVisualTool::RotateXY && resp.dragged() {
+                let dx = vpos.x - state.drag_pos[0];
+                let dy = vpos.y - state.drag_pos[1];
+                state.rotate_xy_deg = [
+                    (dy * 0.25).clamp(-89.0, 89.0),
+                    (dx * 0.25).clamp(-89.0, 89.0),
+                ];
+                action = Some(VideoPanelAction::VisualOverlayEdited);
+            } else if state.active_tool == ActiveVisualTool::Scale && resp.dragged() {
+                let sx = ((vpos.x - state.drag_pos[0]).abs() / 100.0 * 100.0).clamp(10.0, 500.0);
+                let sy = ((vpos.y - state.drag_pos[1]).abs() / 100.0 * 100.0).clamp(10.0, 500.0);
+                state.scale_pct = [sx, sy];
+                action = Some(VideoPanelAction::VisualOverlayEdited);
+            } else if state.active_tool == ActiveVisualTool::RectClip {
+                if resp.drag_started() {
+                    let corners = [
+                        (state.rect_clip[0], state.rect_clip[1]),
+                        (state.rect_clip[2], state.rect_clip[1]),
+                        (state.rect_clip[0], state.rect_clip[3]),
+                        (state.rect_clip[2], state.rect_clip[3]),
+                    ];
+                    let best = corners
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            let da = (a.0 - vpos.x).hypot(a.1 - vpos.y);
+                            let db = (b.0 - vpos.x).hypot(b.1 - vpos.y);
+                            da.total_cmp(&db)
+                        })
+                        .map(|(idx, _)| idx);
+                    state.dragging_vertex = best;
+                }
+                if resp.dragged() {
+                    match state.dragging_vertex {
+                        Some(0) => {
+                            state.rect_clip[0] = vpos.x;
+                            state.rect_clip[1] = vpos.y;
+                        }
+                        Some(1) => {
+                            state.rect_clip[2] = vpos.x;
+                            state.rect_clip[1] = vpos.y;
+                        }
+                        Some(2) => {
+                            state.rect_clip[0] = vpos.x;
+                            state.rect_clip[3] = vpos.y;
+                        }
+                        Some(3) => {
+                            state.rect_clip[2] = vpos.x;
+                            state.rect_clip[3] = vpos.y;
+                        }
+                        _ => {}
+                    }
+                    action = Some(VideoPanelAction::VisualOverlayEdited);
+                }
+                if resp.drag_stopped() {
+                    state.dragging_vertex = None;
+                }
             }
         }
 
@@ -679,23 +769,40 @@ pub fn show_video_panel(
         egui::StrokeKind::Inside,
     );
 
-    // Draw black keyframe tick marks across the seek track (sampled cleanly to stay O(width)).
+    // Draw black keyframe tick marks across the seek track without stride-missing real keyframes.
     let max_f = total.saturating_sub(1).max(1);
-    let kf_stride = (total / 120).max(1);
-    let mut kf_f = 0u32;
-    while kf_f < total {
-        if supplier.is_keyframe(kf_f) {
-            let frac = (kf_f as f32) / (max_f as f32);
-            let tx = snap_px(track_rect.left() + frac * track_rect.width(), ppp);
-            sp.line_segment(
-                [
-                    Pos2::new(tx, track_rect.top() - 2.0),
-                    Pos2::new(tx, track_rect.bottom() + 2.0),
-                ],
-                Stroke::new(1.0 / ppp.max(0.5), Color32::from_rgb(20, 22, 26)),
-            );
+    if let Some(kfs) = supplier.keyframes() {
+        let step = (kfs.len() / 320).max(1);
+        for &kf_f in kfs.iter().step_by(step) {
+            if kf_f < total {
+                let frac = (kf_f as f32) / (max_f as f32);
+                let tx = snap_px(track_rect.left() + frac * track_rect.width(), ppp);
+                sp.line_segment(
+                    [
+                        Pos2::new(tx, track_rect.top() - 2.0),
+                        Pos2::new(tx, track_rect.bottom() + 2.0),
+                    ],
+                    Stroke::new(1.0 / ppp.max(0.5), Color32::from_rgb(20, 22, 26)),
+                );
+            }
         }
-        kf_f = kf_f.saturating_add(kf_stride);
+    } else {
+        let kf_stride = (total / 120).max(1);
+        let mut kf_f = 0u32;
+        while kf_f < total {
+            if supplier.is_keyframe(kf_f) {
+                let frac = (kf_f as f32) / (max_f as f32);
+                let tx = snap_px(track_rect.left() + frac * track_rect.width(), ppp);
+                sp.line_segment(
+                    [
+                        Pos2::new(tx, track_rect.top() - 2.0),
+                        Pos2::new(tx, track_rect.bottom() + 2.0),
+                    ],
+                    Stroke::new(1.0 / ppp.max(0.5), Color32::from_rgb(20, 22, 26)),
+                );
+            }
+            kf_f = kf_f.saturating_add(kf_stride);
+        }
     }
 
     // Draw small slider thumb.
@@ -808,12 +915,32 @@ pub fn show_video_panel(
         )
         .on_hover_text("Offset from active line start / end");
 
+        let zoom_text = if state.zoom_mode == ZoomMode::Fit {
+            std::borrow::Cow::Borrowed("Fit")
+        } else {
+            format_zoom_tenths(state.zoom_tenths)
+        };
         egui::ComboBox::from_id_salt("video_zoom_combo")
             .width(56.0)
-            .selected_text(RichText::new(format_zoom_tenths(state.zoom_tenths)).small())
+            .selected_text(RichText::new(zoom_text).small())
             .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(state.zoom_mode == ZoomMode::Fit, "Fit")
+                    .clicked()
+                {
+                    state.zoom_mode = ZoomMode::Fit;
+                }
                 for z in [250u16, 375, 500, 750, 1000, 1500, 2000] {
-                    ui.selectable_value(&mut state.zoom_tenths, z, format_zoom_tenths(z));
+                    if ui
+                        .selectable_label(
+                            state.zoom_mode == ZoomMode::Fixed && state.zoom_tenths == z,
+                            format_zoom_tenths(z),
+                        )
+                        .clicked()
+                    {
+                        state.zoom_tenths = z;
+                        state.zoom_mode = ZoomMode::Fixed;
+                    }
                 }
             });
     });
